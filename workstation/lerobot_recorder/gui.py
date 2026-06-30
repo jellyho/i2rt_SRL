@@ -225,6 +225,10 @@ class RecorderGUI(QtWidgets.QWidget):
         self.collect_btn.setCheckable(True)
         self.collect_btn.setEnabled(False)
         self.collect_btn.clicked.connect(self._on_collect)
+        self.save_btn = QtWidgets.QPushButton("Save dataset")
+        self.save_btn.setObjectName("save")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._on_save_dataset)
 
         # primary operator view: agentview + wrist insets composited into one frame
         self.live_lbl = QtWidgets.QLabel("camera view")
@@ -271,7 +275,10 @@ class RecorderGUI(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(page)
         lay.setSpacing(12)
         lay.addLayout(strip)
-        lay.addWidget(self.collect_btn)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self.collect_btn, 1)
+        controls.addWidget(self.save_btn)
+        lay.addLayout(controls)
         lay.addWidget(self.live_lbl, 1)
         lay.addWidget(self.review_box)
         lay.addWidget(self.hint)
@@ -390,6 +397,29 @@ class RecorderGUI(QtWidgets.QWidget):
             self.recorder.disarm()
             self.collect_btn.setText("Start collection")
 
+    def _on_save_dataset(self) -> None:
+        if self.recorder is None:
+            return
+        st = self.recorder.get_status()
+        if st["recording"]:
+            QtWidgets.QMessageBox.information(self, "Recording in progress", "Finish the current episode before saving.")
+            return
+        if st["pending"]:
+            QtWidgets.QMessageBox.information(self, "Review pending", "Keep or delete the pending episode before saving.")
+            return
+
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Saving...")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            self.recorder.save_dataset()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._refresh()
+
     def _on_keep(self, outcome: str) -> None:
         if self.recorder is not None:
             self.recorder.keep_episode(outcome=outcome)
@@ -427,6 +457,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self._update_banner(st)
         self._update_health(st)
         self._update_stats(st)
+        self._update_save_button(st)
         self._cue_transitions(self._prev, st)
 
         for b in (self.keep_btn, self.keepfail_btn, self.del_btn):
@@ -501,6 +532,16 @@ class RecorderGUI(QtWidgets.QWidget):
             f"episodes {st['episodes']} · kept {kept} (✓{suc} ✗{fail}) · discarded {disc} · "
             f"success {rate} · frames {st['frames']}"
         )
+
+    def _update_save_button(self, st: dict) -> None:
+        w = st.get("writer") or {}
+        submitted = int(w.get("submitted", 0) or 0)
+        finalized = bool(w.get("finalized"))
+        if finalized and submitted:
+            self.save_btn.setText("Saved")
+        else:
+            self.save_btn.setText("Save dataset")
+        self.save_btn.setEnabled(bool(st.get("saveable") and not st.get("recording") and not st.get("pending")))
 
     def _cue_transitions(self, prev: dict, cur: dict) -> None:
         if cur["recording"] and not prev.get("recording"):

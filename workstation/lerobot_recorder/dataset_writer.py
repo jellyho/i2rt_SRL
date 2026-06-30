@@ -102,6 +102,8 @@ class AsyncDatasetWriter:
         self._saving = False  # True while the worker is encoding/writing one episode
         self._saving_index: Optional[int] = None  # episode index currently being saved
         self._saving_frames = 0  # frame count of the episode currently being saved
+        self._finalized = False
+        self._finalize_lock = threading.Lock()
         self.low_disk = False  # set when an episode was refused for lack of free space
 
     def _free_gb(self) -> float:
@@ -191,14 +193,28 @@ class AsyncDatasetWriter:
                     self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
         else:
+            if self.cfg.resume:
+                self._n_episodes = self._existing_outcome_count()
             logger.info("MOCK writer (repo_id=%s); features=%s", self.cfg.repo_id, sorted(self._features))
 
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
+    def _existing_outcome_count(self) -> int:
+        try:
+            with open(self._outcomes_path) as fh:
+                return sum(1 for line in fh if line.strip())
+        except FileNotFoundError:
+            return 0
+        except Exception as e:
+            logger.warning("could not count existing outcomes at %s: %s", self._outcomes_path, e)
+            return 0
+
     # ------------------------------------------------------------------ submit
     def submit(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
         """Enqueue a complete episode (list of frame dicts) for background saving."""
+        if self._finalized:
+            raise RuntimeError("dataset writer has already been finalized")
         if frames:
             self._queue.put((frames, outcome, task))
             with self._lock:
@@ -234,12 +250,17 @@ class AsyncDatasetWriter:
                 "saving_index": self._saving_index,
                 "saving_frames": self._saving_frames,
                 "queued": self._queue.qsize(),
+                "finalized": self._finalized,
             }
 
     @property
     def num_episodes(self) -> int:
         with self._lock:
             return self._n_episodes
+
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
 
     # ------------------------------------------------------------------ worker
     def _run(self) -> None:
@@ -306,16 +327,20 @@ class AsyncDatasetWriter:
     # ------------------------------------------------------------------ shutdown
     def finalize(self) -> None:
         """Drain the queue, stop the worker, then close the LeRobot dataset."""
-        self._stop.set()
-        if self._worker is not None:
-            self._worker.join(timeout=600.0)
-        if not self._mock and self._ds is not None and self._n_episodes > 0:
-            self._flush_pending_batch()
-            try:
-                self._ds.finalize()
-                logger.info("dataset finalized (parquet/metadata closed)")
-            except Exception as e:
-                logger.error("dataset finalize failed: %s", e)
+        with self._finalize_lock:
+            if self._finalized:
+                return
+            self._stop.set()
+            if self._worker is not None:
+                self._worker.join(timeout=600.0)
+            if not self._mock and self._ds is not None and self._n_episodes > 0:
+                self._flush_pending_batch()
+                try:
+                    self._ds.finalize()
+                    logger.info("dataset finalized (parquet/metadata closed)")
+                except Exception as e:
+                    logger.error("dataset finalize failed: %s", e)
+            self._finalized = True
 
     def _flush_pending_batch(self) -> None:
         """With batch_encoding_size > 1, LeRobot defers video encoding and its finalize()

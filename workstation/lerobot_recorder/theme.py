@@ -44,6 +44,10 @@ QPushButton:disabled {{ color: #484f58; }}
 QPushButton:checked {{ background: {OK}; border-color: {OK}; color: white; }}
 QPushButton#start {{ background: {ACCENT}; border-color: {ACCENT}; color: white; font-size: 40px; font-weight: 700; padding: 22px 40px; }}
 QPushButton#start:hover {{ background: #6cb1ff; }}
+QPushButton#save {{ background: #8ecbff; border-color: #8ecbff; color: #06111f; font-weight: 700; }}
+QPushButton#save:hover {{ background: #a6d8ff; border-color: #a6d8ff; }}
+QPushButton#save:pressed {{ background: #74bdf2; border-color: #74bdf2; }}
+QPushButton#save:disabled {{ background: #21262d; border-color: #30363d; color: #484f58; font-weight: 400; }}
 QPushButton#estop {{ font-size: 26px; font-weight: 700; }}
 QCheckBox {{ spacing: 10px; font-size: 26px; }}
 """

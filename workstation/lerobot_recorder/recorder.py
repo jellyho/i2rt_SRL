@@ -82,13 +82,31 @@ class Recorder:
         """Open cameras + robot link + dataset and begin the record loop (gate stays disarmed)."""
         self.cameras.start()
         self.robot.start()
-        shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}
-        self.writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes)
-        self.writer.open(self._sample_frame())
+        self.writer = self._open_writer()
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         self._set(running=True)
+
+    def _open_writer(self) -> AsyncDatasetWriter:
+        shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}
+        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes)
+        writer.open(self._sample_frame())
+        return writer
+
+    def _ensure_writer_open(self) -> AsyncDatasetWriter:
+        """Return a writer that can accept new episodes.
+
+        The GUI Save button finalizes the current writer so the dataset is usable on
+        disk. If collection continues afterward, the next kept episode reopens the
+        same dataset in resume/append mode.
+        """
+        if self.writer is not None and not self.writer.finalized:
+            return self.writer
+        if self.writer is not None and self.writer.num_episodes > 0:
+            self.cfg.resume = True
+        self.writer = self._open_writer()
+        return self.writer
 
     def _sample_frame(self) -> dict:
         """The FIXED recorded schema, derived from the robot's known outputs (see config)."""
@@ -156,7 +174,8 @@ class Recorder:
 
     def _submit(self, outcome: Optional[str]) -> None:
         """Hand the buffered episode to the writer queue and update live stats."""
-        self.writer.submit(self._episode, outcome, self.cfg.task)
+        writer = self._ensure_writer_open()
+        writer.submit(self._episode, outcome, self.cfg.task)
         with self._lock:
             self._status["kept"] += 1
             if outcome in ("success", "fail"):
@@ -173,11 +192,52 @@ class Recorder:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        if self.writer is not None:
+        if self.writer is not None and not self.writer.finalized:
             self.writer.finalize()
         self.cameras.stop()
         self.robot.stop()
         self._set(running=False)
+
+    def save_dataset(self) -> None:
+        """Finalize saved episodes now, without closing cameras or the robot link."""
+        if self._pending:
+            raise RuntimeError("review the pending episode before saving the dataset")
+        if self.gate.recording or (self._eval and self.gate.armed and self._episode):
+            raise RuntimeError("finish or stop the current recording before saving the dataset")
+
+        was_armed = self.gate.armed
+        self.gate.disarm()
+        self._set(armed=False, recording=False, pending=False)
+        try:
+            writer = self.writer
+            if writer is None:
+                return
+            if writer.finalized:
+                logger.info("dataset already saved; no new episodes to finalize")
+                return
+
+            progress = writer.progress
+            if progress.get("submitted", 0) <= 0 and writer.pending_total <= 0:
+                logger.info("no new episodes to save")
+                return
+
+            logger.info("saving dataset now; waiting for queued episodes to finish")
+            writer.finalize()
+            if writer.num_episodes > 0:
+                self.cfg.resume = True
+            logger.info("manual save complete")
+        finally:
+            if was_armed:
+                self.gate.arm()
+            self._set(
+                armed=self.gate.armed,
+                recording=False,
+                pending=False,
+                episodes=self.writer.num_episodes if self.writer is not None else 0,
+                frames=0,
+                queue=0,
+                saving=False,
+            )
 
     def set_estop(self, flag: bool) -> None:
         """Forward an e-stop request to the robot (holds the followers until released)."""
@@ -191,8 +251,17 @@ class Recorder:
             d["writer"] = self.writer.progress
             d["saving"] = d["writer"]["saving"]
             d["queue"] = d["writer"]["queued"]
+            d["saved"] = bool(d["writer"].get("finalized") and d["writer"].get("submitted", 0) > 0)
+            d["saveable"] = bool(
+                not d["writer"].get("finalized")
+                and d["writer"].get("submitted", 0) > 0
+                and not d.get("recording")
+                and not d.get("pending")
+            )
         else:
             d["saving"] = False
+            d["saved"] = False
+            d["saveable"] = False
         return d
 
     def get_last_images(self) -> dict:
