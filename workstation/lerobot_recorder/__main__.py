@@ -67,17 +67,20 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
         for cam, serial in zip(cams, [s.strip() for s in args.serials.split(",")], strict=False):
             cam.serial = serial
 
+    rec_section = rig.get("recorder", {}) or {}
     tasks = [t.strip() for t in args.tasks.split(";") if t.strip()] or list(rig.get("tasks", []) or [])
+    task = rec.get("task")
+    if task == p.get_default("task") and "task" not in rec_section and tasks:
+        task = tasks[0]
 
     # Booleans: config.yaml recorder.* sets the baseline; the CLI flag forces it on.
-    rec_section = rig.get("recorder", {}) or {}
     review_before_save = bool(rec_section.get("review_before_save", True)) and not args.no_review
     auto_arm = bool(rec_section.get("auto_arm", False)) or args.auto_arm
 
     cfg = RecorderConfig(
         repo_id=rec.get("repo_id"),
         root=rec.get("root"),
-        task=rec.get("task"),
+        task=task,
         tasks=tasks,
         fps=int(rec.get("fps")),
         cameras=cams,
