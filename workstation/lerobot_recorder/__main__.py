@@ -113,7 +113,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(theme.QSS)  # app-level so every window/dialog is themed
     gui = RecorderGUI(cfg)
-    gui.resize(760, 900)
+    gui.resize(1500, 900)
     gui.show()
     sys.exit(app.exec_())
 

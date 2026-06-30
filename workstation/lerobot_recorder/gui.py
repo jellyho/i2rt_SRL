@@ -34,7 +34,7 @@ from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import dataset_dir, dataset_info, remove_dataset_root
 from workstation.lerobot_recorder.recorder import Recorder
 from workstation.lerobot_recorder.sound import Cues
-from workstation.lerobot_recorder.views import compose_agentview
+from workstation.lerobot_recorder.views import compose_camera_strip
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +226,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.collect_btn.setEnabled(False)
         self.collect_btn.clicked.connect(self._on_collect)
 
-        # primary operator view: agentview + wrist insets composited into one frame
+        # primary operator view: left wrist, agentview, right wrist with no overlap
         self.live_lbl = QtWidgets.QLabel("camera view")
         self.live_lbl.setMinimumHeight(360)
         self.live_lbl.setAlignment(QtCore.Qt.AlignCenter)
@@ -436,7 +436,7 @@ class RecorderGUI(QtWidgets.QWidget):
             self.review_slider.setEnabled(False)
 
         images = self.recorder.get_last_images()
-        composite = compose_agentview(images, agent_key=self.cfg.review_cam)
+        composite = compose_camera_strip(images, agent_key=self.cfg.review_cam)
         if isinstance(composite, np.ndarray) and composite.ndim == 3:
             self.live_lbl.setPixmap(_np_to_pixmap(composite).scaled(self.live_lbl.size(), QtCore.Qt.KeepAspectRatio))
 

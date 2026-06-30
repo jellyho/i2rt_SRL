@@ -1,7 +1,9 @@
 """Image composition helpers for the operator views (pure numpy, no cv2).
 
+* :func:`compose_camera_strip` — left wrist, agentview, right wrist side-by-side
+  so the teleoperator can see every camera without overlap.
 * :func:`compose_agentview` — agentview as the base with the wrist views inset in
-  the bottom corners, giving the teleoperator one rich frame.
+  the bottom corners, kept for any callers that still want the compact view.
 * :func:`overlay` — alpha-blend two frames (e.g. an episode's first frame with the
   live camera) so the operator can match object placement before a replay.
 """
@@ -20,6 +22,26 @@ def _resize(img: np.ndarray, h: int, w: int) -> np.ndarray:
     yi = np.linspace(0, img.shape[0] - 1, h).astype(int)
     xi = np.linspace(0, img.shape[1] - 1, w).astype(int)
     return img[yi][:, xi]
+
+
+def compose_camera_strip(
+    images: Dict[str, np.ndarray],
+    agent_key: str = "agentview",
+    order: Tuple[str, ...] = ("wrist_left", "agentview", "wrist_right"),
+) -> Optional[np.ndarray]:
+    """Return a side-by-side live view ordered left camera, middle camera, right camera."""
+    ordered_keys = tuple(agent_key if key == "agentview" else key for key in order)
+    frames = [np.ascontiguousarray(images[key]) for key in ordered_keys if key in images]
+    if not frames:
+        frame = next(iter(images.values()), None)
+        return None if frame is None else np.ascontiguousarray(frame)
+
+    target_h = max(frame.shape[0] for frame in frames)
+    resized = [
+        _resize(frame, target_h, max(round(frame.shape[1] * target_h / frame.shape[0]), 1))
+        for frame in frames
+    ]
+    return np.ascontiguousarray(np.hstack(resized))
 
 
 def compose_agentview(
