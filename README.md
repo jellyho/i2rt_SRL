@@ -35,6 +35,7 @@ sh robot/setup_can_ids.sh          # plug the 4 CAN adapters one-by-one -> persi
 sh workstation/setup_workstation_env.sh   # conda create yam_ws + uv pip install + RealSense udev
 conda activate yam_ws
 workstation/yam-data cams                 # list connected RealSense serials
+# First SSH into the robot normally once before using sshpass, so the host key is trusted; the password is "robot".
 ```
 
 Then edit [`config.yaml`](config.yaml) at the repo root — at minimum the robot address and camera serials:
