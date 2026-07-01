@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from workstation.lerobot_recorder.config import RecorderConfig
-from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter, dataset_dir
+from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter, dataset_dir, dataset_info
 from workstation.lerobot_recorder.doctor import outcomes_by_episode, summarize_outcomes
 from workstation.lerobot_recorder.episode_gate import EV_IDLE, EV_RECORD, EV_START, EV_STOP, EpisodeGate
 
@@ -77,6 +77,106 @@ def test_async_writer_saves_each_queued_episode(tmp_path):
     # the dataset (and its outcomes sidecar) lives at <root>/<name>
     sidecar = Path(dataset_dir(str(tmp_path), cfg.repo_id)) / "outcomes.jsonl"
     assert len(sidecar.read_text().splitlines()) == 3
+
+
+def test_async_writer_resume_preserves_encoding_kwargs(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeDataset:
+        def __init__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            self.num_episodes = 7
+            self.episodes_since_last_encoding = 0
+
+        def finalize(self):
+            pass
+
+    monkeypatch.setattr(
+        "workstation.lerobot_recorder.dataset_writer._import_lerobot_dataset",
+        lambda: FakeDataset,
+    )
+
+    cfg = RecorderConfig(
+        repo_id="test/yam",
+        root=str(tmp_path),
+        mock=False,
+        resume=True,
+        vcodec="auto",
+        batch_encoding_size=4,
+        encoder_threads=2,
+    )
+    Path(dataset_dir(str(tmp_path), cfg.repo_id)).mkdir(parents=True)
+
+    w = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (4, 4, 3)})
+    w.open(_frame())
+    w.finalize()
+
+    assert calls == [
+        (
+            ("test/yam",),
+            {
+                "root": str(tmp_path / "yam"),
+                "vcodec": "auto",
+                "batch_encoding_size": 4,
+                "encoder_threads": 2,
+            },
+        )
+    ]
+
+
+def test_async_writer_resume_recovers_missing_outcome_rows(tmp_path, monkeypatch):
+    class FakeDataset:
+        def __init__(self, *args, **kwargs):
+            self.num_episodes = 3
+            self.episodes_since_last_encoding = 0
+            self.meta = type(
+                "Meta",
+                (),
+                {
+                    "episodes": [
+                        {"episode_index": 0, "tasks": ["pick"], "length": 10},
+                        {"episode_index": 1, "tasks": ["pick"], "length": 11},
+                        {"episode_index": 2, "tasks": ["place"], "length": 12},
+                    ]
+                },
+            )()
+
+        def finalize(self):
+            pass
+
+    monkeypatch.setattr(
+        "workstation.lerobot_recorder.dataset_writer._import_lerobot_dataset",
+        lambda: FakeDataset,
+    )
+
+    cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), mock=False, resume=True)
+    ds_dir = Path(dataset_dir(str(tmp_path), cfg.repo_id))
+    ds_dir.mkdir(parents=True)
+    sidecar = ds_dir / "outcomes.jsonl"
+    sidecar.write_text(json.dumps({"episode": 1, "outcome": "success", "task": "pick", "frames": 11}) + "\n")
+
+    w = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (4, 4, 3)})
+    w.open(_frame())
+    w.finalize()
+
+    rows = [json.loads(line) for line in sidecar.read_text().splitlines()]
+    assert [row["episode"] for row in rows] == [0, 1, 2]
+    assert rows[0]["outcome"] == "unknown"
+    assert rows[0]["task"] == "pick"
+    assert rows[0]["frames"] == 10
+    assert rows[0]["recovered"] is True
+    assert rows[1]["outcome"] == "success"
+    assert rows[2]["outcome"] == "unknown"
+    assert rows[2]["task"] == "place"
+
+
+def test_dataset_info_prefers_lerobot_episode_count(tmp_path):
+    ds_dir = tmp_path / "yam"
+    (ds_dir / "meta").mkdir(parents=True)
+    (ds_dir / "meta" / "info.json").write_text(json.dumps({"total_episodes": 41}))
+    (ds_dir / "outcomes.jsonl").write_text(json.dumps({"episode": 40, "outcome": "success"}) + "\n")
+
+    assert dataset_info(str(ds_dir)) == {"exists": True, "episodes": 41}
 
 
 def test_disk_guard_refuses_save(tmp_path):
