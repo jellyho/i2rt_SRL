@@ -44,13 +44,23 @@ class DeployGUI(RecorderGUI):
         self.discard_home_btn.clicked.connect(lambda: self._on_finish("discard"))
         self.runner_status = QtWidgets.QLabel("policy: not connected")
         self.runner_status.setStyleSheet(f"color:{theme.MUTED};")
+        self.button_legend = QtWidgets.QLabel(
+            "Handle buttons: left upper = start/stop policy rollout, left lower = human intervention on/off, "
+            "right upper = discard + home, right lower = keep + home."
+        )
+        self.button_legend.setWordWrap(True)
+        self.button_legend.setStyleSheet(
+            f"background:#2d230b;color:{theme.TEXT};border:1px solid {theme.WARN};"
+            "border-radius:8px;padding:10px 12px;font-weight:600;"
+        )
 
         grid.addWidget(self.dagger_state, 0, 0, 1, 4)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
         grid.addWidget(self.keep_home_btn, 1, 2)
         grid.addWidget(self.discard_home_btn, 1, 3)
-        grid.addWidget(self.runner_status, 2, 0, 1, 4)
+        grid.addWidget(self.button_legend, 2, 0, 1, 4)
+        grid.addWidget(self.runner_status, 3, 0, 1, 4)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):
