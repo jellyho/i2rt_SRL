@@ -6,9 +6,13 @@
 # env is fully independent — add your model's deps here
 # (torch / JAX / CUDA, lerobot, or openpi from its repo).
 #
-#   sh policy_serving/setup_policy_env.sh
+#   bash policy_serving/setup_policy_env.sh
 #
 # Env overrides:  POLICY_PY=3.11
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
