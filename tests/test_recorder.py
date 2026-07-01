@@ -103,3 +103,38 @@ def test_dagger_source_assembly():
     snap_idle = bridge._assemble(idle)
     assert snap_idle["teleop_state"] == "IDLE"
     assert snap_idle["action"] is None  # not intervening -> nothing to record
+
+
+def test_dagger_snapshot_carries_state_and_event():
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    bridge = PortalBridge(cfg)
+    pose = {"pos": [0.0] * 7, "vel": [0.0] * 7, "eff": [0.0] * 7}
+    snap = bridge._assemble(
+        {
+            "intervention": False,
+            "policy_running": True,
+            "homing": False,
+            "dagger_state": "policy",
+            "last_dagger_event": {"seq": 3, "action": "keep"},
+            "left": pose,
+            "right": pose,
+            "t": 2.0,
+        }
+    )
+    assert snap["policy_running"] is True
+    assert snap["dagger_state"] == "policy"
+    assert snap["last_dagger_event"] == {"seq": 3, "action": "keep"}
+
+
+def test_dagger_recorder_events_do_not_use_expert_button_map():
+    cfg = RecorderConfig(record_source="dagger", mock=False, button_map={"left.0": "discard"})
+    rec = Recorder(cfg)
+    rec.gate.arm()
+    rec.gate.update("ENGAGED")
+    rec._scan_buttons({"buttons": {"left": [1]}})
+    assert rec._btn_outcome is None
+
+    rec._scan_dagger_event({"last_dagger_event": {"seq": 1, "action": "keep"}})
+    assert rec._btn_outcome == "keep"
+    rec._scan_dagger_event({"last_dagger_event": {"seq": 2, "action": "discard"}})
+    assert rec._btn_outcome == "discard"

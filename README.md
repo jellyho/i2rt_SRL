@@ -85,8 +85,8 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ```bash
 robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.1      # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
-workstation/yam-data bridge --prompt "pick up the cube"  # 💻 workstation (reads config.yaml)
-# press a handle button (or RobotClient.set_intervention) to take over; release to hand back.
+workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
+# UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 ```
 
 ### D · Replay a dataset onto the robot

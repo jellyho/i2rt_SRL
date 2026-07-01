@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
 from typing import Dict, List
 
 import numpy as np
@@ -32,30 +31,9 @@ from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClien
 
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.config import ARM_DOF, ARMS, RecorderConfig
+from workstation.policy_bridge.config import BridgeConfig
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class BridgeConfig:
-    robot_host: str = "127.0.0.1"
-    robot_port: int = 11331
-    policy_host: str = "127.0.0.1"
-    policy_port: int = 8000
-    action_horizon: int = 16
-    rate_hz: float = 30.0
-    image_size: int = 224
-    prompt: str = "do the task"
-    use_async: bool = True  # prefetch the next action chunk to hide inference latency
-    # camera role -> obs key sent to the policy (align to your policy's config)
-    image_keys: Dict[str, str] = field(
-        default_factory=lambda: {
-            "agentview": "observation/images/agentview",
-            "wrist_left": "observation/images/wrist_left",
-            "wrist_right": "observation/images/wrist_right",
-        }
-    )
-
 
 class PolicyBridge:
     def __init__(self, cfg: BridgeConfig, recorder_cfg: RecorderConfig):
@@ -112,6 +90,10 @@ class PolicyBridge:
         )
         period = 1.0 / max(self.cfg.rate_hz, 1.0)
         try:
+            try:
+                self.robot.set_policy_running(True)
+            except Exception:
+                pass
             while not self._stop:
                 t0 = time.monotonic()
                 try:
@@ -129,6 +111,10 @@ class PolicyBridge:
         except KeyboardInterrupt:
             pass
         finally:
+            try:
+                self.robot.set_policy_running(False)
+            except Exception:
+                pass
             self.cameras.stop()
 
     def stop(self) -> None:

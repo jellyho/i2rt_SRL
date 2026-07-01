@@ -34,6 +34,11 @@ _EMPTY = {
     "action": None,
     "buttons": {},
     "intervention": False,
+    "policy_running": False,
+    "homing": False,
+    "dagger_state": "stopped",
+    "last_dagger_event": None,
+    "estop": False,
     "stamp": 0.0,
 }
 
@@ -49,6 +54,11 @@ class PortalBridge:
         self._connected = False
         self._estop_req = False
         self._estop_sent: Optional[bool] = None
+        self._policy_running_req: Optional[bool] = None
+        self._policy_running_sent: Optional[bool] = None
+        self._intervention_req: Optional[bool] = None
+        self._intervention_sent: Optional[bool] = None
+        self._finish_req: Optional[str] = None
         self._last_err: Optional[str] = None
 
     @property
@@ -59,6 +69,20 @@ class PortalBridge:
     def set_estop(self, flag: bool) -> None:
         """Request a robot e-stop; applied (and re-applied on reconnect) by the poll loop."""
         self._estop_req = bool(flag)
+
+    def set_policy_running(self, flag: bool) -> None:
+        """Request DAgger policy rollout start/stop."""
+        self._policy_running_req = bool(flag)
+
+    def set_intervention(self, flag: bool) -> None:
+        """Request DAgger human intervention state."""
+        self._intervention_req = bool(flag)
+
+    def finish_dagger_run(self, action: str) -> None:
+        """Request DAgger keep/discard + homing."""
+        action = str(action).lower()
+        if action in {"keep", "discard"}:
+            self._finish_req = action
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -115,10 +139,25 @@ class PortalBridge:
                 if self._estop_sent != self._estop_req:  # apply e-stop (and re-apply on reconnect)
                     self._client.set_estop(self._estop_req)
                     self._estop_sent = self._estop_req
+                if (
+                    self._policy_running_req is not None
+                    and self._policy_running_sent != self._policy_running_req
+                ):
+                    self._client.set_policy_running(self._policy_running_req)
+                    self._policy_running_sent = self._policy_running_req
+                if self._intervention_req is not None and self._intervention_sent != self._intervention_req:
+                    self._client.set_intervention(self._intervention_req)
+                    self._intervention_sent = self._intervention_req
+                if self._finish_req is not None:
+                    action = self._finish_req
+                    self._finish_req = None
+                    self._client.finish_dagger_run(action)
             except Exception as e:
                 self._client = None  # drop and retry next tick
                 self._connected = False
                 self._estop_sent = None  # force re-apply after reconnect
+                self._policy_running_sent = None
+                self._intervention_sent = None
                 # Surface *why* the link is down instead of failing silently — but only
                 # when the reason changes, so a persistently-down server doesn't spam.
                 msg = f"{type(e).__name__}: {e}"
@@ -179,6 +218,11 @@ class PortalBridge:
             "action": action,
             "buttons": buttons,
             "intervention": intervening,
+            "policy_running": bool(obs.get("policy_running")),
+            "homing": bool(obs.get("homing")),
+            "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
+            "last_dagger_event": obs.get("last_dagger_event"),
+            "estop": bool(obs.get("estop")),
             "stamp": float(obs.get("t", 0.0)),
         }
 
@@ -206,6 +250,9 @@ class PortalBridge:
                     "state": state,
                     "leader": leader,
                     "action": action,
+                    "policy_running": bool(self._policy_running_req),
+                    "intervention": name == "ENGAGED",
+                    "dagger_state": "policy" if self._policy_running_req else "stopped",
                     "stamp": now,
                 }
             if now - seg_start >= dur:
