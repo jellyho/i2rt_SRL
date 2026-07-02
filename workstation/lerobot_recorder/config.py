@@ -85,6 +85,16 @@ class RecorderConfig:
     fps: int = 60  # dataset / record-loop rate (matched to the 60 fps cameras)
     robot_type: str = "yam_bimanual"
     use_videos: bool = True
+    # Output dataset format: "lerobot" (LeRobotDataset, default) or "abcdl" (the abcdl
+    # MP4+binary training cache — one episode dir per save, loadable via AbcdlDataset /
+    # pushable with AbcdlDataset.push_to_hub). Needs the `abcdl` package installed.
+    record_format: str = "lerobot"
+    abcdl_size: int = 224  # square px the cameras are resized to for the abcdl format
+    # Per-frame RL signals computed from the episode outcome and stored as dataset
+    # features (success / reward / mc_return) — for value/RL learners.
+    rl_features: bool = False        # enable per-frame success/reward/mc_return
+    reward_mode: str = "sparse"      # "sparse" (0/+1 at success) | "step" (-1/step, 0 at success)
+    discount_factor: float = 0.99    # γ for the Monte-Carlo return-to-go
     # Video encoding speed (LeRobot). The default 'libsvtav1' (AV1) is SLOW to encode;
     # 'h264' is much faster, 'auto' picks a hardware encoder (e.g. nvenc) if available.
     vcodec: str = "libsvtav1"
