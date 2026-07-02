@@ -5,9 +5,13 @@
 # Creates a uv venv (default: <repo>/.venv) and installs i2rt. The robot machine
 # runs the portal robot server (i2rt.serving.run_robot_server).
 #
-#   sh robot/setup_robot_env.sh
+#   bash robot/setup_robot_env.sh
 #
 # Env overrides:  ROBOT_PY=3.11  VENV=/path/to/venv
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +42,6 @@ cat <<EOF
 
 [setup] done.
   Activate:    source $VENV/bin/activate
-  Bring up CAN: sh robot/setup_can_ids.sh   (once)  /  sh robot/reset_all_can.sh (per boot)
+  Bring up CAN: bash robot/setup_can_ids.sh   (once)  /  bash robot/reset_all_can.sh (per boot)
   Run server:  robot/yam teleop   |  robot/yam dagger   |  robot/yam wrapper
 EOF

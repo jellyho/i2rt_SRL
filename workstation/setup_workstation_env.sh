@@ -6,9 +6,13 @@
 # it), and uv does the fast installs for THIS repo. Installs i2rt (portal client),
 # yam-policy (websocket client for the bridge), and the LeRobot recorder deps.
 #
-#   sh workstation/setup_workstation_env.sh
+#   bash workstation/setup_workstation_env.sh
 #
 # Env overrides:  YAM_WS_ENV=yam_ws  WS_PY=3.11
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

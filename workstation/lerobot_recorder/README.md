@@ -60,8 +60,8 @@ Recorded at **60 fps** (matched to the cameras). Uses the official v3.0 API
 ### [robot machine] — YAM robot server (uv; nothing to activate)
 
 ```bash
-sh robot/setup_robot_env.sh            # optional: pre-create .venv + install i2rt
-sh robot/setup_can_ids.sh              # persistent CAN names (once)
+bash robot/setup_robot_env.sh          # optional: pre-create .venv + install i2rt
+bash robot/setup_can_ids.sh            # persistent CAN names (once)
 ```
 
 You don't need to activate anything — `robot/yam` uses **`uv run`**, which resolves
@@ -74,7 +74,7 @@ conda owns the env (so you can also `pip install` other policy repos into it); u
 does the fast installs for this repo:
 
 ```bash
-sh workstation/setup_workstation_env.sh       # conda create yam_ws + uv pip install + udev rules
+bash workstation/setup_workstation_env.sh     # conda create yam_ws + uv pip install + udev rules
 conda activate yam_ws
 ```
 

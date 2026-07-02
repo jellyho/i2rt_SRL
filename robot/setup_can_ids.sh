@@ -12,8 +12,12 @@
 #   can_leader_l  can_leader_r  can_follower_l  can_follower_r
 #
 # Usage:
-#   sh robot/setup_can_ids.sh
+#   bash robot/setup_can_ids.sh
 #
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 if [ "$(id -u)" != "0" ]; then
@@ -150,4 +154,4 @@ echo "    python i2rt/motor_config_tool/ping_motors.py --channel can_follower_l"
 echo "    python robot/read_encoder.py --channel can_leader_l"
 echo
 echo "Note: 'ip link ... up' does not persist across reboot. Re-run the bring-up"
-echo "loop (or 'sh robot/reset_all_can.sh') after each boot."
+echo "loop (or 'bash robot/reset_all_can.sh') after each boot."
