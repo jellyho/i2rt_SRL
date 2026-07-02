@@ -56,13 +56,22 @@ def dataset_info(root: str) -> Dict:
     """Inspect the dataset dir at ``root`` for the setup page — no lerobot import.
 
     ``{"exists": bool, "episodes": int|None}``. Episode count is a best-effort read
-    of the ``outcomes.jsonl`` sidecar (None if absent/unreadable)."""
+    of LeRobot metadata, falling back to the ``outcomes.jsonl`` sidecar."""
     path = os.path.expanduser(root)
     if not os.path.isdir(path) or not os.listdir(path):
         return {"exists": False, "episodes": None}
     episodes: Optional[int] = None
+    info_path = os.path.join(path, "meta", "info.json")
+    if os.path.exists(info_path):
+        try:
+            with open(info_path) as fh:
+                meta_episodes = json.load(fh).get("total_episodes")
+            if meta_episodes is not None:
+                episodes = int(meta_episodes)
+        except Exception:
+            episodes = None
     sidecar = os.path.join(path, "outcomes.jsonl")
-    if os.path.exists(sidecar):
+    if episodes is None and os.path.exists(sidecar):
         try:
             with open(sidecar) as fh:
                 episodes = sum(1 for line in fh if line.strip())
@@ -144,6 +153,110 @@ class AsyncDatasetWriter:
             feats[key] = {"dtype": "float32", "shape": (vec.size,), "names": self._vector_names(key, vec.size)}
         return feats
 
+    def _dataset_encoding_kwargs(self) -> dict:
+        enc = {
+            "vcodec": self.cfg.vcodec,
+            "batch_encoding_size": max(1, int(self.cfg.batch_encoding_size)),
+        }
+        if int(self.cfg.encoder_threads) > 0:
+            enc["encoder_threads"] = int(self.cfg.encoder_threads)
+        return enc
+
+    def _create_encoding_kwargs(self) -> dict:
+        enc = self._dataset_encoding_kwargs()
+        # Async PNG writer (parallelizes the slow pre-encode step). Only pass when
+        # enabled so older LeRobot versions without these kwargs keep working.
+        if int(self.cfg.image_writer_threads) > 0 or int(self.cfg.image_writer_processes) > 0:
+            enc["image_writer_threads"] = int(self.cfg.image_writer_threads)
+            enc["image_writer_processes"] = int(self.cfg.image_writer_processes)
+        return enc
+
+    def _dataset_episode_entries(self) -> List[dict]:
+        episodes = getattr(getattr(self._ds, "meta", None), "episodes", None)
+        if episodes is None:
+            return []
+        entries: List[dict] = []
+        try:
+            iterator = iter(episodes)
+        except TypeError:
+            return []
+        for ep in iterator:
+            try:
+                episode_index = int(ep["episode_index"])
+            except Exception:
+                continue
+            tasks = ep.get("tasks") or []
+            if isinstance(tasks, str):
+                task = tasks
+            else:
+                task = str(tasks[0]) if tasks else self.cfg.task
+            length = ep.get("length")
+            if length is None:
+                length = int(ep.get("dataset_to_index", 0)) - int(ep.get("dataset_from_index", 0))
+            entries.append(
+                {
+                    "episode": episode_index,
+                    "outcome": "unknown",
+                    "task": task,
+                    "frames": int(length),
+                    "source": "recovered",
+                    "t": None,
+                    "recovered": True,
+                }
+            )
+        return entries
+
+    def _read_outcome_entries(self) -> List[dict]:
+        if not os.path.exists(self._outcomes_path):
+            return []
+        entries: List[dict] = []
+        try:
+            with open(self._outcomes_path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning("skipping malformed outcome row in %s", self._outcomes_path)
+        except Exception as e:
+            logger.error("could not read outcome sidecar: %s", e)
+        return entries
+
+    def _rewrite_outcome_entries(self, entries: List[dict]) -> None:
+        os.makedirs(self._root, exist_ok=True)
+        tmp_path = f"{self._outcomes_path}.tmp"
+        with open(tmp_path, "w") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry) + "\n")
+        os.replace(tmp_path, self._outcomes_path)
+
+    def _ensure_outcome_sidecar_complete(self) -> None:
+        recovered = {int(e["episode"]): e for e in self._dataset_episode_entries()}
+        if not recovered:
+            return
+        entries_by_episode: Dict[int, dict] = {}
+        for entry in self._read_outcome_entries():
+            try:
+                entries_by_episode[int(entry["episode"])] = entry
+            except Exception:
+                logger.warning("skipping outcome row without a valid episode index in %s", self._outcomes_path)
+        missing = sorted(set(recovered) - set(entries_by_episode))
+        if not missing:
+            return
+        for episode_index in missing:
+            entries_by_episode[episode_index] = recovered[episode_index]
+        ordered = [entries_by_episode[i] for i in sorted(entries_by_episode)]
+        try:
+            self._rewrite_outcome_entries(ordered)
+            logger.warning(
+                "recovered %d missing outcome sidecar row(s) from dataset metadata: episodes %s",
+                len(missing), missing,
+            )
+        except Exception as e:
+            logger.error("could not repair outcome sidecar: %s", e)
+
     # ------------------------------------------------------------------ lifecycle
     def open(self, sample_frame: dict) -> None:
         """Open the dataset using ``sample_frame`` to derive the feature schema."""
@@ -151,23 +264,22 @@ class AsyncDatasetWriter:
         if not self._mock:
             LeRobotDataset = _import_lerobot_dataset()
             if self.cfg.resume and os.path.isdir(self._root):
-                self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root)
+                enc = self._dataset_encoding_kwargs()
+                try:
+                    self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root, **enc)
+                except TypeError:
+                    logger.warning("LeRobotDataset() rejected encoding kwargs %s; using defaults", sorted(enc))
+                    self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root)
                 self._n_episodes = int(
                     getattr(self._ds, "num_episodes", getattr(getattr(self._ds, "meta", None), "total_episodes", 0))
                 )
-                logger.info("dataset resuming at %s (%d existing episodes)", self._root, self._n_episodes)
+                self._ensure_outcome_sidecar_complete()
+                logger.info(
+                    "dataset resuming at %s (%d existing episodes, vcodec=%s, batch=%s)",
+                    self._root, self._n_episodes, self.cfg.vcodec, self.cfg.batch_encoding_size,
+                )
             else:
-                enc = {  # video-encoding knobs (faster codec / parallel batch encoding)
-                    "vcodec": self.cfg.vcodec,
-                    "batch_encoding_size": max(1, int(self.cfg.batch_encoding_size)),
-                }
-                if int(self.cfg.encoder_threads) > 0:
-                    enc["encoder_threads"] = int(self.cfg.encoder_threads)
-                # Async PNG writer (parallelizes the slow pre-encode step). Only pass when
-                # enabled so older LeRobot versions without these kwargs keep working.
-                if int(self.cfg.image_writer_threads) > 0 or int(self.cfg.image_writer_processes) > 0:
-                    enc["image_writer_threads"] = int(self.cfg.image_writer_threads)
-                    enc["image_writer_processes"] = int(self.cfg.image_writer_processes)
+                enc = self._create_encoding_kwargs()
                 try:
                     self._ds = LeRobotDataset.create(
                         repo_id=self.cfg.repo_id,
