@@ -83,8 +83,11 @@ def main() -> None:
     pd.add_argument("--config", default=None, help="config.yaml (control overrides + port)")
     pd.add_argument("--port", type=int, default=default_port)
     pd.add_argument("--sim", action="store_true")
+    pd.add_argument("--home", default="")
     pd.add_argument("--mirror-kp", type=float, default=cc.DAGGER_MIRROR_KP)
     pd.add_argument("--feedback-kp", type=float, default=cc.DAGGER_FEEDBACK_KP)
+    pd.add_argument("--home-kp", type=float, default=cc.HOME_KP)
+    pd.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for DAgger keep/discard homing")
     pd.add_argument("--rate", type=float, default=120.0)
     pd.add_argument("--max-joint-speed", type=float, default=1.5)
 
@@ -117,13 +120,20 @@ def main() -> None:
             )
         )
     elif args.mode == "dagger":
+        dagger_sec = rig.get("dagger", {}) or {}
         ctrl = DaggerController(
             DaggerConfig(
                 sim=args.sim,
+                home=args.home,
                 mirror_kp=args.mirror_kp,
                 feedback_kp=args.feedback_kp,
+                home_kp=args.home_kp,
+                home_speed=args.home_speed,
                 rate=args.rate,
                 max_joint_speed=args.max_joint_speed,
+                button_map=dict(dagger_sec.get("buttons", {}))
+                if dagger_sec.get("buttons")
+                else DaggerConfig().button_map,
             )
         )
     else:  # wrapper

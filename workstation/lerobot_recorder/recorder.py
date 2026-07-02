@@ -64,6 +64,12 @@ class Recorder:
             "success": 0,
             "fail": 0,
             "discarded": 0,
+            "interventions": 0,
+            "dagger_state": "stopped",
+            "policy_running": False,
+            "intervention": False,
+            "homing": False,
+            "estop": False,
         }
         self._last_images: dict = {}
         self._pending = False
@@ -73,6 +79,9 @@ class Recorder:
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
         # "<side>.<index>" -> outcome (success/fail/discard); see RecorderConfig.button_map
         self._button_outcome: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in (cfg.button_map or {}).items()}
+        if cfg.record_source == "dagger":
+            self._button_outcome = {}  # DAgger buttons are handled by the robot state machine.
+        self._last_dagger_event_seq = 0
         # "eval": record a continuous rollout (policy / intervention) from arm to disarm,
         # instead of gating on the teleop engage signal.
         self._eval = cfg.record_source == "eval"
@@ -243,6 +252,18 @@ class Recorder:
         """Forward an e-stop request to the robot (holds the followers until released)."""
         self.robot.set_estop(flag)
 
+    def set_policy_running(self, flag: bool) -> None:
+        """Forward a DAgger policy rollout start/stop request."""
+        self.robot.set_policy_running(flag)
+
+    def set_intervention(self, flag: bool) -> None:
+        """Forward a DAgger human-intervention request."""
+        self.robot.set_intervention(flag)
+
+    def finish_dagger_run(self, action: str) -> None:
+        """Forward a DAgger keep/discard + home request."""
+        self.robot.finish_dagger_run(action)
+
     def get_status(self) -> dict:
         with self._lock:
             d = dict(self._status)
@@ -287,8 +308,9 @@ class Recorder:
                 with self._lock:
                     self._last_images = images
                 snap = self.robot.get_snapshot()
+                self._scan_dagger_event(snap)
                 if self._pending:
-                    self._set(teleop=snap["teleop_state"])  # awaiting Keep/Delete: don't start a new episode
+                    self._set(teleop=snap["teleop_state"], **self._dagger_status(snap))
                 else:
                     self._step(images, snap)
                     warned = self._warn_state(snap, warned)
@@ -309,6 +331,7 @@ class Recorder:
 
     def _step(self, images: dict, snap: dict) -> None:
         self._scan_buttons(snap)
+        self._scan_dagger_event(snap)
 
         if self._eval:  # continuous rollout while armed; no engage gate
             if self.gate.armed and self.cameras.healthy and snap["state"] is not None and snap["action"] is not None:
@@ -324,6 +347,7 @@ class Recorder:
                 queue=self.writer.queue_depth,
                 cam_ok=self.cameras.healthy,
                 robot_ok=self.robot.connected,
+                **self._dagger_status(snap),
             )
             return
 
@@ -333,6 +357,9 @@ class Recorder:
             if event == eg.EV_START:
                 self._episode, self._preview, self._btn_outcome = [], [], None
                 logger.info("● recording episode (teleop engaged)")
+                if self.cfg.record_source == "dagger":
+                    with self._lock:
+                        self._status["interventions"] += 1
             if snap["state"] is not None and snap["action"] is not None and self.cameras.healthy:
                 self._episode.append(self._frame(images, snap))
                 self._buffer_preview(images)
@@ -362,7 +389,44 @@ class Recorder:
             queue=self.writer.queue_depth,
             cam_ok=self.cameras.healthy,
             robot_ok=self.robot.connected,
+            **self._dagger_status(snap),
         )
+
+    @staticmethod
+    def _dagger_status(snap: dict) -> dict:
+        return {
+            "dagger_state": snap.get("dagger_state", "stopped"),
+            "policy_running": bool(snap.get("policy_running")),
+            "intervention": bool(snap.get("intervention")),
+            "homing": bool(snap.get("homing")),
+            "estop": bool(snap.get("estop")),
+        }
+
+    def _scan_dagger_event(self, snap: dict) -> None:
+        """Apply robot-side DAgger keep/discard events exactly once."""
+        if self.cfg.record_source != "dagger":
+            return
+        event = snap.get("last_dagger_event")
+        if not isinstance(event, dict):
+            return
+        try:
+            seq = int(event.get("seq", 0))
+        except Exception:
+            return
+        if seq <= self._last_dagger_event_seq:
+            return
+        self._last_dagger_event_seq = seq
+        action = str(event.get("action", "")).lower()
+        if action == "keep":
+            if self._pending:
+                self.keep_episode(outcome="keep")
+            else:
+                self._btn_outcome = "keep"
+        elif action == "discard":
+            if self._pending:
+                self.delete_episode()
+            else:
+                self._btn_outcome = "discard"
 
     def _scan_buttons(self, snap: dict) -> None:
         """Latch a success/fail/discard outcome on a rising edge of a leader label button,

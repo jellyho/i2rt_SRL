@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Convenience launcher for the workstation-side tools (recorder / replay / bridge).
+# Convenience launcher for the workstation-side tools (recorder / replay / bridge / deploy).
 #
 # Activates the workstation **conda** env (default: yam_ws) and runs a tool.
 # Inside that conda env this repo is installed with uv; you can pip/uv-install other
@@ -9,6 +9,7 @@
 #   workstation/yam-data record [args]   # GUI recorder (teleop-gated LeRobot capture)
 #   workstation/yam-data replay [args]   # GUI replay (drive the robot from a dataset)
 #   workstation/yam-data bridge [args]   # policy bridge (portal robot <-> websocket policy)
+#   workstation/yam-data deploy [args]   # GUI DAgger deployment + policy bridge
 #   workstation/yam-data cams            # list connected RealSense serials
 #   workstation/yam-data doctor [args]   # dataset stats / validation
 #
@@ -36,10 +37,11 @@ case "$cmd" in
     record) exec python -m workstation.lerobot_recorder "$@" ;;
     replay) exec python -m workstation.lerobot_recorder.replay_main "$@" ;;
     bridge) exec python -m workstation.policy_bridge "$@" ;;
+    deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|bridge|cams|doctor} [args]" >&2
+        echo "usage: yam-data {record|replay|bridge|deploy|cams|doctor} [args]" >&2
         exit 2
         ;;
 esac

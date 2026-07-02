@@ -34,6 +34,7 @@ def test_controllers_step_sim():
     tc.close()
 
     dc = DaggerController(DaggerConfig(sim=True))
+    dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
     for _ in range(3):
         dc.step()
@@ -41,6 +42,60 @@ def test_controllers_step_sim():
     assert ds["intervention"] is False
     assert len(ds["left"]["applied"]) == 7  # policy drives the follower when not intervening
     dc.close()
+
+
+def test_dagger_policy_intervention_and_home_states():
+    dc = DaggerController(DaggerConfig(sim=True, max_joint_speed=10.0, home_speed=10.0))
+    dc.step()
+    assert dc.snapshot()["dagger_state"] == "stopped"
+
+    dc.set_policy_running(True)
+    dc.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+    dc.step()
+    snap = dc.snapshot()
+    assert snap["dagger_state"] == "policy"
+    assert snap["policy_running"] is True
+    assert snap["left"]["applied"] is not None
+
+    dc.set_intervention(True)
+    dc.step()
+    snap = dc.snapshot()
+    assert snap["dagger_state"] == "intervention"
+    assert snap["intervention"] is True
+
+    dc.finish_dagger_run("keep")
+    for _ in range(60):
+        dc.step()
+        if dc.snapshot()["dagger_state"] == "stopped":
+            break
+    snap = dc.snapshot()
+    assert snap["dagger_state"] == "stopped"
+    assert snap["policy_running"] is False
+    assert snap["intervention"] is False
+    assert snap["last_dagger_event"]["action"] == "keep"
+    dc.close()
+
+
+def test_dagger_button_map_toggles_rollout(monkeypatch):
+    ctrl = DaggerController(
+        DaggerConfig(sim=True, button_map={"left.0": "rollout_toggle", "left.1": "intervention_toggle"})
+    )
+    current = {"buttons": [1, 0]}
+
+    def fake_read_handle(leader):
+        return np.zeros(leader.num_dofs()), None, list(current["buttons"])
+
+    monkeypatch.setattr("i2rt.serving.controllers.read_handle", fake_read_handle)
+    ctrl.step()
+    assert ctrl.snapshot()["policy_running"] is True
+    ctrl.step()  # held button does not retrigger
+    assert ctrl.snapshot()["policy_running"] is True
+    current["buttons"] = [0, 0]
+    ctrl.step()
+    current["buttons"] = [1, 0]
+    ctrl.step()
+    assert ctrl.snapshot()["policy_running"] is False
+    ctrl.close()
 
 
 def test_teleop_bilateral_engage_steps():

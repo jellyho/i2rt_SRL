@@ -7,6 +7,8 @@ rate, and serves these portal methods to the workstation:
 * ``get_metadata()``         -> {mode, sides, has_gripper}
 * ``set_policy_action(data)``-> {side: position} (dagger / wrapper)
 * ``set_intervention(flag)`` -> external gate override (dagger)
+* ``set_policy_running(flag)`` -> start/stop DAgger policy rollout
+* ``finish_dagger_run(action)`` -> keep/discard current DAgger run and home
 * ``command(data)``          -> {side: position} direct follower target (wrapper/replay)
 * ``set_sim_engage(flag)``   -> force ENGAGED in sim (teleop)
 
@@ -41,6 +43,8 @@ class RobotServer:
         self._server.bind("get_metadata", self.controller.metadata)
         self._server.bind("set_policy_action", self.controller.set_policy_action)
         self._server.bind("set_intervention", self.controller.set_intervention)
+        self._server.bind("set_policy_running", self.controller.set_policy_running)
+        self._server.bind("finish_dagger_run", self.controller.finish_dagger_run)
         self._server.bind("command", self.controller.command)
         self._server.bind("set_sim_engage", self.controller.set_sim_engage)
         self._server.bind("set_estop", self.controller.set_estop)
