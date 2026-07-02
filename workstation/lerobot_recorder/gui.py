@@ -156,7 +156,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.root_edit.textChanged.connect(lambda *_: self._update_setup_status())
 
         self.task_combo = QtWidgets.QComboBox()
-        self.task_combo.setEditable(True)
+        self.task_combo.setEditable(False)
         seen = []
         for t in [self.cfg.task, *self.cfg.tasks]:
             if t and t not in seen:

@@ -8,6 +8,7 @@ import i2rt.serving.rig_config as rc
 from i2rt.serving import control_config as cc
 from i2rt.serving.rig_config import Resolver, apply_camera_serials, apply_control_overrides, find_rig, load_rig
 from workstation.lerobot_recorder.config import default_cameras
+from workstation.lerobot_recorder.__main__ import build_config
 
 
 def _no_repo_rig(monkeypatch, tmp_path):
@@ -80,3 +81,30 @@ def test_resolver_key_alias():
     p.add_argument("--robot-host", default="127.0.0.1")
     r = Resolver(p.parse_args([]), p, {"host": "10.0.0.5"})
     assert r.get("robot_host", key="host") == "10.0.0.5"
+
+
+def test_recorder_config_uses_first_yaml_task_as_active_default(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("tasks:\n  - pick the cube\n  - stack the blocks\n")
+
+    cfg = build_config(["--config", str(cfg_path)])
+
+    assert cfg.tasks == ["pick the cube", "stack the blocks"]
+    assert cfg.task == "pick the cube"
+
+
+def test_recorder_config_task_precedence(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "recorder:\n"
+        "  task: open the drawer\n"
+        "tasks:\n"
+        "  - pick the cube\n"
+        "  - stack the blocks\n"
+    )
+
+    cfg = build_config(["--config", str(cfg_path)])
+    assert cfg.task == "open the drawer"
+
+    cfg = build_config(["--config", str(cfg_path), "--task", "close the drawer"])
+    assert cfg.task == "close the drawer"
