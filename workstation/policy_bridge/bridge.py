@@ -31,7 +31,7 @@ import numpy as np
 from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClientPolicy, image_tools
 
 from workstation.lerobot_recorder.cameras import CameraManager
-from workstation.lerobot_recorder.config import ARM_DOF, ARMS, RecorderConfig
+from workstation.lerobot_recorder.config import ARM_DOF, ARMS, CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,12 @@ class PolicyBridge:
         meta = client.get_server_metadata() or {}
         self.action_horizon = int(meta.get("action_horizon", cfg.action_horizon))
         self.image_keys = meta.get("image_keys", cfg.image_keys)
-        self.image_size = int(meta.get("image_size", cfg.image_size))
+        image_shape = meta.get("image_shape")
+        if isinstance(image_shape, (list, tuple)) and len(image_shape) == 2:
+            self.image_shape = (int(image_shape[0]), int(image_shape[1]))
+        else:
+            image_size = int(meta.get("image_size", cfg.image_size))
+            self.image_shape = (image_size, image_size)
         if meta:
             logger.info("policy server metadata: %s", meta)
 
@@ -80,17 +85,47 @@ class PolicyBridge:
         self._stop = False
 
     # ---- obs assembly -------------------------------------------------------
+    @staticmethod
+    def _fuse(sides: List[Dict], fields: tuple, per_arm: int | None = None) -> np.ndarray | None:
+        parts = []
+        for side in sides:
+            if not side or any(side.get(field) is None for field in fields):
+                return None
+            vec = np.concatenate([np.asarray(side[field], dtype=np.float32).reshape(-1) for field in fields])
+            if per_arm is not None and vec.size != per_arm:
+                return None
+            parts.append(vec)
+        return np.concatenate(parts).astype(np.float32)
+
+    @staticmethod
+    def _fit(value: np.ndarray | None, dim: int) -> np.ndarray:
+        out = np.zeros(dim, dtype=np.float32)
+        if value is None:
+            return out
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        n = min(dim, arr.size)
+        if n:
+            out[:n] = arr[:n]
+        return out
+
     def _build_obs(self, robot_obs: Dict, images: Dict[str, np.ndarray]) -> Dict:
-        state_parts: List[np.ndarray] = []
-        for a in ARMS:
-            side = robot_obs.get(a)
-            if not side or "pos" not in side:
-                return {}
-            state_parts.append(np.asarray(side["pos"], dtype=np.float32))
-        obs = {"observation/state": np.concatenate(state_parts), "prompt": self.cfg.prompt}
+        sides = [robot_obs.get(a) for a in ARMS]
+        pos = self._fuse(sides, ("pos",), ARM_DOF)
+        if pos is None:
+            return {}
+
+        obs = {"observation/state": pos, "prompt": self.cfg.prompt}
+        full_state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
+        if full_state is not None:
+            obs["observation.state"] = full_state
+        obs["observation.leader"] = self._fit(self._fuse(sides, ("leader_pos",)), LEADER_DIM)
+        obs["observation.eef"] = self._fit(self._fuse(sides, ("eef",)), EEF_DIM)
+        obs["observation.control_mode"] = np.array([CONTROL_MODE["teleop"]], dtype=np.float32)
+
+        height, width = self.image_shape
         for role, key in self.image_keys.items():
             if role in images:
-                img = image_tools.resize_with_pad(images[role], self.image_size, self.image_size)
+                img = image_tools.resize_with_pad(images[role], height, width)
                 obs[key] = image_tools.convert_to_uint8(img)
         return obs
 
@@ -102,12 +137,14 @@ class PolicyBridge:
     def run(self) -> None:
         self.cameras.start()
         logger.info(
-            "PolicyBridge up: robot=%s:%d policy=%s:%d horizon=%d rate=%.0f Hz",
+            "PolicyBridge up: robot=%s:%d policy=%s:%d horizon=%d image=%dx%d rate=%.0f Hz",
             self.cfg.robot_host,
             self.cfg.robot_port,
             self.cfg.policy_host,
             self.cfg.policy_port,
-            self.cfg.action_horizon,
+            self.action_horizon,
+            self.image_shape[1],
+            self.image_shape[0],
             self.cfg.rate_hz,
         )
         period = 1.0 / max(self.cfg.rate_hz, 1.0)
