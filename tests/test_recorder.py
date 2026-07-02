@@ -63,6 +63,52 @@ def test_eval_rollout_records_from_arm_to_disarm(tmp_path):
     assert (tmp_path / "eval" / "outcomes.jsonl").exists()
 
 
+def test_manual_save_finalizes_and_next_episode_reopens_writer(tmp_path):
+    cfg = RecorderConfig(
+        repo_id="test/manual", root=str(tmp_path), fps=60, mock=True, review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.start()
+    try:
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec.save_dataset()
+        first_writer = rec.writer
+        assert first_writer.finalized
+        assert first_writer.num_episodes == 1
+
+        rec._episode = [rec._sample_frame()]
+        rec._submit("fail")
+        assert rec.writer is not first_writer
+        rec.save_dataset()
+    finally:
+        rec.shutdown()
+
+    lines = (tmp_path / "manual" / "outcomes.jsonl").read_text().splitlines()
+    rows = [json.loads(line) for line in lines]
+    assert [row["episode"] for row in rows] == [0, 1]
+    assert [row["outcome"] for row in rows] == ["success", "fail"]
+
+
+def test_manual_save_preserves_armed_idle_state(tmp_path):
+    cfg = RecorderConfig(
+        repo_id="test/armed_save", root=str(tmp_path), fps=60, mock=True, review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.writer = rec._open_writer()
+    rec.arm()
+    try:
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec.save_dataset()
+        st = rec.get_status()
+        assert rec.gate.armed is True
+        assert st["armed"] is True
+        assert st["recording"] is False
+    finally:
+        rec.shutdown()
+
+
 def test_control_mode_in_frame():
     cfg = RecorderConfig(record_source="teleop", mock=False)
     rec = Recorder(cfg)
