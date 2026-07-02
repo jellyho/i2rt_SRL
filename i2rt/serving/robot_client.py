@@ -36,6 +36,12 @@ class RobotClient:
     def set_intervention(self, flag: bool) -> None:
         self._client.set_intervention(bool(flag))
 
+    def set_policy_running(self, flag: bool) -> None:
+        self._client.set_policy_running(bool(flag))
+
+    def finish_dagger_run(self, action: str) -> None:
+        self._client.finish_dagger_run(str(action))
+
     def set_sim_engage(self, flag: bool) -> None:
         self._client.set_sim_engage(bool(flag))
 

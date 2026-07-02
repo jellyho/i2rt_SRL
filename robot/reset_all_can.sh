@@ -1,5 +1,11 @@
 #!/bin/bash
 
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
+set -eo pipefail
+
 if [ "$(id -u)" != "0" ]; then
     SUDO="sudo"
 else

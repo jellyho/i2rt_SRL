@@ -4,7 +4,21 @@ from __future__ import annotations
 
 import numpy as np
 
-from workstation.lerobot_recorder.views import compose_agentview, overlay
+from workstation.lerobot_recorder.views import compose_agentview, compose_camera_strip, overlay
+
+
+def test_compose_camera_strip_orders_left_agent_right():
+    h, w = 120, 160
+    images = {
+        "agentview": np.full((h, w, 3), 20, np.uint8),
+        "wrist_left": np.full((h, w, 3), 100, np.uint8),
+        "wrist_right": np.full((h, w, 3), 200, np.uint8),
+    }
+    out = compose_camera_strip(images, agent_key="agentview")
+    assert out.shape == (h, w * 3, 3)
+    assert np.all(out[:, :w] == 100)
+    assert np.all(out[:, w : 2 * w] == 20)
+    assert np.all(out[:, 2 * w :] == 200)
 
 
 def test_compose_agentview_insets():

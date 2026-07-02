@@ -60,8 +60,8 @@ Recorded at **60 fps** (matched to the cameras). Uses the official v3.0 API
 ### [robot machine] — YAM robot server (uv; nothing to activate)
 
 ```bash
-sh robot/setup_robot_env.sh            # optional: pre-create .venv + install i2rt
-sh robot/setup_can_ids.sh              # persistent CAN names (once)
+bash robot/setup_robot_env.sh          # optional: pre-create .venv + install i2rt
+bash robot/setup_can_ids.sh            # persistent CAN names (once)
 ```
 
 You don't need to activate anything — `robot/yam` uses **`uv run`**, which resolves
@@ -74,7 +74,7 @@ conda owns the env (so you can also `pip install` other policy repos into it); u
 does the fast installs for this repo:
 
 ```bash
-sh workstation/setup_workstation_env.sh       # conda create yam_ws + uv pip install + udev rules
+bash workstation/setup_workstation_env.sh     # conda create yam_ws + uv pip install + udev rules
 conda activate yam_ws
 ```
 
@@ -188,25 +188,19 @@ robot/yam dagger --mirror-kp 0.2
 #               see policy_serving/README.md
 python -m yam_policy.serve --policy <module>:<Class> --config k=v     # :8000
 
-# 3. [workstation]  the bridge: robot (portal) <-> policy (websocket)
-workstation/yam-data bridge \
+# 3. [workstation]  deploy UI: robot (portal) <-> policy (websocket) + DAgger recording
+workstation/yam-data deploy \
     --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
     --serials <wrist_left_sn>,<wrist_right_sn>,<agentview_sn> \
-    --prompt "pick up the cube"
-# press a handle button (or RobotClient.set_intervention) to take over both arms.
+    --repo-id user/yam_pick --prompt "pick up the cube"
+# UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 ```
 
-**Collect HG-DAgger data** by running the recorder against the same dagger server
-with `--source dagger`: an episode = one intervention segment, and the recorded
-action is the **human (leader) action** (`observation.state` is the follower state):
+`workstation/yam-data bridge` is still available as a headless/debug bridge. For
+normal DAgger collection, use `deploy` so the policy bridge, recorder, live stats,
+and safety controls share one operator UI.
 
-```bash
-# [workstation]  (while the dagger server runs and you take over via the handle)
-workstation/yam-data record --source dagger --robot-host <ROBOT_IP> \
-    --repo-id user/yam_dagger --serials A,B,C
-```
-
-This closes the loop: train → deploy (bridge) → intervene → collect → retrain.
+This closes the loop: train → deploy UI → intervene → collect → retrain.
 
 ## D. Replay a dataset onto the robot
 

@@ -63,6 +63,52 @@ def test_eval_rollout_records_from_arm_to_disarm(tmp_path):
     assert (tmp_path / "eval" / "outcomes.jsonl").exists()
 
 
+def test_manual_save_finalizes_and_next_episode_reopens_writer(tmp_path):
+    cfg = RecorderConfig(
+        repo_id="test/manual", root=str(tmp_path), fps=60, mock=True, review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.start()
+    try:
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec.save_dataset()
+        first_writer = rec.writer
+        assert first_writer.finalized
+        assert first_writer.num_episodes == 1
+
+        rec._episode = [rec._sample_frame()]
+        rec._submit("fail")
+        assert rec.writer is not first_writer
+        rec.save_dataset()
+    finally:
+        rec.shutdown()
+
+    lines = (tmp_path / "manual" / "outcomes.jsonl").read_text().splitlines()
+    rows = [json.loads(line) for line in lines]
+    assert [row["episode"] for row in rows] == [0, 1]
+    assert [row["outcome"] for row in rows] == ["success", "fail"]
+
+
+def test_manual_save_preserves_armed_idle_state(tmp_path):
+    cfg = RecorderConfig(
+        repo_id="test/armed_save", root=str(tmp_path), fps=60, mock=True, review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.writer = rec._open_writer()
+    rec.arm()
+    try:
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec.save_dataset()
+        st = rec.get_status()
+        assert rec.gate.armed is True
+        assert st["armed"] is True
+        assert st["recording"] is False
+    finally:
+        rec.shutdown()
+
+
 def test_control_mode_in_frame():
     cfg = RecorderConfig(record_source="teleop", mock=False)
     rec = Recorder(cfg)
@@ -103,3 +149,38 @@ def test_dagger_source_assembly():
     snap_idle = bridge._assemble(idle)
     assert snap_idle["teleop_state"] == "IDLE"
     assert snap_idle["action"] is None  # not intervening -> nothing to record
+
+
+def test_dagger_snapshot_carries_state_and_event():
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    bridge = PortalBridge(cfg)
+    pose = {"pos": [0.0] * 7, "vel": [0.0] * 7, "eff": [0.0] * 7}
+    snap = bridge._assemble(
+        {
+            "intervention": False,
+            "policy_running": True,
+            "homing": False,
+            "dagger_state": "policy",
+            "last_dagger_event": {"seq": 3, "action": "keep"},
+            "left": pose,
+            "right": pose,
+            "t": 2.0,
+        }
+    )
+    assert snap["policy_running"] is True
+    assert snap["dagger_state"] == "policy"
+    assert snap["last_dagger_event"] == {"seq": 3, "action": "keep"}
+
+
+def test_dagger_recorder_events_do_not_use_expert_button_map():
+    cfg = RecorderConfig(record_source="dagger", mock=False, button_map={"left.0": "discard"})
+    rec = Recorder(cfg)
+    rec.gate.arm()
+    rec.gate.update("ENGAGED")
+    rec._scan_buttons({"buttons": {"left": [1]}})
+    assert rec._btn_outcome is None
+
+    rec._scan_dagger_event({"last_dagger_event": {"seq": 1, "action": "keep"}})
+    assert rec._btn_outcome == "keep"
+    rec._scan_dagger_event({"last_dagger_event": {"seq": 2, "action": "discard"}})
+    assert rec._btn_outcome == "discard"

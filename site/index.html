@@ -112,11 +112,11 @@
       <h3 id="sc-setup">One-time setup</h3>
       <p><span class="pill real">robot</span> — persistent CAN names (no env to activate; <code>robot/yam</code> resolves it via <code>uv run</code>):</p>
       <span class="code-label">bash · robot</span>
-<pre><code>sh robot/setup_robot_env.sh      # optional: pre-create the uv env + install
-sh robot/setup_can_ids.sh        # plug 4 adapters one-by-one → fixed names</code></pre>
+<pre><code>bash robot/setup_robot_env.sh    # optional: pre-create the uv env + install
+bash robot/setup_can_ids.sh      # plug 4 adapters one-by-one → fixed names</code></pre>
       <p><span class="pill sim">workstation</span> — conda env + uv (so you can also <code>pip install</code> other policy repos into it):</p>
       <span class="code-label">bash · workstation</span>
-<pre><code>sh workstation/setup_workstation_env.sh   # conda create yam_ws + uv pip install + udev rules
+<pre><code>bash workstation/setup_workstation_env.sh # conda create yam_ws + uv pip install + udev rules
 conda activate yam_ws
 workstation/yam-data cams             # list RealSense serials</code></pre>
       <p>Then edit <code>config.yaml</code> at the repo root — at least the camera serials and <code>robot.host</code>:</p>
@@ -378,7 +378,7 @@ sudo ip link set can0 up type can bitrate 1000000
 sudo sh devices/install_devices.sh
 
 # Reset an unresponsive adapter
-sh robot/reset_all_can.sh</code></pre>
+bash robot/reset_all_can.sh</code></pre>
 
       <p><code>robot/reset_all_can.sh</code> brings every <code>can*</code> interface down and back up at 1&nbsp;Mbit/s. With multiple adapters, device names can shuffle depending on plug order; to pin stable names, follow the serial-based udev setup in <code>docs/guides/set-persistent-can-ids.md</code> (e.g. <code>can_follower_l</code>, <code>can_leader_r</code>). CAN interface names are <strong>at most 13 characters</strong> and must start with <code>can</code>.</p>
     </section>

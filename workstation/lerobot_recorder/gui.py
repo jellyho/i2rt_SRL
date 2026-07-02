@@ -34,7 +34,7 @@ from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import dataset_dir, dataset_info, remove_dataset_root
 from workstation.lerobot_recorder.recorder import Recorder
 from workstation.lerobot_recorder.sound import Cues
-from workstation.lerobot_recorder.views import compose_agentview
+from workstation.lerobot_recorder.views import compose_camera_strip
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.root_edit.textChanged.connect(lambda *_: self._update_setup_status())
 
         self.task_combo = QtWidgets.QComboBox()
-        self.task_combo.setEditable(True)
+        self.task_combo.setEditable(False)
         seen = []
         for t in [self.cfg.task, *self.cfg.tasks]:
             if t and t not in seen:
@@ -172,12 +172,32 @@ class RecorderGUI(QtWidgets.QWidget):
         self.resume_check = QtWidgets.QCheckBox("Continue collecting (append to the existing dataset)")
         self.resume_check.setChecked(self.cfg.resume)
         self.resume_check.toggled.connect(lambda *_: self._update_setup_status())
+        self.resume_check.toggled.connect(self._sync_rl_enabled)
+
+        # Per-frame RL signals (success / reward / mc_return). On resume these are
+        # inherited from the existing dataset's rl_config.json, so the controls are
+        # disabled to make clear the original scheme is preserved.
+        self.rl_check = QtWidgets.QCheckBox("Per-frame RL signals (success / reward / mc_return)")
+        self.rl_check.setChecked(bool(getattr(self.cfg, "rl_features", False)))
+        self.reward_combo = QtWidgets.QComboBox()
+        self.reward_combo.addItems(["sparse", "step"])
+        ridx = self.reward_combo.findText(getattr(self.cfg, "reward_mode", "sparse"))
+        self.reward_combo.setCurrentIndex(ridx if ridx >= 0 else 0)
+        self.discount_spin = QtWidgets.QDoubleSpinBox()
+        self.discount_spin.setRange(0.0, 1.0)
+        self.discount_spin.setSingleStep(0.01)
+        self.discount_spin.setDecimals(3)
+        self.discount_spin.setValue(float(getattr(self.cfg, "discount_factor", 0.99)))
 
         form.addRow("repo_id", self.repo_edit)
         form.addRow("root", self.root_edit)
         form.addRow("task", self.task_combo)
         form.addRow("source", self.source_combo)
         form.addRow("", self.resume_check)
+        form.addRow("", self.rl_check)
+        form.addRow("reward", self.reward_combo)
+        form.addRow("discount γ", self.discount_spin)
+        self._sync_rl_enabled()
 
         self.setup_status = QtWidgets.QLabel()
         self.setup_status.setTextFormat(QtCore.Qt.RichText)
@@ -225,8 +245,12 @@ class RecorderGUI(QtWidgets.QWidget):
         self.collect_btn.setCheckable(True)
         self.collect_btn.setEnabled(False)
         self.collect_btn.clicked.connect(self._on_collect)
+        self.save_btn = QtWidgets.QPushButton("Save dataset")
+        self.save_btn.setObjectName("save")
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._on_save_dataset)
 
-        # primary operator view: agentview + wrist insets composited into one frame
+        # primary operator view: left wrist, agentview, right wrist with no overlap
         self.live_lbl = QtWidgets.QLabel("camera view")
         self.live_lbl.setMinimumHeight(360)
         self.live_lbl.setAlignment(QtCore.Qt.AlignCenter)
@@ -271,7 +295,10 @@ class RecorderGUI(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(page)
         lay.setSpacing(12)
         lay.addLayout(strip)
-        lay.addWidget(self.collect_btn)
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(self.collect_btn, 1)
+        controls.addWidget(self.save_btn)
+        lay.addLayout(controls)
         lay.addWidget(self.live_lbl, 1)
         lay.addWidget(self.review_box)
         lay.addWidget(self.hint)
@@ -306,6 +333,13 @@ class RecorderGUI(QtWidgets.QWidget):
         self.setup_status.setText(cam_txt + "<br>" + ds_txt)
 
     # ------------------------------------------------------------------ actions
+    def _sync_rl_enabled(self) -> None:
+        """On resume the RL scheme is inherited from the dataset, so grey out the
+        controls to signal they won't change the existing dataset."""
+        resuming = self.resume_check.isChecked()
+        for w in (self.rl_check, self.reward_combo, self.discount_spin):
+            w.setEnabled(not resuming)
+
     def _on_start(self) -> None:
         cfg = self.cfg
         cfg.repo_id = self.repo_edit.text().strip()
@@ -313,6 +347,9 @@ class RecorderGUI(QtWidgets.QWidget):
         cfg.task = self.task_combo.currentText().strip()
         cfg.record_source = self.source_combo.currentText().strip()
         cfg.resume = self.resume_check.isChecked()
+        cfg.rl_features = self.rl_check.isChecked()
+        cfg.reward_mode = self.reward_combo.currentText().strip()
+        cfg.discount_factor = float(self.discount_spin.value())
 
         # Single-instance guard: two recorders fighting over the cameras causes the
         # flapping/freeze, so refuse to start a second one with a clear message.
@@ -390,6 +427,29 @@ class RecorderGUI(QtWidgets.QWidget):
             self.recorder.disarm()
             self.collect_btn.setText("Start collection")
 
+    def _on_save_dataset(self) -> None:
+        if self.recorder is None:
+            return
+        st = self.recorder.get_status()
+        if st["recording"]:
+            QtWidgets.QMessageBox.information(self, "Recording in progress", "Finish the current episode before saving.")
+            return
+        if st["pending"]:
+            QtWidgets.QMessageBox.information(self, "Review pending", "Keep or delete the pending episode before saving.")
+            return
+
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Saving...")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            self.recorder.save_dataset()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self._refresh()
+
     def _on_keep(self, outcome: str) -> None:
         if self.recorder is not None:
             self.recorder.keep_episode(outcome=outcome)
@@ -427,6 +487,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self._update_banner(st)
         self._update_health(st)
         self._update_stats(st)
+        self._update_save_button(st)
         self._cue_transitions(self._prev, st)
 
         for b in (self.keep_btn, self.keepfail_btn, self.del_btn):
@@ -436,7 +497,7 @@ class RecorderGUI(QtWidgets.QWidget):
             self.review_slider.setEnabled(False)
 
         images = self.recorder.get_last_images()
-        composite = compose_agentview(images, agent_key=self.cfg.review_cam)
+        composite = compose_camera_strip(images, agent_key=self.cfg.review_cam)
         if isinstance(composite, np.ndarray) and composite.ndim == 3:
             self.live_lbl.setPixmap(_np_to_pixmap(composite).scaled(self.live_lbl.size(), QtCore.Qt.KeepAspectRatio))
 
@@ -501,6 +562,16 @@ class RecorderGUI(QtWidgets.QWidget):
             f"episodes {st['episodes']} · kept {kept} (✓{suc} ✗{fail}) · discarded {disc} · "
             f"success {rate} · frames {st['frames']}"
         )
+
+    def _update_save_button(self, st: dict) -> None:
+        w = st.get("writer") or {}
+        submitted = int(w.get("submitted", 0) or 0)
+        finalized = bool(w.get("finalized"))
+        if finalized and submitted:
+            self.save_btn.setText("Saved")
+        else:
+            self.save_btn.setText("Save dataset")
+        self.save_btn.setEnabled(bool(st.get("saveable") and not st.get("recording") and not st.get("pending")))
 
     def _cue_transitions(self, prev: dict, cur: dict) -> None:
         if cur["recording"] and not prev.get("recording"):

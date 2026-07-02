@@ -26,13 +26,13 @@ Two launchers run the right env for you — **`robot/yam`** on the robot, **`wor
 
 ```bash
 # 🤖 robot — create the uv env (optional; robot/yam auto-resolves it) + fix CAN names
-sh robot/setup_robot_env.sh        # optional: pre-create .venv + install i2rt
-sh robot/setup_can_ids.sh          # plug the 4 CAN adapters one-by-one -> persistent names (once)
+bash robot/setup_robot_env.sh      # optional: pre-create .venv + install i2rt
+bash robot/setup_can_ids.sh        # plug the 4 CAN adapters one-by-one -> persistent names (once)
 ```
 
 ```bash
 # 💻 workstation — conda env yam_ws + uv installs (you can pip-install other policy repos into it)
-sh workstation/setup_workstation_env.sh   # conda create yam_ws + uv pip install + RealSense udev
+bash workstation/setup_workstation_env.sh # conda create yam_ws + uv pip install + RealSense udev
 conda activate yam_ws
 workstation/yam-data cams                 # list connected RealSense serials
 ```
@@ -85,8 +85,8 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ```bash
 robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.1      # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
-workstation/yam-data bridge --prompt "pick up the cube"  # 💻 workstation (reads config.yaml)
-# press a handle button (or RobotClient.set_intervention) to take over; release to hand back.
+workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
+# UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 ```
 
 ### D · Replay a dataset onto the robot
@@ -142,7 +142,7 @@ sudo ip link set can0 up type can bitrate 1000000
 sudo sh devices/install_devices.sh
 
 # Reset unresponsive adapter
-sh robot/reset_all_can.sh
+bash robot/reset_all_can.sh
 ```
 
 ## YAM Arm

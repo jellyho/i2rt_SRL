@@ -67,17 +67,20 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
         for cam, serial in zip(cams, [s.strip() for s in args.serials.split(",")], strict=False):
             cam.serial = serial
 
+    rec_section = rig.get("recorder", {}) or {}
     tasks = [t.strip() for t in args.tasks.split(";") if t.strip()] or list(rig.get("tasks", []) or [])
+    task = rec.get("task")
+    if task == p.get_default("task") and "task" not in rec_section and tasks:
+        task = tasks[0]
 
     # Booleans: config.yaml recorder.* sets the baseline; the CLI flag forces it on.
-    rec_section = rig.get("recorder", {}) or {}
     review_before_save = bool(rec_section.get("review_before_save", True)) and not args.no_review
     auto_arm = bool(rec_section.get("auto_arm", False)) or args.auto_arm
 
     cfg = RecorderConfig(
         repo_id=rec.get("repo_id"),
         root=rec.get("root"),
-        task=rec.get("task"),
+        task=task,
         tasks=tasks,
         fps=int(rec.get("fps")),
         cameras=cams,
@@ -93,6 +96,13 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
     buttons = rec_section.get("buttons")  # leader button -> outcome (keeps the built-in default if unset)
     if buttons:
         cfg.button_map = {str(k): str(v) for k, v in buttons.items()}
+    # output format: "lerobot" (default) or "abcdl" (abcdl MP4+binary training cache)
+    cfg.record_format = str(rec_section.get("format", rec_section.get("record_format", cfg.record_format)))
+    cfg.abcdl_size = int(rec_section.get("abcdl_size", cfg.abcdl_size))
+    # per-frame RL signals (success / reward / mc_return)
+    cfg.rl_features = bool(rec_section.get("rl_features", cfg.rl_features))
+    cfg.reward_mode = str(rec_section.get("reward_mode", cfg.reward_mode))
+    cfg.discount_factor = float(rec_section.get("discount_factor", cfg.discount_factor))
     # video-encoding knobs (saving speed): config.yaml recorder.* overrides the defaults
     cfg.use_videos = bool(rec_section.get("use_videos", cfg.use_videos))
     cfg.vcodec = str(rec_section.get("vcodec", cfg.vcodec))
@@ -113,7 +123,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(theme.QSS)  # app-level so every window/dialog is themed
     gui = RecorderGUI(cfg)
-    gui.resize(760, 900)
+    gui.resize(1500, 900)
     gui.show()
     sys.exit(app.exec_())
 

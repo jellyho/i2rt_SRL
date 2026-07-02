@@ -13,11 +13,11 @@ Transports: robot↔workstation = **portal** (TCP, default `:11331`); workstatio
 
 ```bash
 # [robot]   uv-managed; robot/yam uses `uv run` (no activation needed)
-sh robot/setup_robot_env.sh                       # optional pre-create + verify
+bash robot/setup_robot_env.sh                     # optional pre-create + verify
 # [ws]      conda env + uv installs
-sh workstation/setup_workstation_env.sh && conda activate yam_ws
+bash workstation/setup_workstation_env.sh && conda activate yam_ws
 # [policy]  (any host/GPU)
-sh policy_serving/setup_policy_env.sh && source policy_serving/.venv/bin/activate
+bash policy_serving/setup_policy_env.sh && source policy_serving/.venv/bin/activate
 ```
 - [ ] Workstation env imports cleanly (`python -c "import i2rt, yam_policy, lerobot, pyrealsense2"`).
 - [ ] Robot: `robot/yam teleop --sim` boots (uv resolves the env on first run).
@@ -28,7 +28,7 @@ sh policy_serving/setup_policy_env.sh && source policy_serving/.venv/bin/activat
 
 ```bash
 # [robot]
-sh robot/setup_can_ids.sh           # persistent names (once)
+bash robot/setup_can_ids.sh         # persistent names (once)
 robot/yam canup                      # bring up at 1 Mbit/s (each boot)
 # [ws]
 workstation/yam-data cams              # list RealSense serials

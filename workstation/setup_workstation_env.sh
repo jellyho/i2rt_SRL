@@ -6,9 +6,13 @@
 # it), and uv does the fast installs for THIS repo. Installs i2rt (portal client),
 # yam-policy (websocket client for the bridge), and the LeRobot recorder deps.
 #
-#   sh workstation/setup_workstation_env.sh
+#   bash workstation/setup_workstation_env.sh
 #
 # Env overrides:  YAM_WS_ENV=yam_ws  WS_PY=3.11
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +46,11 @@ echo "[setup] uv-installing i2rt + yam-policy + recorder deps into conda env '$E
 uv pip install -e .                                   # uv targets the active conda env
 uv pip install -e policy_serving
 uv pip install -r workstation/lerobot_recorder/requirements.txt
+
+# Optional: abcdl data layer (recorder `format: abcdl` + per-frame RL signals). Pulled
+# from GitHub; skip-on-failure so a network hiccup doesn't break the core setup.
+echo "[setup] abcdl data layer (optional; for format: abcdl + rl_features) ..."
+uv pip install -e '.[abcdl]' || echo "  (abcdl skipped; only needed for abcdl format / rl_features)"
 
 echo "[setup] RealSense udev rules (USB permissions) ..."
 if [ ! -e /etc/udev/rules.d/99-realsense-libusb.rules ]; then

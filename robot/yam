@@ -36,8 +36,8 @@ case "$cmd" in
     teleop)  run i2rt.serving.run_robot_server teleop  "$@" ;;
     dagger)  run i2rt.serving.run_robot_server dagger  "$@" ;;
     wrapper) run i2rt.serving.run_robot_server wrapper "$@" ;;
-    can)     exec sh "$REPO/robot/setup_can_ids.sh" "$@" ;;
-    canup)   exec sh "$REPO/robot/reset_all_can.sh" "$@" ;;
+    can)     exec bash "$REPO/robot/setup_can_ids.sh" "$@" ;;
+    canup)   exec bash "$REPO/robot/reset_all_can.sh" "$@" ;;
     *)
         echo "usage: yam {teleop|dagger|wrapper|can|canup} [args]" >&2
         exit 2

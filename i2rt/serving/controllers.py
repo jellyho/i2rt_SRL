@@ -120,6 +120,8 @@ class BaseController:
 
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
+    def set_policy_running(self, flag: bool) -> None: ...
+    def finish_dagger_run(self, action: str) -> None: ...
     def command(self, data: Dict) -> None: ...
     def set_sim_engage(self, flag: bool) -> None: ...
     def close(self) -> None: ...
@@ -368,11 +370,22 @@ class TeleopController(BaseController):
 @dataclass
 class DaggerConfig:
     sim: bool = False
+    home: str = ""
     mirror_kp: float = cc.DAGGER_MIRROR_KP
     feedback_kp: float = cc.DAGGER_FEEDBACK_KP
+    home_kp: float = cc.HOME_KP
+    home_speed: float = cc.HOME_SPEED
     rate: float = 120.0
     max_joint_speed: float = 1.5
     command_timeout: float = 0.5  # s; stale policy actions (link loss) are ignored -> hold
+    button_map: Dict[str, str] = field(
+        default_factory=lambda: {
+            "left.0": "rollout_toggle",
+            "left.1": "intervention_toggle",
+            "right.0": "discard_home",
+            "right.1": "keep_home",
+        }
+    )
 
 
 class DaggerController(BaseController):
@@ -383,27 +396,68 @@ class DaggerController(BaseController):
         self.command_timeout = cfg.command_timeout
         self.mirror_kp = cfg.mirror_kp
         self.feedback_kp = cfg.feedback_kp
+        self.home_kp = cfg.home_kp
         self.pairs = build_bimanual(default_bimanual_specs(cfg.sim), sim=cfg.sim)
-        max_step = max_step_from_speed(cfg.max_joint_speed, cfg.rate)
+        self._run_step = max_step_from_speed(cfg.max_joint_speed, cfg.rate)
+        self._home_step = max_step_from_speed(cfg.home_speed, cfg.rate)
 
         self._intervening = False
-        self._toggle = LatchingToggle(initial=False)
+        self._policy_running = False
+        self._homing = False
+        self._btn_prev: Dict[str, list] = {}
+        self._button_map: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in cfg.button_map.items()}
+        self._event_seq = 0
+        self._last_event: Optional[Dict[str, object]] = None
         self._policy_action: Dict[str, Optional[np.ndarray]] = {s: None for s in self.pairs}
         self._kin = _build_kin({s: p.follower for s, p in self.pairs.items()})
-        self._smooth = {s: TargetSmoother(p.follower.get_joint_pos(), max_step) for s, p in self.pairs.items()}
-        self._has_grip = "gripper_pos" in next(iter(self.pairs.values())).follower.get_observations()
+        self._smooth = {s: TargetSmoother(p.follower.get_joint_pos(), self._run_step) for s, p in self.pairs.items()}
+        first = next(iter(self.pairs.values())).follower
+        n = int(first.num_dofs())
+        self._has_grip = "gripper_pos" in first.get_observations()
+        n_arm = n - 1 if self._has_grip else n
+        self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
+        self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._leader_smooth = {
+            s: TargetSmoother(np.asarray(p.leader.get_joint_pos())[: self.home_arm.size], self._home_step)
+            for s, p in self.pairs.items()
+        }
+        self._home_d0 = {s: 0.0 for s in self.pairs}
 
         self._lock = threading.Lock()
-        self._snap: Dict = {"mode": self.mode, "t": 0.0, "intervention": False}
+        self._snap: Dict = {
+            "mode": self.mode,
+            "t": 0.0,
+            "intervention": False,
+            "policy_running": False,
+            "homing": False,
+            "dagger_state": "stopped",
+            "last_dagger_event": None,
+        }
         self._metadata = {"mode": self.mode, "sides": list(self.pairs), "has_gripper": self._has_grip}
         logger.info(
-            "DaggerController up: sides=%s mirror_kp=%s feedback_kp=%s max_joint_speed=%s sim=%s",
+            "DaggerController up: sides=%s home_arm=%s mirror_kp=%s feedback_kp=%s max_joint_speed=%s sim=%s",
             list(self.pairs),
+            np.round(self.home_arm, 2).tolist(),
             cfg.mirror_kp,
             cfg.feedback_kp,
             cfg.max_joint_speed,
             cfg.sim,
         )
+
+    @staticmethod
+    def _parse_home(home_str: str, n_arm: int) -> "tuple[np.ndarray, float]":
+        if not home_str:
+            return np.zeros(n_arm), 0.0
+        vals = [float(x) for x in home_str.split(",") if x.strip() != ""]
+        if len(vals) == n_arm:
+            return np.asarray(vals), 0.0
+        if len(vals) == n_arm + 1:
+            return np.asarray(vals[:n_arm]), float(vals[n_arm])
+        raise ValueError(f"home expects {n_arm} or {n_arm + 1} values, got {len(vals)}")
+
+    @staticmethod
+    def _ease_vel_scale(p: float) -> float:
+        return float(0.5 + 0.785 * np.sin(np.pi * min(max(p, 0.0), 1.0)))
 
     # ---- external inputs ----------------------------------------------------
     def set_policy_action(self, data: Dict) -> None:
@@ -418,7 +472,66 @@ class DaggerController(BaseController):
         self._touch_cmd()
 
     def set_intervention(self, flag: bool) -> None:
-        self._toggle.state = bool(flag)
+        if self._homing:
+            return
+        self._intervening = bool(flag)
+
+    def set_policy_running(self, flag: bool) -> None:
+        if self._homing:
+            return
+        self._policy_running = bool(flag)
+        if not self._policy_running:
+            self._intervening = False
+
+    def finish_dagger_run(self, action: str) -> None:
+        action = str(action).lower()
+        if action not in {"keep", "discard"}:
+            logger.warning("unknown dagger finish action: %s", action)
+            return
+        self._event_seq += 1
+        self._last_event = {"seq": self._event_seq, "action": action}
+        self._policy_running = False
+        self._intervening = False
+        self._homing = True
+        for side, pair in self.pairs.items():
+            self._smooth[side].reset(pair.follower.get_joint_pos())
+            self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
+            self._home_d0[side] = max(float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6)
+
+    def _toggle_button_action(self, action: str) -> None:
+        if action == "rollout_toggle":
+            self.set_policy_running(not self._policy_running)
+        elif action == "intervention_toggle":
+            self.set_intervention(not self._intervening)
+        elif action == "keep_home":
+            self.finish_dagger_run("keep")
+        elif action == "discard_home":
+            self.finish_dagger_run("discard")
+        else:
+            logger.warning("unknown dagger button action: %s", action)
+
+    def _scan_buttons(self, buttons: Dict[str, list]) -> None:
+        if self._homing:
+            self._btn_prev = {side: list(btns) for side, btns in buttons.items()}
+            return
+        for side, btns in buttons.items():
+            prev = self._btn_prev.get(side, [])
+            for idx in range(len(btns)):
+                pressed = bool(btns[idx])
+                was = idx < len(prev) and bool(prev[idx])
+                if pressed and not was:
+                    action = self._button_map.get(f"{side}.{idx}")
+                    if action:
+                        self._toggle_button_action(action)
+            self._btn_prev[side] = list(btns)
+
+    def _homing_done(self) -> bool:
+        for side in self.pairs:
+            if np.linalg.norm(self._smooth[side].cur - self.home_full) > _HOME_TOL:
+                return False
+            if np.linalg.norm(self._leader_smooth[side].cur - self.home_arm) > _HOME_TOL:
+                return False
+        return True
 
     # ---- one control tick (port of DaggerNode._loop) ------------------------
     def step(self) -> None:
@@ -433,8 +546,7 @@ class DaggerController(BaseController):
             arm_q[side], grip_cmd[side], buttons[side] = a, g, b
             valid[side] = is_finite_vector(a, pair.leader.num_dofs())
 
-        pressed = any(bool(b[0]) for b in buttons.values() if b)
-        self._intervening = self._toggle.update(pressed)
+        self._scan_buttons(buttons)
 
         sides_snap: Dict[str, Dict] = {}
         for side, pair in self.pairs.items():
@@ -445,14 +557,22 @@ class DaggerController(BaseController):
             try:
                 self._effort_guard(pair.follower)
                 desired = None
-                if self._intervening:
+                if self._homing:
+                    d = float(np.linalg.norm(smoother.cur - self.home_full))
+                    p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
+                    smoother.max_step = self._leader_smooth[side].max_step = self._home_step * self._ease_vel_scale(p)
+                    desired = smoother.step(self.home_full)
+                    self._home_leader(pair, self._leader_smooth[side].step(self.home_arm))
+                elif self._intervening:
+                    smoother.max_step = self._run_step
                     if valid[side]:
                         human = build_follower_target(pair.follower, arm_q[side], grip_cmd[side])
                         desired = human
                         self._drive_leader(
                             pair, np.asarray(pair.follower.get_joint_pos())[: pair.leader.num_dofs()], self.feedback_kp
                         )
-                else:
+                elif self._policy_running:
+                    smoother.max_step = self._run_step
                     act = self._policy_action[side]
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
@@ -475,14 +595,45 @@ class DaggerController(BaseController):
             except Exception as e:
                 logger.warning("[%s] dagger step failed: %s", side, e)
 
+        if self._homing and self._homing_done():
+            self._homing = False
+
+        dagger_state = self._state_name()
         with self._lock:
             self._snap = {
                 "mode": self.mode,
                 "t": now,
                 "intervention": bool(self._intervening),
+                "policy_running": bool(self._policy_running),
+                "homing": bool(self._homing),
+                "dagger_state": dagger_state,
+                "last_dagger_event": dict(self._last_event) if self._last_event is not None else None,
                 "estop": self._estop,
                 **sides_snap,
             }
+
+    def _state_name(self) -> str:
+        if self._estop:
+            return "estop"
+        if self._homing:
+            return "homing"
+        if self._intervening:
+            return "intervention"
+        if self._policy_running:
+            return "policy"
+        return "stopped"
+
+    def _home_leader(self, pair: ArmPair, target_arm: np.ndarray) -> None:
+        leader = pair.leader
+        if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+            return
+        try:
+            m = leader.num_dofs()
+            kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
+            leader.update_kp_kd(pair.base_kp[:m] * self.home_kp, kd)
+            leader.command_joint_pos(np.asarray(target_arm, dtype=float)[:m])
+        except Exception:
+            pass
 
     def _drive_leader(self, pair: ArmPair, target_q: np.ndarray, kp_scale: float) -> None:
         leader = pair.leader
