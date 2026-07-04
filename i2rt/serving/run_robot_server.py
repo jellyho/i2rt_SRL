@@ -23,6 +23,7 @@ from i2rt.serving.controllers import (
 )
 from i2rt.serving.rig_config import apply_control_overrides, load_rig
 from i2rt.serving.robot_server import DEFAULT_PORT, RobotServer
+from i2rt.robots.utils import ArmType, GripperType
 
 
 class _DropChatter(logging.Filter):
@@ -60,6 +61,10 @@ def main() -> None:
         logging.info("rig control overrides: %s", applied)
     robot_sec = rig.get("robot", {}) or {}
     default_port = int(robot_sec.get("port", DEFAULT_PORT))
+    # Gripper / arm come from config.yaml `robot:` (CLI flags below override per run).
+    default_arm = str(robot_sec.get("arm_type", "yam"))
+    default_gripper = str(robot_sec.get("gripper", "linear_4310"))
+    default_leader_gripper = str(robot_sec.get("leader_gripper", "yam_teaching_handle"))
 
     p = argparse.ArgumentParser(description="YAM robot server (portal)")
     sub = p.add_subparsers(dest="mode", required=True)
@@ -78,6 +83,9 @@ def main() -> None:
     pt.add_argument("--ramp-speed", type=float, default=cc.RAMP_SPEED)
     pt.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for the (gentle) homing return")
     pt.add_argument("--gate-joints", default=",".join(str(j) for j in cc.GATE_JOINTS))
+    pt.add_argument("--arm-type", default=default_arm)
+    pt.add_argument("--gripper", default=default_gripper, help="follower (end-effector) gripper type")
+    pt.add_argument("--leader-gripper", default=default_leader_gripper)
 
     pd = sub.add_parser("dagger", help="HG-DAgger policy + button takeover")
     pd.add_argument("--config", default=None, help="config.yaml (control overrides + port)")
@@ -90,18 +98,30 @@ def main() -> None:
     pd.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for DAgger keep/discard homing")
     pd.add_argument("--rate", type=float, default=120.0)
     pd.add_argument("--max-joint-speed", type=float, default=1.5)
+    pd.add_argument("--arm-type", default=default_arm)
+    pd.add_argument("--gripper", default=default_gripper, help="follower (end-effector) gripper type")
+    pd.add_argument("--leader-gripper", default=default_leader_gripper)
 
     pw = sub.add_parser("wrapper", help="followers track an external command (replay)")
     pw.add_argument("--config", default=None, help="config.yaml (control overrides + port/channels)")
     pw.add_argument("--port", type=int, default=default_port)
     pw.add_argument("--sim", action="store_true")
-    pw.add_argument("--arm-type", default="yam")
-    pw.add_argument("--gripper", default="linear_4310")
+    pw.add_argument("--arm-type", default=default_arm)
+    pw.add_argument("--gripper", default=default_gripper)
     pw.add_argument("--rate", type=float, default=100.0)
     pw.add_argument("--max-joint-speed", type=float, default=1.5)
     pw.add_argument("--control", choices=["joint", "eef"], default="joint", help="command space (eef is experimental)")
 
     args = p.parse_args()
+
+    # Fail fast (with the valid list) if a config/CLI gripper or arm is misspelled,
+    # instead of deep in robot construction.
+    if getattr(args, "gripper", None) is not None:
+        GripperType.from_string_name(args.gripper)
+    if getattr(args, "leader_gripper", None) is not None:
+        GripperType.from_string_name(args.leader_gripper)
+    if getattr(args, "arm_type", None) is not None:
+        ArmType(args.arm_type)
 
     if args.mode == "teleop":
         ctrl = TeleopController(
@@ -117,6 +137,9 @@ def main() -> None:
                 ramp_speed=args.ramp_speed,
                 home_speed=args.home_speed,
                 gate_joints=args.gate_joints,
+                arm_type=args.arm_type,
+                leader_gripper=args.leader_gripper,
+                follower_gripper=args.gripper,
             )
         )
     elif args.mode == "dagger":
@@ -134,6 +157,9 @@ def main() -> None:
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
                 else DaggerConfig().button_map,
+                arm_type=args.arm_type,
+                leader_gripper=args.leader_gripper,
+                follower_gripper=args.gripper,
             )
         )
     else:  # wrapper

@@ -12,6 +12,10 @@ robot:
   host: 192.168.0.42           # robot server (portal) address, used by the workstation tools
   port: 11331
   channels: { left: can_follower_l, right: can_follower_r }   # wrapper followers
+  arm_type: yam                # yam | big_yam | yam_pro | yam_ultra
+  # follower (end-effector) gripper: linear_4310 | linear_3507 | crank_4310 | flexible_4310 | no_gripper
+  gripper: flexible_4310
+  leader_gripper: yam_teaching_handle   # leader handle (rarely changed)
 
 policy:
   host: 127.0.0.1            # websocket policy server (for the bridge)
@@ -19,8 +23,8 @@ policy:
 
 control:                     # overrides i2rt/serving/control_config (robot server)
   bilateral_kp: 0.0
-  ramp_speed: 0.8            # one-time engage approach speed (rad/s)
-  home_speed: 0.8            # gentle homing return (rad/s)
+  ramp_speed: 0.6            # one-time engage approach speed (rad/s)
+  home_speed: 0.6            # gentle homing return (rad/s)
   # --- engage / release gate (drives teleop_state IDLE↔ENGAGED↔HOMING, i.e. episode start/stop) ---
   engage_thr: 0.4           # gate-joint displacement (rad) to ENGAGE (lift to start)
   release_thr: 0.3          # gate-joint displacement (rad) to RELEASE → HOMING → IDLE (lower to end)

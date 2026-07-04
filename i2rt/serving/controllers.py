@@ -143,6 +143,9 @@ class TeleopConfig:
     ramp_speed: float = cc.RAMP_SPEED
     home_speed: float = cc.HOME_SPEED  # slower ramp for the homing return
     gate_joints: str = ",".join(str(j) for j in cc.GATE_JOINTS)
+    arm_type: str = "yam"
+    leader_gripper: str = "yam_teaching_handle"
+    follower_gripper: str = "linear_4310"
 
 
 class TeleopController(BaseController):
@@ -152,7 +155,11 @@ class TeleopController(BaseController):
         self.cfg = cfg
         self.bilateral_kp = cfg.bilateral_kp
         self.home_kp = cfg.home_kp
-        self.pairs = build_bimanual(default_bimanual_specs(cfg.sim), sim=cfg.sim)
+        self.pairs = build_bimanual(
+            default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
+                                   leader_gripper=cfg.leader_gripper,
+                                   follower_gripper=cfg.follower_gripper),
+            sim=cfg.sim)
         self._ramp_step = max_step_from_speed(cfg.ramp_speed, cfg.rate)
         self._home_step = max_step_from_speed(cfg.home_speed, cfg.rate)
         self._gate_joints = [int(x) for x in cfg.gate_joints.split(",") if x.strip() != ""] if cfg.gate_joints else []
@@ -378,6 +385,9 @@ class DaggerConfig:
     rate: float = 120.0
     max_joint_speed: float = 1.5
     command_timeout: float = 0.5  # s; stale policy actions (link loss) are ignored -> hold
+    arm_type: str = "yam"
+    leader_gripper: str = "yam_teaching_handle"
+    follower_gripper: str = "linear_4310"
     button_map: Dict[str, str] = field(
         default_factory=lambda: {
             "left.0": "rollout_toggle",
@@ -397,7 +407,11 @@ class DaggerController(BaseController):
         self.mirror_kp = cfg.mirror_kp
         self.feedback_kp = cfg.feedback_kp
         self.home_kp = cfg.home_kp
-        self.pairs = build_bimanual(default_bimanual_specs(cfg.sim), sim=cfg.sim)
+        self.pairs = build_bimanual(
+            default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
+                                   leader_gripper=cfg.leader_gripper,
+                                   follower_gripper=cfg.follower_gripper),
+            sim=cfg.sim)
         self._run_step = max_step_from_speed(cfg.max_joint_speed, cfg.rate)
         self._home_step = max_step_from_speed(cfg.home_speed, cfg.rate)
 

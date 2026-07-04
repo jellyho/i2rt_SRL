@@ -206,14 +206,25 @@ def gate_distance(arm_q: np.ndarray, home_arm: np.ndarray, joints: Optional[List
     return float(np.linalg.norm(a[:n] - h[:n]))
 
 
-def default_bimanual_specs(sim: bool) -> List[PairSpec]:
-    """Standard left/right channel naming used across i2rt bimanual examples."""
+def default_bimanual_specs(
+    sim: bool,
+    arm_type: str = "yam",
+    leader_gripper: str = "yam_teaching_handle",
+    follower_gripper: str = "linear_4310",
+) -> List[PairSpec]:
+    """Standard left/right channel naming used across i2rt bimanual examples.
+
+    ``arm_type`` / ``*_gripper`` default to the YAM teaching-handle leader + linear_4310
+    follower; override them (e.g. from config.yaml ``robot:``) to run a different gripper.
+    """
     if sim:
-        return [
-            PairSpec("left", "sim_leader_l", "sim_follower_l"),
-            PairSpec("right", "sim_leader_r", "sim_follower_r"),
-        ]
+        sides = [("left", "sim_leader_l", "sim_follower_l"),
+                 ("right", "sim_leader_r", "sim_follower_r")]
+    else:
+        sides = [("left", "can_leader_l", "can_follower_l"),
+                 ("right", "can_leader_r", "can_follower_r")]
     return [
-        PairSpec("left", "can_leader_l", "can_follower_l"),
-        PairSpec("right", "can_leader_r", "can_follower_r"),
+        PairSpec(side, lead, foll, arm_type=arm_type,
+                 leader_gripper=leader_gripper, follower_gripper=follower_gripper)
+        for side, lead, foll in sides
     ]
