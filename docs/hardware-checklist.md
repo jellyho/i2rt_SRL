@@ -136,6 +136,7 @@ workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
 ```
 - [ ] Bridge logs the policy **server metadata** and auto-configures `action_horizon`/image keys (no hand-matching).
 - [ ] Policy drives the followers; pressing a handle button hands control to the human (intervention), releasing returns to policy.
+- [ ] Deploy UI **Rewind + Human** replays the recent policy motion backward, then enters intervention.
 - [ ] Kill the bridge → robot holds within `command_timeout` (link-loss watchdog).
 
 ## 11. HG-DAgger collection

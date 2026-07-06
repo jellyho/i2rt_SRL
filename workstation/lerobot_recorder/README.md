@@ -182,7 +182,7 @@ workstation/yam-data record --mock
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
 robot/yam canup
-robot/yam dagger --mirror-kp 0.2
+robot/yam dagger --mirror-kp 0.2 --rewind-window-s 5.0
 
 # 2. [policy]   serve your policy (own env; openpi-compatible websocket)
 #               see policy_serving/README.md
@@ -194,6 +194,7 @@ workstation/yam-data deploy \
     --serials <wrist_left_sn>,<wrist_right_sn>,<agentview_sn> \
     --repo-id user/yam_pick --prompt "pick up the cube"
 # UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
+# Rewind + Human replays the recent policy motion backward, then starts human intervention.
 ```
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
