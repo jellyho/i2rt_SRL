@@ -36,6 +36,9 @@ _EMPTY = {
     "intervention": False,
     "policy_running": False,
     "homing": False,
+    "rewinding": False,
+    "rewind_available_s": 0.0,
+    "rewind_buffer_frames": 0,
     "dagger_state": "stopped",
     "last_dagger_event": None,
     "estop": False,
@@ -59,6 +62,8 @@ class PortalBridge:
         self._intervention_req: Optional[bool] = None
         self._intervention_sent: Optional[bool] = None
         self._finish_req: Optional[str] = None
+        self._rewind_req = False
+        self._mock_rewind_until = 0.0
         self._last_err: Optional[str] = None
 
     @property
@@ -83,6 +88,12 @@ class PortalBridge:
         action = str(action).lower()
         if action in {"keep", "discard"}:
             self._finish_req = action
+
+    def rewind_rollout(self) -> None:
+        """Request deterministic DAgger rewind of the recent policy rollout."""
+        self._rewind_req = True
+        if self.cfg.mock:
+            self._mock_rewind_until = time.time() + 1.0
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -152,6 +163,11 @@ class PortalBridge:
                     action = self._finish_req
                     self._finish_req = None
                     self._client.finish_dagger_run(action)
+                if self._rewind_req:
+                    self._rewind_req = False
+                    self._intervention_req = None
+                    self._intervention_sent = None
+                    self._client.rewind_rollout()
             except Exception as e:
                 self._client = None  # drop and retry next tick
                 self._connected = False
@@ -220,6 +236,9 @@ class PortalBridge:
             "intervention": intervening,
             "policy_running": bool(obs.get("policy_running")),
             "homing": bool(obs.get("homing")),
+            "rewinding": bool(obs.get("rewinding")),
+            "rewind_available_s": float(obs.get("rewind_available_s", 0.0) or 0.0),
+            "rewind_buffer_frames": int(obs.get("rewind_buffer_frames", 0) or 0),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
             "last_dagger_event": obs.get("last_dagger_event"),
             "estop": bool(obs.get("estop")),
@@ -242,6 +261,11 @@ class PortalBridge:
             state = np.concatenate([np.concatenate([pos, vel, eff]) for _ in ARMS]).astype(np.float32)
             action = np.concatenate([pos for _ in ARMS]).astype(np.float32)
             leader = np.concatenate([pos[:6] for _ in ARMS]).astype(np.float32)  # 6-dof leader per arm
+            rewinding = now < self._mock_rewind_until
+            if self._rewind_req and not rewinding:
+                self._rewind_req = False
+                self._intervention_req = True
+            intervention = bool(self._intervention_req) or name == "ENGAGED"
             with self._lock:
                 self._snap = {
                     **_EMPTY,
@@ -251,8 +275,19 @@ class PortalBridge:
                     "leader": leader,
                     "action": action,
                     "policy_running": bool(self._policy_running_req),
-                    "intervention": name == "ENGAGED",
-                    "dagger_state": "policy" if self._policy_running_req else "stopped",
+                    "intervention": intervention and not rewinding,
+                    "rewinding": rewinding,
+                    "rewind_available_s": 5.0 if self._policy_running_req and not rewinding else 0.0,
+                    "rewind_buffer_frames": 300 if self._policy_running_req and not rewinding else 0,
+                    "dagger_state": (
+                        "rewinding"
+                        if rewinding
+                        else "intervention"
+                        if intervention
+                        else "policy"
+                        if self._policy_running_req
+                        else "stopped"
+                    ),
                     "stamp": now,
                 }
             if now - seg_start >= dur:

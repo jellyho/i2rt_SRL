@@ -24,7 +24,7 @@ class DeployGUI(RecorderGUI):
         idx = self.source_combo.findText("dagger")
         self.source_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.source_combo.setEnabled(False)
-        self.hint.setText("space toggles collection · policy/intervention/keep/discard can use UI or handle buttons")
+        self.hint.setText("space toggles collection · policy/intervention/rewind/keep/discard can use UI or handle buttons")
 
     def _build_collect_page(self) -> QtWidgets.QWidget:
         page = super()._build_collect_page()
@@ -38,6 +38,8 @@ class DeployGUI(RecorderGUI):
         self.intervention_btn = QtWidgets.QPushButton("Human Intervention")
         self.intervention_btn.setCheckable(True)
         self.intervention_btn.clicked.connect(self._on_intervention_toggle)
+        self.rewind_btn = QtWidgets.QPushButton("Rewind + Human")
+        self.rewind_btn.clicked.connect(self._on_rewind)
         self.keep_home_btn = QtWidgets.QPushButton("Keep + Home")
         self.keep_home_btn.clicked.connect(lambda: self._on_finish("keep"))
         self.discard_home_btn = QtWidgets.QPushButton("Discard + Home")
@@ -54,13 +56,14 @@ class DeployGUI(RecorderGUI):
             "border-radius:8px;padding:10px 12px;font-weight:600;"
         )
 
-        grid.addWidget(self.dagger_state, 0, 0, 1, 4)
+        grid.addWidget(self.dagger_state, 0, 0, 1, 5)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
-        grid.addWidget(self.keep_home_btn, 1, 2)
-        grid.addWidget(self.discard_home_btn, 1, 3)
-        grid.addWidget(self.button_legend, 2, 0, 1, 4)
-        grid.addWidget(self.runner_status, 3, 0, 1, 4)
+        grid.addWidget(self.rewind_btn, 1, 2)
+        grid.addWidget(self.keep_home_btn, 1, 3)
+        grid.addWidget(self.discard_home_btn, 1, 4)
+        grid.addWidget(self.button_legend, 2, 0, 1, 5)
+        grid.addWidget(self.runner_status, 3, 0, 1, 5)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):
@@ -87,6 +90,10 @@ class DeployGUI(RecorderGUI):
         st = self.recorder.get_status()
         self.recorder.set_intervention(not bool(st.get("intervention")))
 
+    def _on_rewind(self) -> None:
+        if self.recorder is not None:
+            self.recorder.rewind_rollout()
+
     def _on_finish(self, action: str) -> None:
         if self.recorder is not None:
             self.recorder.finish_dagger_run(action)
@@ -103,6 +110,8 @@ class DeployGUI(RecorderGUI):
             text, color = "LOW DISK — not saving", theme.STATE_COLORS["ERROR"]
         elif not (st["cam_ok"] and st.get("robot_ok", True)):
             text, color = "DEVICE FAULT", theme.STATE_COLORS["ERROR"]
+        elif st.get("rewinding"):
+            text, color = "REWINDING", theme.STATE_COLORS["REVIEW"]
         elif st.get("homing"):
             text, color = "HOMING", theme.STATE_COLORS["REVIEW"]
         elif st.get("intervention"):
@@ -137,13 +146,20 @@ class DeployGUI(RecorderGUI):
         running = bool(st.get("policy_running"))
         intervention = bool(st.get("intervention"))
         homing = bool(st.get("homing"))
-        blocked = homing or bool(st.get("estop"))
+        rewinding = bool(st.get("rewinding"))
+        rewind_frames = int(st.get("rewind_buffer_frames", 0) or 0)
+        rewind_s = float(st.get("rewind_available_s", 0.0) or 0.0)
+        blocked = homing or rewinding or bool(st.get("estop"))
         self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
-        self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")
+        self.rewind_btn.setText(f"Rewind {rewind_s:.1f}s + Human" if rewind_frames else "Rewind + Human")
+        self.dagger_state.setText(
+            f"state: {st.get('dagger_state', 'stopped')} · rewind buffer {rewind_frames} frames"
+        )
         for btn in (self.policy_btn, self.intervention_btn, self.keep_home_btn, self.discard_home_btn):
             btn.setEnabled(not blocked)
+        self.rewind_btn.setEnabled(not blocked and running and not intervention and rewind_frames >= 2)
         runner = self.runner.get_status() if self.runner is not None else {}
         horizon = runner.get("action_horizon", self.bridge_cfg.action_horizon)
         img = runner.get("image_size", self.bridge_cfg.image_size)

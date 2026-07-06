@@ -69,6 +69,9 @@ class Recorder:
             "policy_running": False,
             "intervention": False,
             "homing": False,
+            "rewinding": False,
+            "rewind_available_s": 0.0,
+            "rewind_buffer_frames": 0,
             "estop": False,
         }
         self._last_images: dict = {}
@@ -264,6 +267,10 @@ class Recorder:
         """Forward a DAgger keep/discard + home request."""
         self.robot.finish_dagger_run(action)
 
+    def rewind_rollout(self) -> None:
+        """Forward a deterministic DAgger rewind request."""
+        self.robot.rewind_rollout()
+
     def get_status(self) -> dict:
         with self._lock:
             d = dict(self._status)
@@ -399,6 +406,9 @@ class Recorder:
             "policy_running": bool(snap.get("policy_running")),
             "intervention": bool(snap.get("intervention")),
             "homing": bool(snap.get("homing")),
+            "rewinding": bool(snap.get("rewinding")),
+            "rewind_available_s": float(snap.get("rewind_available_s", 0.0) or 0.0),
+            "rewind_buffer_frames": int(snap.get("rewind_buffer_frames", 0) or 0),
             "estop": bool(snap.get("estop")),
         }
 

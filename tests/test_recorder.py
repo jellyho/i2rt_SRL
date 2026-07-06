@@ -160,6 +160,9 @@ def test_dagger_snapshot_carries_state_and_event():
             "intervention": False,
             "policy_running": True,
             "homing": False,
+            "rewinding": True,
+            "rewind_available_s": 2.5,
+            "rewind_buffer_frames": 150,
             "dagger_state": "policy",
             "last_dagger_event": {"seq": 3, "action": "keep"},
             "left": pose,
@@ -168,6 +171,9 @@ def test_dagger_snapshot_carries_state_and_event():
         }
     )
     assert snap["policy_running"] is True
+    assert snap["rewinding"] is True
+    assert snap["rewind_available_s"] == 2.5
+    assert snap["rewind_buffer_frames"] == 150
     assert snap["dagger_state"] == "policy"
     assert snap["last_dagger_event"] == {"seq": 3, "action": "keep"}
 

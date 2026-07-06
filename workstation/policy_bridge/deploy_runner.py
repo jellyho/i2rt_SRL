@@ -112,7 +112,10 @@ class DeploymentPolicyRunner:
                     self._connect_robot()
                     obs = self._robot.get_observation()
                     should_stream = bool(obs.get("policy_running")) and not (
-                        obs.get("intervention") or obs.get("homing") or obs.get("estop")
+                        obs.get("intervention")
+                        or obs.get("homing")
+                        or obs.get("rewinding")
+                        or obs.get("estop")
                     )
                     if should_stream:
                         self._connect_policy()
