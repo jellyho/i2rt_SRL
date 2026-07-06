@@ -98,6 +98,42 @@ def test_dagger_button_map_toggles_rollout(monkeypatch):
     ctrl.close()
 
 
+def test_dagger_rewind_replays_policy_history_and_intervenes():
+    ctrl = DaggerController(
+        DaggerConfig(sim=True, rate=30.0, max_joint_speed=100.0, command_timeout=10.0, rewind_window_s=5.0)
+    )
+    try:
+        ctrl.set_policy_running(True)
+        forward = []
+        for value in (0.05, 0.10, 0.15, 0.20):
+            target = np.full(7, value, dtype=float)
+            ctrl.set_policy_action({"left": target, "right": target})
+            ctrl.step()
+            forward.append(np.asarray(ctrl.snapshot()["left"]["applied"], dtype=float))
+
+        assert ctrl.snapshot()["rewind_buffer_frames"] >= 2
+        assert ctrl.rewind_rollout() is True
+
+        rewound = []
+        for _ in range(10):
+            ctrl.step()
+            snap = ctrl.snapshot()
+            if snap["left"]["applied"] is not None:
+                rewound.append(np.asarray(snap["left"]["applied"], dtype=float))
+            if snap["dagger_state"] == "intervention":
+                break
+
+        snap = ctrl.snapshot()
+        assert snap["intervention"] is True
+        assert snap["policy_running"] is True
+        assert snap["rewinding"] is False
+        assert len(rewound) >= 2
+        assert np.allclose(rewound[0], forward[-1])
+        assert np.allclose(rewound[-1] - rewound[0], -(forward[-1] - forward[0]))
+    finally:
+        ctrl.close()
+
+
 def test_teleop_bilateral_engage_steps():
     """Engage with bilateral_kp>0 runs through the (fixed) free-until-caught-up path."""
     tc = TeleopController(TeleopConfig(sim=True, bilateral_kp=0.2))

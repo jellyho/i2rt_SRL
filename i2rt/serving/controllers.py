@@ -18,8 +18,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import numpy as np
 
@@ -122,6 +123,7 @@ class BaseController:
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
     def finish_dagger_run(self, action: str) -> None: ...
+    def rewind_rollout(self) -> bool: ...
     def command(self, data: Dict) -> None: ...
     def set_sim_engage(self, flag: bool) -> None: ...
     def close(self) -> None: ...
@@ -385,6 +387,7 @@ class DaggerConfig:
     rate: float = 120.0
     max_joint_speed: float = 1.5
     command_timeout: float = 0.5  # s; stale policy actions (link loss) are ignored -> hold
+    rewind_window_s: float = 5.0
     arm_type: str = "yam"
     leader_gripper: str = "yam_teaching_handle"
     follower_gripper: str = "linear_4310"
@@ -418,6 +421,10 @@ class DaggerController(BaseController):
         self._intervening = False
         self._policy_running = False
         self._homing = False
+        self._rewinding = False
+        self._rewind_window_s = max(float(cfg.rewind_window_s), 0.0)
+        self._action_history: Deque[tuple[float, Dict[str, np.ndarray]]] = deque()
+        self._rewind_queue: List[Dict[str, np.ndarray]] = []
         self._btn_prev: Dict[str, list] = {}
         self._button_map: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in cfg.button_map.items()}
         self._event_seq = 0
@@ -444,6 +451,9 @@ class DaggerController(BaseController):
             "intervention": False,
             "policy_running": False,
             "homing": False,
+            "rewinding": False,
+            "rewind_available_s": 0.0,
+            "rewind_buffer_frames": 0,
             "dagger_state": "stopped",
             "last_dagger_event": None,
         }
@@ -486,16 +496,23 @@ class DaggerController(BaseController):
         self._touch_cmd()
 
     def set_intervention(self, flag: bool) -> None:
-        if self._homing:
+        if self._homing or self._rewinding:
             return
+        was_intervening = self._intervening
         self._intervening = bool(flag)
+        if was_intervening and not self._intervening and self._policy_running:
+            self._action_history.clear()
 
     def set_policy_running(self, flag: bool) -> None:
-        if self._homing:
+        if self._homing or self._rewinding:
             return
+        was_running = self._policy_running
         self._policy_running = bool(flag)
+        if self._policy_running and not was_running:
+            self._action_history.clear()
         if not self._policy_running:
             self._intervening = False
+            self._action_history.clear()
 
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
@@ -507,10 +524,38 @@ class DaggerController(BaseController):
         self._policy_running = False
         self._intervening = False
         self._homing = True
+        self._rewinding = False
+        self._rewind_queue = []
+        self._action_history.clear()
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
             self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
             self._home_d0[side] = max(float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6)
+
+    def rewind_rollout(self) -> bool:
+        """Replay the recent policy-controlled target trajectory backward, then hand to the human."""
+        now = time.monotonic()
+        self._trim_action_history(now)
+        if self._homing or self._rewinding or self._estop:
+            return False
+        if len(self._action_history) < 2:
+            logger.warning("rewind requested but policy history is empty")
+            return False
+
+        self._rewind_queue = [
+            {side: np.asarray(target, dtype=float).copy() for side, target in sample.items()}
+            for _, sample in reversed(self._action_history)
+        ]
+        self._action_history.clear()
+        self._rewinding = True
+        self._intervening = False
+
+        first = self._rewind_queue[0]
+        for side, target in first.items():
+            if side in self._smooth:
+                self._smooth[side].reset(target)
+        logger.info("rewinding %d policy action frames", len(self._rewind_queue))
+        return True
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":
@@ -521,11 +566,33 @@ class DaggerController(BaseController):
             self.finish_dagger_run("keep")
         elif action == "discard_home":
             self.finish_dagger_run("discard")
+        elif action in {"rewind", "rewind_rollout"}:
+            self.rewind_rollout()
         else:
             logger.warning("unknown dagger button action: %s", action)
 
+    def _append_action_history(self, now: float, sample: Dict[str, np.ndarray]) -> None:
+        if self._rewind_window_s <= 0.0:
+            return
+        self._action_history.append((now, {side: target.copy() for side, target in sample.items()}))
+        self._trim_action_history(now)
+
+    def _trim_action_history(self, now: float) -> None:
+        if self._rewind_window_s <= 0.0:
+            self._action_history.clear()
+            return
+        cutoff = now - self._rewind_window_s
+        while self._action_history and self._action_history[0][0] < cutoff:
+            self._action_history.popleft()
+
+    def _rewind_available_s(self, now: float) -> float:
+        self._trim_action_history(now)
+        if len(self._action_history) < 2:
+            return 0.0
+        return max(0.0, min(self._rewind_window_s, self._action_history[-1][0] - self._action_history[0][0]))
+
     def _scan_buttons(self, buttons: Dict[str, list]) -> None:
-        if self._homing:
+        if self._homing or self._rewinding:
             self._btn_prev = {side: list(btns) for side, btns in buttons.items()}
             return
         for side, btns in buttons.items():
@@ -550,6 +617,7 @@ class DaggerController(BaseController):
     # ---- one control tick (port of DaggerNode._loop) ------------------------
     def step(self) -> None:
         now = time.monotonic()
+        history_sample: Dict[str, np.ndarray] = {}
         arm_q, grip_cmd, buttons, valid = {}, {}, {}, {}
         for side, pair in self.pairs.items():
             try:
@@ -561,6 +629,11 @@ class DaggerController(BaseController):
             valid[side] = is_finite_vector(a, pair.leader.num_dofs())
 
         self._scan_buttons(buttons)
+        rewinding_this_step = self._rewinding
+        rewind_sample = self._rewind_queue[0] if rewinding_this_step and self._rewind_queue else None
+        record_history = self._policy_running and not (
+            self._intervening or self._homing or rewinding_this_step or self._estop
+        )
 
         sides_snap: Dict[str, Dict] = {}
         for side, pair in self.pairs.items():
@@ -571,7 +644,13 @@ class DaggerController(BaseController):
             try:
                 self._effort_guard(pair.follower)
                 desired = None
-                if self._homing:
+                if rewind_sample is not None:
+                    smoother.max_step = self._run_step
+                    target = rewind_sample.get(side)
+                    if is_finite_vector(target, n):
+                        desired = target[:n]
+                        self._drive_leader(pair, target[: pair.leader.num_dofs()], self.mirror_kp)
+                elif self._homing:
                     d = float(np.linalg.norm(smoother.cur - self.home_full))
                     p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
                     smoother.max_step = self._leader_smooth[side].max_step = self._home_step * self._ease_vel_scale(p)
@@ -596,6 +675,8 @@ class DaggerController(BaseController):
                 if desired is not None:
                     target = smoother.step(desired)
                     applied = self._apply(pair.follower, target)
+                    if record_history and applied is not None:
+                        history_sample[side] = np.asarray(applied, dtype=float).copy()
                 else:
                     smoother.reset(pair.follower.get_joint_pos())
 
@@ -609,10 +690,22 @@ class DaggerController(BaseController):
             except Exception as e:
                 logger.warning("[%s] dagger step failed: %s", side, e)
 
+        if record_history and len(history_sample) == len(self.pairs):
+            self._append_action_history(now, history_sample)
+
+        if rewind_sample is not None:
+            self._rewind_queue.pop(0)
+            if not self._rewind_queue:
+                self._rewinding = False
+                self._intervening = True
+                for side, pair in self.pairs.items():
+                    self._smooth[side].reset(pair.follower.get_joint_pos())
+
         if self._homing and self._homing_done():
             self._homing = False
 
         dagger_state = self._state_name()
+        rewind_available_s = self._rewind_available_s(now)
         with self._lock:
             self._snap = {
                 "mode": self.mode,
@@ -620,6 +713,9 @@ class DaggerController(BaseController):
                 "intervention": bool(self._intervening),
                 "policy_running": bool(self._policy_running),
                 "homing": bool(self._homing),
+                "rewinding": bool(self._rewinding),
+                "rewind_available_s": rewind_available_s,
+                "rewind_buffer_frames": len(self._action_history),
                 "dagger_state": dagger_state,
                 "last_dagger_event": dict(self._last_event) if self._last_event is not None else None,
                 "estop": self._estop,
@@ -629,6 +725,8 @@ class DaggerController(BaseController):
     def _state_name(self) -> str:
         if self._estop:
             return "estop"
+        if self._rewinding:
+            return "rewinding"
         if self._homing:
             return "homing"
         if self._intervening:

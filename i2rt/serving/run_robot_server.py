@@ -98,6 +98,7 @@ def main() -> None:
     pd.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for DAgger keep/discard homing")
     pd.add_argument("--rate", type=float, default=120.0)
     pd.add_argument("--max-joint-speed", type=float, default=1.5)
+    pd.add_argument("--rewind-window-s", type=float, default=5.0, help="seconds of policy action history to keep")
     pd.add_argument("--arm-type", default=default_arm)
     pd.add_argument("--gripper", default=default_gripper, help="follower (end-effector) gripper type")
     pd.add_argument("--leader-gripper", default=default_leader_gripper)
@@ -154,6 +155,7 @@ def main() -> None:
                 home_speed=args.home_speed,
                 rate=args.rate,
                 max_joint_speed=args.max_joint_speed,
+                rewind_window_s=args.rewind_window_s,
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
                 else DaggerConfig().button_map,
