@@ -39,12 +39,18 @@ class ArmPair:
 
 
 def _robot(channel: str, arm_type: str, gripper: str, sim: bool, zero_gravity: bool) -> Any:
+    from i2rt.serving.control_config import leader_arm_overrides
+
+    # Leader-only grav-comp feel overrides (config.yaml control.leader_*); the
+    # follower always keeps the shared yam.yml feedforward so replay matches.
+    overrides = leader_arm_overrides() if zero_gravity else {}
     return get_yam_robot(
         channel=channel,
         arm_type=ArmType(arm_type),
         gripper_type=GripperType(gripper),
         zero_gravity_mode=zero_gravity,
         sim=sim,
+        **overrides,
     )
 
 

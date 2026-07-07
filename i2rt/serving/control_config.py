@@ -45,6 +45,30 @@ GATE_JOINTS: List[int] = [1]
 HOME_KP: float = 0.3  # pulls the leader back to home while homing
 BILATERAL_KP: float = 0.0  # teleop: back-drives the leader while engaged (force feel) # This should be 0.0
 
+# --- Leader free-mode feel (grav-comp overrides, LEADER ONLY) ----------------
+# While engaged with BILATERAL_KP=0 the leader runs pure gravity comp; what the
+# hand feels is (gravity model error) + (grav_comp_kd damping) + (uncompensated
+# Coulomb friction). These override the shared yam.yml vectors for the LEADER
+# arm only, so it can be tuned lighter without touching the follower's
+# feedforward. Each accepts None (keep yam.yml), a float (all joints), or a
+# per-joint list (arm joints only, no gripper — 6 for a YAM).
+LEADER_GRAVITY_COMP_FACTOR: Optional[Union[float, List[float]]] = None  # >1.0 floats the arm up
+LEADER_GRAV_COMP_KD: Optional[Union[float, List[float]]] = None  # viscous drag; lower = lighter in motion
+LEADER_COULOMB_FRICTION: Optional[Union[float, List[float]]] = None  # friction feedforward; higher = less sticky
+
+
+def leader_arm_overrides() -> dict:
+    """kwargs for ``get_yam_robot`` when building a LEADER arm ({} = no overrides)."""
+    out: dict = {}
+    if LEADER_GRAVITY_COMP_FACTOR is not None:
+        out["gravity_comp_factor"] = LEADER_GRAVITY_COMP_FACTOR
+    if LEADER_GRAV_COMP_KD is not None:
+        out["grav_comp_kd"] = LEADER_GRAV_COMP_KD
+    if LEADER_COULOMB_FRICTION is not None:
+        out["coulomb_friction"] = LEADER_COULOMB_FRICTION
+    return out
+
+
 # --- DAgger leader gains (separate for the two phases) -----------------------
 # Intervention is TOGGLED by a handle button (press once to take over, press again
 # to hand back). While intervening the human drives the follower (FEEDBACK gain on

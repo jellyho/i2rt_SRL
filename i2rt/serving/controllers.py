@@ -423,6 +423,13 @@ class DaggerController(BaseController):
         self._event_seq = 0
         self._last_event: Optional[Dict[str, object]] = None
         self._policy_action: Dict[str, Optional[np.ndarray]] = {s: None for s in self.pairs}
+        # Leader damping while it mirrors the policy (grav_comp_kd "on"); the same
+        # damping is switched OFF (zero kd, free arm) during a feedback_kp=0 intervention.
+        self._leader_grav_kd: Dict[str, Optional[np.ndarray]] = {}
+        for side, pair in self.pairs.items():
+            info = pair.leader.get_robot_info() if hasattr(pair.leader, "get_robot_info") else {}
+            gkd = info.get("grav_comp_kd") if isinstance(info, dict) else None
+            self._leader_grav_kd[side] = np.asarray(gkd, dtype=float) if gkd is not None else None
         self._kin = _build_kin({s: p.follower for s, p in self.pairs.items()})
         self._smooth = {s: TargetSmoother(p.follower.get_joint_pos(), self._run_step) for s, p in self.pairs.items()}
         first = next(iter(self.pairs.values())).follower
@@ -582,16 +589,25 @@ class DaggerController(BaseController):
                     if valid[side]:
                         human = build_follower_target(pair.follower, arm_q[side], grip_cmd[side])
                         desired = human
-                        self._drive_leader(
-                            pair, np.asarray(pair.follower.get_joint_pos())[: pair.leader.num_dofs()], self.feedback_kp
-                        )
+                        if self.feedback_kp > 0.0:
+                            self._drive_leader(
+                                pair,
+                                np.asarray(pair.follower.get_joint_pos())[: pair.leader.num_dofs()],
+                                self.feedback_kp,
+                            )
+                        else:
+                            # feedback_kp=0: fully free leader — grav-comp idle with ZERO
+                            # damping (grav_comp_kd off), not a stale PD hold from mirroring.
+                            self._free_leader(pair)
                 elif self._policy_running:
                     smoother.max_step = self._run_step
                     act = self._policy_action[side]
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
                         desired = act[:n]
-                        self._drive_leader(pair, act[: pair.leader.num_dofs()], self.mirror_kp)
+                        # grav_comp_kd doubles as mirror damping (grav_comp_kd "on")
+                        self._drive_leader(pair, act[: pair.leader.num_dofs()], self.mirror_kp,
+                                           kd=self._leader_grav_kd.get(side))
 
                 if desired is not None:
                     target = smoother.step(desired)
@@ -649,14 +665,26 @@ class DaggerController(BaseController):
         except Exception:
             pass
 
-    def _drive_leader(self, pair: ArmPair, target_q: np.ndarray, kp_scale: float) -> None:
+    def _drive_leader(self, pair: ArmPair, target_q: np.ndarray, kp_scale: float,
+                      kd: Optional[np.ndarray] = None) -> None:
         leader = pair.leader
         if kp_scale <= 0.0 or not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
             return
         try:
             m = leader.num_dofs()
-            leader.update_kp_kd(pair.base_kp[:m] * kp_scale, np.zeros(m))
+            kd_vec = np.zeros(m) if kd is None else np.asarray(kd, dtype=float)[:m]
+            leader.update_kp_kd(pair.base_kp[:m] * kp_scale, kd_vec)
             leader.command_joint_pos(np.asarray(target_q, dtype=float)[:m])
+        except Exception:
+            pass
+
+    def _free_leader(self, pair: ArmPair) -> None:
+        """Leader fully free: grav-comp idle with zero damping (grav_comp_kd off)."""
+        leader = pair.leader
+        if not hasattr(leader, "enter_gravity_comp_idle"):
+            return
+        try:
+            leader.enter_gravity_comp_idle(kd=np.zeros(leader.num_dofs()))
         except Exception:
             pass
 

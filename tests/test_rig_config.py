@@ -55,6 +55,24 @@ def test_apply_control_overrides(monkeypatch):
     assert apply_control_overrides({}) == {}
 
 
+def test_apply_control_overrides_leader_keys(monkeypatch):
+    for attr in ("LEADER_GRAVITY_COMP_FACTOR", "LEADER_GRAV_COMP_KD", "LEADER_COULOMB_FRICTION"):
+        monkeypatch.setattr(cc, attr, None, raising=False)
+    applied = apply_control_overrides(
+        {
+            "control": {
+                "leader_gravity_comp_factor": 1.1,
+                "leader_grav_comp_kd": [0.05, 0.05, 0.05, 0.15, 0.03, 0.03],
+                "leader_coulomb_friction": 0.4,
+            }
+        }
+    )
+    assert cc.LEADER_GRAVITY_COMP_FACTOR == 1.1
+    assert cc.LEADER_GRAV_COMP_KD == [0.05, 0.05, 0.05, 0.15, 0.03, 0.03]
+    assert cc.LEADER_COULOMB_FRICTION == 0.4
+    assert "LEADER_GRAVITY_COMP_FACTOR" in applied
+
+
 def test_apply_camera_serials():
     cams = apply_camera_serials(default_cameras(), {"cameras": {"agentview": "AAA", "wrist_left": "BBB"}})
     by = {c.key: c.serial for c in cams}

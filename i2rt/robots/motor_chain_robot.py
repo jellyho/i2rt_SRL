@@ -626,7 +626,7 @@ class MotorChainRobot(Robot):
         self._kp = kp
         self._kd = kd
 
-    def enter_gravity_comp_idle(self) -> None:
+    def enter_gravity_comp_idle(self, kd: Optional[np.ndarray] = None) -> None:
         """Reset active commands to gravity-comp idle.
 
         Sets ``self._commands`` to zeros with ``kd = self._grav_comp_kd``,
@@ -635,10 +635,16 @@ class MotorChainRobot(Robot):
         grav-comp idle without leaving the previous target pose/gains active.
         Leaves ``self._kp`` / ``self._kd`` unchanged so subsequent control
         commands still use the configured control gains.
+
+        Args:
+            kd: Optional per-joint damping for THIS idle period only (e.g. zeros
+                for a fully free arm); ``None`` uses the configured grav_comp_kd.
         """
+        kd = self._grav_comp_kd.copy() if kd is None else np.asarray(kd, dtype=float)
+        assert kd.shape == self._grav_comp_kd.shape, f"kd expects shape {self._grav_comp_kd.shape}, got {kd.shape}"
         with self._command_lock:
             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
-            self._commands.kd = self._grav_comp_kd.copy()
+            self._commands.kd = kd
 
     def start_recording(self, save_dir: str) -> bool:
         """Start recording joint state data asynchronously."""

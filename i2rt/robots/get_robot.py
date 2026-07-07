@@ -53,6 +53,22 @@ def _load_joint_limits_from_xml(*xml_paths: str) -> np.ndarray:
     return limits
 
 
+def _override_vec(base: np.ndarray, val: Any) -> np.ndarray:
+    """Resolve a per-joint override against the arm-config default ``base``.
+
+    ``None`` keeps ``base``; a scalar broadcasts to every joint; a sequence must
+    match ``base``'s length (arm joints only).
+    """
+    if val is None:
+        return base.copy()
+    if np.isscalar(val):
+        return np.full(len(base), float(val))
+    vec = np.asarray(val, dtype=float)
+    if vec.shape != (len(base),):
+        raise ValueError(f"per-joint override expects {len(base)} values, got {vec.shape}")
+    return vec
+
+
 def get_encoder_chain(can_interface: CanInterface) -> EncoderChain:
     passive_encoder_reader = PassiveEncoderReader(can_interface)
     return EncoderChain([0x50E], passive_encoder_reader)
@@ -134,6 +150,8 @@ def get_yam_robot(
     ee_mass: Optional[float] = None,
     ee_inertia: Optional[np.ndarray] = None,
     gravity_comp_factor: Optional[np.ndarray] = None,
+    grav_comp_kd: Optional[np.ndarray] = None,
+    coulomb_friction: Optional[np.ndarray] = None,
     gripper_limits_override: Optional[np.ndarray] = None,
     gripper_kp: Optional[float] = None,
     gripper_kd: Optional[float] = None,
@@ -151,7 +169,11 @@ def get_yam_robot(
         ee_mass: Optional end-effector mass override (kg) for MuJoCo inertial.
         ee_inertia: Optional 10-element inertia override [ipos(3), quat(4), diaginertia(3)].
         gravity_comp_factor: Per-joint array (6 elements, arm joints only) multiplied against gravity torques.
-            Overrides the arm-type default when provided.
+            Overrides the arm-type default when provided. Scalars broadcast to every joint.
+        grav_comp_kd: Optional override of the arm-type grav-comp idle damping (scalar or
+            per-arm-joint array). Lower = less viscous drag when the arm is hand-guided.
+        coulomb_friction: Optional override of the arm-type Coulomb friction feedforward
+            (scalar or per-arm-joint array, Nm). Higher = less sticky, but too high dithers.
         gripper_limits_override: Optional [closed, open] limits. If provided, skips calibration.
         gripper_kp: Optional gripper kp override. Defaults to gripper_type's default.
         gripper_kd: Optional gripper kd override. Defaults to gripper_type's default.
@@ -165,7 +187,7 @@ def get_yam_robot(
     with_teaching_handle = gripper_type == GripperType.YAM_TEACHING_HANDLE
 
     hw = _load_arm_config(arm_type)
-    effective_gravity_comp = hw.gravity_comp_factor if gravity_comp_factor is None else gravity_comp_factor
+    effective_gravity_comp = _override_vec(hw.gravity_comp_factor, gravity_comp_factor)
     if with_gripper:
         effective_gravity_comp = np.append(effective_gravity_comp, 1.0)
 
@@ -188,8 +210,8 @@ def get_yam_robot(
     directions = list(hw.directions)
     kp = hw.kp.copy()
     kd = hw.kd.copy()
-    grav_comp_kd = hw.grav_comp_kd.copy()
-    coulomb_friction = hw.coulomb_friction.copy()
+    grav_comp_kd = _override_vec(hw.grav_comp_kd, grav_comp_kd)
+    coulomb_friction = _override_vec(hw.coulomb_friction, coulomb_friction)
     motor_offsets = [0.0] * len(motor_list)
 
     if with_gripper:
