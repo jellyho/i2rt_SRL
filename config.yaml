@@ -34,7 +34,7 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # scalar = all joints, list = per arm joint (6). Omit = yam.yml defaults (shown).
   # In DAgger the grav_comp_kd damping is dynamic: ON while the leader mirrors the
   # policy, OFF (zero) while intervening with dagger_feedback_kp: 0.
-  leader_grav_comp_kd: [0.1, 0.1, 0.1, 0.3, 0.05, 0.05]      # viscous drag; lower = lighter in motion
+  leader_grav_comp_kd: [0.025, 0.025, 0.025, 0.075, 0.0125, 0.0175]      # viscous drag; lower = lighter in motion
   # leader_coulomb_friction: [0.3, 0.3, 0.3, 0.06, 0.06, 0.06] # friction feedforward, Nm; higher = less sticky, too high buzzes
   # leader_gravity_comp_factor: [1.0, 1.1, 1.1, 1.2, 1.0, 1.0] # >1 floats the arm up
   # follower_effort_limit: 30.0          # Nm; collision/overload soft-stop (omit = off)
