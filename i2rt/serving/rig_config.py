@@ -29,6 +29,7 @@ _CONTROL_MAP = {
     "follower_kp": "FOLLOWER_KP",
     "follower_kd": "FOLLOWER_KD",
     "ramp_speed": "RAMP_SPEED",
+    "engage_time": "ENGAGE_TIME",
     "home_speed": "HOME_SPEED",
     "engage_thr": "ENGAGE_THR",
     "release_thr": "RELEASE_THR",

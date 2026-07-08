@@ -27,6 +27,12 @@ FOLLOWER_KD: Optional[Union[float, List[float]]] = None
 # Only the one-time engage approach and the homing return are rate-limited;
 # steady tracking is direct (uses FOLLOWER_KP/KD above).
 RAMP_SPEED: float = 0.8
+# Fixed engage catch-up duration (s): the follower meets the LIVE leader pose in
+# exactly this time via a cosine blend whose velocity matches the leader's at
+# handoff (perfectly smooth transition to direct tracking). The duration is
+# stretched if any joint's implied peak speed would exceed RAMP_SPEED (safety
+# ceiling). 0 = legacy speed-based catch-up at RAMP_SPEED.
+ENGAGE_TIME: float = 0.0
 # Homing return speed (rad/s) — kept slower than the engage approach so the robot
 # and leaders ease back to home gently (e.g. after a leader "end episode" button).
 HOME_SPEED: float = 0.4

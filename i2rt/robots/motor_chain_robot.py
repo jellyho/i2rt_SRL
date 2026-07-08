@@ -626,6 +626,20 @@ class MotorChainRobot(Robot):
         self._kp = kp
         self._kd = kd
 
+    def set_gravity_comp_factor(self, factor: np.ndarray) -> None:
+        """Swap the per-joint gravity-comp factor at runtime (takes effect next tick)."""
+        factor = np.asarray(factor, dtype=float)
+        assert factor.shape == self.gravity_comp_factor.shape
+        with self._state_lock:
+            self.gravity_comp_factor = factor
+
+    def set_coulomb_friction(self, coulomb: np.ndarray) -> None:
+        """Swap the per-joint Coulomb friction feedforward at runtime (takes effect next tick)."""
+        coulomb = np.asarray(coulomb, dtype=float)
+        assert coulomb.shape == self._coulomb_friction.shape
+        with self._state_lock:
+            self._coulomb_friction = coulomb
+
     def enter_gravity_comp_idle(self, kd: Optional[np.ndarray] = None) -> None:
         """Reset active commands to gravity-comp idle.
 

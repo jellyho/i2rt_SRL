@@ -24,18 +24,22 @@ policy:
 control:                     # overrides i2rt/serving/control_config (robot server)
   bilateral_kp: 0.0
   ramp_speed: 0.6            # one-time engage approach speed (rad/s)
+  engage_time: 2.0         # fixed engage catch-up (s): follower meets the live leader in
+  #                          # exactly this time (auto-stretched if a joint would exceed
+  #                          # ramp_speed). Omit/0 = legacy speed-based catch-up.
   home_speed: 0.6            # gentle homing return (rad/s)
   # --- engage / release gate (drives teleop_state IDLE↔ENGAGED↔HOMING, i.e. episode start/stop) ---
   engage_thr: 0.4           # gate-joint displacement (rad) to ENGAGE (lift to start)
   release_thr: 0.3          # gate-joint displacement (rad) to RELEASE → HOMING → IDLE (lower to end)
   dwell: 0.5                # seconds the threshold must hold before the state flips (debounce)
   gate_joints: [1]          # leader joint(s) that drive the gate ([] = L2 over all arm joints)
-  # --- leader free-mode feel (LEADER only; follower keeps yam.yml) ---
-  # scalar = all joints, list = per arm joint (6). Omit = yam.yml defaults (shown).
-  # In DAgger the grav_comp_kd damping is dynamic: ON while the leader mirrors the
-  # policy, OFF (zero) while intervening with dagger_feedback_kp: 0.
+  # --- leader human-held feel (LEADER only; follower keeps yam.yml) ---
+  # scalar = all joints, list = per arm joint (6). Omit = yam.yml defaults.
+  # Applied ONLY while a human holds the leader: teleop ENGAGED and DAgger
+  # intervention (dagger_feedback_kp: 0 -> fully free intervention). Every other
+  # phase (homing, idle/before engage, policy mirroring) uses yam.yml originals.
   leader_grav_comp_kd: [0.000, 0.000, 0.000, 0.000, 0.0000, 0.0000]      # viscous drag; lower = lighter in motion
-  leader_coulomb_friction: [0.45, 0.45, 0.45, 0.06, 0.06, 0.06] # friction feedforward, Nm; higher = less sticky, too high buzzes
+  leader_coulomb_friction: [0.5, 0.5, 0.5, 0.08, 0.08, 0.08] # friction feedforward, Nm; higher = less sticky, too high buzzes
   # leader_gravity_comp_factor: [1.0, 1.1, 1.1, 1.2, 1.0, 1.0] # >1 floats the arm up
   # follower_effort_limit: 30.0          # Nm; collision/overload soft-stop (omit = off)
   # follower_joint_limits: [[-3.0, 3.0], [-2.0, 2.0]]   # per-joint clamp [lo, hi]
@@ -46,7 +50,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
   wrist_right: "352122271652"           # D405
 
 recorder:
-  repo_id: jellyho/yam_pick
+  repo_id: jellyho/close_bottle_cap
   root: ~/lerobot_data
   fps: 30
   min_free_gb: 1.0
@@ -77,5 +81,5 @@ recorder:
     right.0: discard         # right upper button -> discard
 
 tasks:                       # quick-switch language instructions in the recorder GUI
-  - "pick up the cube"
+  - "pick up the cap and close the bottle"
   - "stack the blocks"

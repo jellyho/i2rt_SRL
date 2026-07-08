@@ -41,6 +41,7 @@ from i2rt.serving.teleop_common import (
 logger = logging.getLogger(__name__)
 
 _HOME_TOL = 0.05  # rad; homing considered done when the ramp is within this of home
+_LEADER_HOME_TOL = 0.1  # rad; the PHYSICAL leader must also be this close (weak home_kp lags)
 
 
 def _side_state(robot: Any, kin: Optional[ArmKinematics] = None) -> Dict[str, list]:
@@ -55,6 +56,21 @@ def _side_state(robot: Any, kin: Optional[ArmKinematics] = None) -> Dict[str, li
 def _build_kin(robots: Dict[str, Any]) -> Dict[str, ArmKinematics]:
     """One ArmKinematics per follower (for EEF FK in the snapshot / IK control)."""
     return {side: ArmKinematics(robot) for side, robot in robots.items()}
+
+
+def _arm_grav_defaults(arm_type: str) -> Optional[Dict[str, np.ndarray]]:
+    """The arm-type's ORIGINAL grav-comp terms (yam.yml), before any leader_* override."""
+    try:
+        from i2rt.robots.utils import ArmType, _load_arm_config
+
+        hw = _load_arm_config(ArmType(arm_type))
+        return {
+            "kd": np.asarray(hw.grav_comp_kd, dtype=float),
+            "factor": np.asarray(hw.gravity_comp_factor, dtype=float),
+            "coulomb": np.asarray(hw.coulomb_friction, dtype=float),
+        }
+    except Exception:
+        return None  # unknown arm (e.g. bare sim) -> no feel switching
 
 
 class BaseController:
@@ -118,6 +134,41 @@ class BaseController:
         robot.command_joint_pos(target)
         return np.asarray(target, dtype=float).tolist()
 
+    def _init_leader_grav_sets(self, arm_type: str) -> None:
+        """Capture the two leader grav-comp feel sets: the yam.yml ORIGINALS (used
+        whenever no human holds the arm) and the config.yaml leader_* override feel
+        the leader was built with (used while human-held)."""
+        self._grav_orig = _arm_grav_defaults(arm_type)
+        self._grav_free: Dict[str, Optional[Dict[str, np.ndarray]]] = {}
+        for side, pair in self.pairs.items():
+            info = pair.leader.get_robot_info() if hasattr(pair.leader, "get_robot_info") else {}
+            try:
+                self._grav_free[side] = {
+                    "factor": np.asarray(info["gravity_comp_factor"], dtype=float),
+                    "coulomb": np.asarray(info["coulomb_friction"], dtype=float),
+                }
+            except (KeyError, TypeError):
+                self._grav_free[side] = None
+        self._leader_held: Dict[str, Optional[bool]] = {s: None for s in self.pairs}  # None -> set on first tick
+
+    def _sync_leader_feel(self, pair: Any, side: str, held: bool) -> None:
+        """Flip the leader's gravity/friction feedforward when human-held changes:
+        override feel while held, yam.yml originals otherwise."""
+        if self._leader_held.get(side) == held:
+            return
+        self._leader_held[side] = held
+        vals = self._grav_free.get(side) if held else self._grav_orig
+        if vals is None:
+            return
+        leader = pair.leader
+        try:
+            if hasattr(leader, "set_gravity_comp_factor"):
+                leader.set_gravity_comp_factor(vals["factor"])
+            if hasattr(leader, "set_coulomb_friction"):
+                leader.set_coulomb_friction(vals["coulomb"])
+        except Exception:
+            pass
+
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
@@ -141,6 +192,7 @@ class TeleopConfig:
     bilateral_kp: float = cc.BILATERAL_KP
     rate: float = 120.0
     ramp_speed: float = cc.RAMP_SPEED
+    engage_time: float = cc.ENGAGE_TIME  # fixed-time engage catch-up (s); 0 = speed-based
     home_speed: float = cc.HOME_SPEED  # slower ramp for the homing return
     gate_joints: str = ",".join(str(j) for j in cc.GATE_JOINTS)
     arm_type: str = "yam"
@@ -166,6 +218,10 @@ class TeleopController(BaseController):
         self._caught_up = {s: False for s in self.pairs}
         self._home_d0 = {s: 0.0 for s in self.pairs}  # start distance for the homing cosine profile
         self._engage_d0 = {s: 0.0 for s in self.pairs}  # start distance for the engage cosine approach
+        # fixed-time engage blend state (engage_time > 0)
+        self._engage_t0 = {s: 0.0 for s in self.pairs}  # blend start time
+        self._engage_T = {s: 0.0 for s in self.pairs}  # effective blend duration
+        self._engage_start = {s: None for s in self.pairs}  # follower pose at blend start
         self._prev_state = TeleopStateMachine.HOMING
 
         first = next(iter(self.pairs.values())).follower
@@ -178,6 +234,9 @@ class TeleopController(BaseController):
         self.sm = TeleopStateMachine(cfg.engage_thr, cfg.release_thr, cfg.dwell)
         self._sim_engage = False
 
+        # leader_* override feel only while ENGAGED (human holds the arm);
+        # HOMING / IDLE revert to the yam.yml originals
+        self._init_leader_grav_sets(cfg.arm_type)
         self._kin = _build_kin({s: p.follower for s, p in self.pairs.items()})
         self._fsmooth, self._lsmooth = {}, {}
         for side, pair in self.pairs.items():
@@ -220,11 +279,20 @@ class TeleopController(BaseController):
         return any(idx < len(b) and bool(b[idx]) for b in buttons.values() for idx in cc.HOME_BUTTONS)
 
     def _homing_done(self) -> bool:
-        for side in self.pairs:
+        for side, pair in self.pairs.items():
             if np.linalg.norm(self._fsmooth[side].cur - self.home_full) > _HOME_TOL:
                 return False
             if np.linalg.norm(self._lsmooth[side].cur - self.home_arm) > _HOME_TOL:
                 return False
+            # The virtual ramp reaching home is not enough: the physical leader lags
+            # the weak home_kp pull, and flipping to IDLE too early frees it short of
+            # home. Keep HOMING until the leader actually arrives.
+            try:
+                lq = np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+                if np.linalg.norm(lq - self.home_arm) > _LEADER_HOME_TOL:
+                    return False
+            except Exception:
+                pass
         return True
 
     @staticmethod
@@ -266,12 +334,36 @@ class TeleopController(BaseController):
             applied = None
             try:
                 self._effort_guard(pair.follower)
+                # override feel only while the human actually holds the leader
+                self._sync_leader_feel(pair, side, held=state == TeleopStateMachine.ENGAGED)
                 if state == TeleopStateMachine.ENGAGED:
                     desired = build_follower_target(pair.follower, arm_q[side], grip[side])
                     if not is_finite_vector(desired, n):
                         desired = fsm.cur
                     if self._caught_up[side]:
                         applied = desired
+                        fsm.reset(applied)
+                    elif self.cfg.engage_time > 0.0:
+                        # Fixed-TIME catch-up: cosine blend from the engage pose to the
+                        # LIVE leader over engage_time seconds. s'(1)=0, so at handoff
+                        # the command's velocity equals the leader's own — direct
+                        # tracking takes over with no discontinuity. The duration is
+                        # stretched if any joint's peak blend speed (pi/2 * gap / T)
+                        # would exceed ramp_speed.
+                        if self._prev_state != TeleopStateMachine.ENGAGED:
+                            start = fsm.cur.copy()
+                            gap = float(np.max(np.abs(start - desired)))
+                            t_min = (np.pi / 2.0) * gap / max(self.cfg.ramp_speed, 1e-6)
+                            self._engage_start[side] = start
+                            self._engage_T[side] = max(self.cfg.engage_time, t_min)
+                            self._engage_t0[side] = now
+                        tau = (now - self._engage_t0[side]) / max(self._engage_T[side], 1e-6)
+                        if tau >= 1.0:
+                            self._caught_up[side] = True
+                            applied = desired
+                        else:
+                            s_blend = 0.5 * (1.0 - np.cos(np.pi * tau))
+                            applied = self._engage_start[side] + s_blend * (desired - self._engage_start[side])
                         fsm.reset(applied)
                     else:
                         # Cosine ease for the catch-up from home to the (live) leader:
@@ -303,10 +395,10 @@ class TeleopController(BaseController):
                     fsm.max_step = lsm.max_step = self._home_step * self._ease_vel_scale(p)
                     applied = fsm.step(self.home_full)
                     self._home_leader(pair, lsm.step(self.home_arm))
-                else:  # IDLE
+                else:  # IDLE — free, but with the ORIGINAL damping (human not holding yet)
                     fsm.max_step = self._ramp_step
                     applied = fsm.step(self.home_full)
-                    self._free_leader(pair)
+                    self._free_leader(pair, kd=self._grav_orig["kd"] if self._grav_orig else None)
                     lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
 
                 applied_list = self._apply(pair.follower, applied)
@@ -343,11 +435,16 @@ class TeleopController(BaseController):
         except Exception:
             pass
 
-    def _free_leader(self, pair: ArmPair) -> None:
+    def _free_leader(self, pair: ArmPair, kd: Optional[np.ndarray] = None) -> None:
+        """Grav-comp idle; ``kd=None`` uses the leader's own configured (override)
+        damping, an explicit vector (e.g. the yam.yml original) overrides per call."""
         leader = pair.leader
         if hasattr(leader, "enter_gravity_comp_idle"):
             try:
-                leader.enter_gravity_comp_idle()
+                if kd is None:
+                    leader.enter_gravity_comp_idle()
+                else:
+                    leader.enter_gravity_comp_idle(kd=kd)
             except Exception:
                 pass
 
@@ -423,13 +520,12 @@ class DaggerController(BaseController):
         self._event_seq = 0
         self._last_event: Optional[Dict[str, object]] = None
         self._policy_action: Dict[str, Optional[np.ndarray]] = {s: None for s in self.pairs}
-        # Leader damping while it mirrors the policy (grav_comp_kd "on"); the same
-        # damping is switched OFF (zero kd, free arm) during a feedback_kp=0 intervention.
-        self._leader_grav_kd: Dict[str, Optional[np.ndarray]] = {}
-        for side, pair in self.pairs.items():
-            info = pair.leader.get_robot_info() if hasattr(pair.leader, "get_robot_info") else {}
-            gkd = info.get("grav_comp_kd") if isinstance(info, dict) else None
-            self._leader_grav_kd[side] = np.asarray(gkd, dtype=float) if gkd is not None else None
+        # The config.yaml leader_* overrides are the HUMAN-HELD feel (intervention);
+        # in every other phase (mirroring, homing, stopped) all grav-comp terms
+        # revert to the yam.yml originals: kd via the mirror PD command, gravity
+        # factor + Coulomb feedforward via _sync_leader_feel.
+        self._init_leader_grav_sets(cfg.arm_type)
+        self._mirror_kd = self._grav_orig["kd"] if self._grav_orig is not None else None
         self._kin = _build_kin({s: p.follower for s, p in self.pairs.items()})
         self._smooth = {s: TargetSmoother(p.follower.get_joint_pos(), self._run_step) for s, p in self.pairs.items()}
         first = next(iter(self.pairs.values())).follower
@@ -577,6 +673,8 @@ class DaggerController(BaseController):
             human = None
             try:
                 self._effort_guard(pair.follower)
+                # override feel only while the human actually holds the leader
+                self._sync_leader_feel(pair, side, held=self._intervening)
                 desired = None
                 if self._homing:
                     d = float(np.linalg.norm(smoother.cur - self.home_full))
@@ -607,7 +705,7 @@ class DaggerController(BaseController):
                         desired = act[:n]
                         # grav_comp_kd doubles as mirror damping (grav_comp_kd "on")
                         self._drive_leader(pair, act[: pair.leader.num_dofs()], self.mirror_kp,
-                                           kd=self._leader_grav_kd.get(side))
+                                           kd=self._mirror_kd)
 
                 if desired is not None:
                     target = smoother.step(desired)
@@ -679,12 +777,13 @@ class DaggerController(BaseController):
             pass
 
     def _free_leader(self, pair: ArmPair) -> None:
-        """Leader fully free: grav-comp idle with zero damping (grav_comp_kd off)."""
+        """Leader free, teleop-identical feel: grav-comp idle with the leader's own
+        configured kd (i.e. the leader_grav_comp_kd override when set)."""
         leader = pair.leader
         if not hasattr(leader, "enter_gravity_comp_idle"):
             return
         try:
-            leader.enter_gravity_comp_idle(kd=np.zeros(leader.num_dofs()))
+            leader.enter_gravity_comp_idle()
         except Exception:
             pass
 
