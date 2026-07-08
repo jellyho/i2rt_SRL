@@ -39,18 +39,15 @@ class ArmPair:
 
 
 def _robot(channel: str, arm_type: str, gripper: str, sim: bool, zero_gravity: bool) -> Any:
-    from i2rt.serving.control_config import leader_arm_overrides
-
-    # Leader-only grav-comp feel overrides (config.yaml control.leader_*); the
-    # follower always keeps the shared yam.yml feedforward so replay matches.
-    overrides = leader_arm_overrides() if zero_gravity else {}
+    # Both arms are BUILT with the yam.yml originals — the leader is damped from
+    # power-on. The config.yaml control.leader_* feel overrides are applied at
+    # runtime by the controllers, only while a human holds the leader.
     return get_yam_robot(
         channel=channel,
         arm_type=ArmType(arm_type),
         gripper_type=GripperType(gripper),
         zero_gravity_mode=zero_gravity,
         sim=sim,
-        **overrides,
     )
 
 

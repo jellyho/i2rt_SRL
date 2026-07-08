@@ -64,7 +64,9 @@ LEADER_COULOMB_FRICTION: Optional[Union[float, List[float]]] = None  # friction 
 
 
 def leader_arm_overrides() -> dict:
-    """kwargs for ``get_yam_robot`` when building a LEADER arm ({} = no overrides)."""
+    """The raw LEADER_* overrides ({} = none). Consumed by the controllers, which
+    resolve them against the yam.yml originals and apply them at runtime while a
+    human holds the leader (the arm itself is BUILT with the originals)."""
     out: dict = {}
     if LEADER_GRAVITY_COMP_FACTOR is not None:
         out["gravity_comp_factor"] = LEADER_GRAVITY_COMP_FACTOR

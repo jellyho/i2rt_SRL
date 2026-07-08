@@ -43,12 +43,16 @@ def test_override_vec_broadcast():
         _override_vec(base, [1.0, 2.0])  # wrong per-joint length
 
 
-def test_build_pair_passes_leader_overrides_to_leader_only(monkeypatch):
+def test_build_pair_builds_both_arms_with_yam_defaults(monkeypatch):
+    # The leader_* overrides are a RUNTIME feel (applied by the controllers only
+    # while a human holds the arm). Construction must stay on the yam.yml
+    # originals so the leader is properly damped from power-on — even during the
+    # window before the control loop starts stepping.
     import i2rt.serving.teleop_common as tc
 
     _reset_leader_overrides(monkeypatch)
     monkeypatch.setattr(cc, "LEADER_COULOMB_FRICTION", 0.45, raising=False)
-    monkeypatch.setattr(cc, "LEADER_GRAV_COMP_KD", [0.05] * 6, raising=False)
+    monkeypatch.setattr(cc, "LEADER_GRAV_COMP_KD", [0.0] * 6, raising=False)
 
     calls = []
 
@@ -64,8 +68,6 @@ def test_build_pair_passes_leader_overrides_to_leader_only(monkeypatch):
     tc.build_pair(tc.PairSpec(side="left", leader_channel="can_l", follower_channel="can_f"), sim=False)
 
     leader_kw, follower_kw = calls
-    assert leader_kw["coulomb_friction"] == 0.45
-    assert leader_kw["grav_comp_kd"] == [0.05] * 6
-    assert "gravity_comp_factor" not in leader_kw  # unset -> yam.yml default
-    for key in ("coulomb_friction", "grav_comp_kd", "gravity_comp_factor"):
-        assert key not in follower_kw  # follower keeps the shared yam.yml values
+    for kw in (leader_kw, follower_kw):
+        for key in ("coulomb_friction", "grav_comp_kd", "gravity_comp_factor"):
+            assert key not in kw

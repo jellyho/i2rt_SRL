@@ -11,13 +11,14 @@ import threading
 
 import numpy as np
 
-# yam.yml originals (what mirroring must revert to)
+# yam.yml originals (construction state, and what every not-held phase uses)
 GRAV_COMP_KD = np.array([0.1, 0.1, 0.1, 0.3, 0.05, 0.05])
 ORIG_FACTOR = np.array([1.0, 1.1, 1.1, 1.2, 1.0, 1.0])
 ORIG_COULOMB = np.array([0.3, 0.3, 0.3, 0.06, 0.06, 0.06])
-# pretend config.yaml leader_* overrides the leader was BUILT with (human-held feel)
-FREE_FACTOR = np.array([1.0, 1.2, 1.2, 1.3, 1.0, 1.0])
-FREE_COULOMB = np.array([0.5, 0.5, 0.5, 0.06, 0.06, 0.06])
+# config.yaml leader_* overrides (human-held feel, applied at runtime only)
+FREE_FACTOR = [1.0, 1.2, 1.2, 1.3, 1.0, 1.0]
+FREE_COULOMB = [0.5, 0.5, 0.5, 0.06, 0.06, 0.06]
+FREE_KD = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 
 class StubLeader:
@@ -48,8 +49,6 @@ class StubLeader:
             "kp": np.full(self.n, 10.0),
             "kd": np.full(self.n, 1.0),
             "grav_comp_kd": self.grav_comp_kd.copy(),
-            "gravity_comp_factor": FREE_FACTOR.copy(),
-            "coulomb_friction": FREE_COULOMB.copy(),
         }
 
     def update_kp_kd(self, kp, kd):
@@ -93,9 +92,19 @@ class StubFollower:
         self.cmds.append(np.asarray(pos, dtype=float))
 
 
+def _set_free_feel(monkeypatch):
+    """Simulate config.yaml leader_* overrides (the human-held feel)."""
+    from i2rt.serving import control_config as cc
+
+    monkeypatch.setattr(cc, "LEADER_GRAVITY_COMP_FACTOR", list(FREE_FACTOR), raising=False)
+    monkeypatch.setattr(cc, "LEADER_COULOMB_FRICTION", list(FREE_COULOMB), raising=False)
+    monkeypatch.setattr(cc, "LEADER_GRAV_COMP_KD", list(FREE_KD), raising=False)
+
+
 def _make_dagger(monkeypatch, feedback_kp: float, leader_kd: np.ndarray = None):
     from i2rt.serving import controllers as ctl
 
+    _set_free_feel(monkeypatch)
     leader, follower = StubLeader(grav_comp_kd=leader_kd), StubFollower()
     pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
                        base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
@@ -135,9 +144,9 @@ def test_intervention_with_zero_feedback_kp_frees_leader(monkeypatch):
     dc.set_intervention(True)
     dc.step()
     assert leader.idle_calls, "feedback_kp=0 intervention must enter grav-comp idle"
-    # kd=None -> the leader's own configured kd, i.e. the leader_grav_comp_kd
-    # override — intervention feels exactly like teleop free mode
-    assert leader.idle_calls[-1] is None
+    # the leader_grav_comp_kd override kd is passed explicitly (the leader itself
+    # is BUILT with the yam.yml original) — intervention feels like teleop engaged
+    assert np.allclose(leader.idle_calls[-1], FREE_KD)
     assert len(leader.cmd_calls) == n_cmds  # the stale mirror target is NOT re-commanded
 
 
@@ -175,6 +184,7 @@ def test_dagger_stopped_uses_original_grav_ff(monkeypatch):
 def _make_teleop(monkeypatch, **cfg_kw):
     from i2rt.serving import controllers as ctl
 
+    _set_free_feel(monkeypatch)
     leader, follower = StubLeader(), StubFollower()
     pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
                        base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
@@ -189,8 +199,8 @@ def test_teleop_not_engaged_uses_original_grav_ff(monkeypatch):
     tc.step()  # HOMING -> IDLE; either way the human is not holding the arm
     assert np.allclose(leader.factor_calls[-1], ORIG_FACTOR)
     assert np.allclose(leader.coulomb_calls[-1], ORIG_COULOMB)
-    # IDLE frees the leader with the ORIGINAL damping, not the override
-    assert leader.idle_calls and np.allclose(leader.idle_calls[-1], GRAV_COMP_KD)
+    # IDLE frees the leader with its BUILT-IN (original) damping, kd untouched
+    assert leader.idle_calls and leader.idle_calls[-1] is None
 
 
 def test_teleop_engaged_applies_override_feel(monkeypatch):
@@ -200,7 +210,7 @@ def test_teleop_engaged_applies_override_feel(monkeypatch):
     tc.step()
     assert np.allclose(leader.factor_calls[-1], FREE_FACTOR)
     assert np.allclose(leader.coulomb_calls[-1], FREE_COULOMB)
-    assert leader.idle_calls[-1] is None  # free with the leader's own override kd
+    assert np.allclose(leader.idle_calls[-1], FREE_KD)  # override kd passed explicitly
 
 
 def test_homing_done_requires_physical_leader_at_home(monkeypatch):

@@ -135,20 +135,20 @@ class BaseController:
         return np.asarray(target, dtype=float).tolist()
 
     def _init_leader_grav_sets(self, arm_type: str) -> None:
-        """Capture the two leader grav-comp feel sets: the yam.yml ORIGINALS (used
-        whenever no human holds the arm) and the config.yaml leader_* override feel
-        the leader was built with (used while human-held)."""
+        """Capture the two leader grav-comp feel sets: the yam.yml ORIGINALS (the
+        arm's construction state, used whenever no human holds it) and the
+        config.yaml leader_* override feel resolved against them (human-held)."""
+        from i2rt.robots.get_robot import _override_vec
+
         self._grav_orig = _arm_grav_defaults(arm_type)
-        self._grav_free: Dict[str, Optional[Dict[str, np.ndarray]]] = {}
-        for side, pair in self.pairs.items():
-            info = pair.leader.get_robot_info() if hasattr(pair.leader, "get_robot_info") else {}
-            try:
-                self._grav_free[side] = {
-                    "factor": np.asarray(info["gravity_comp_factor"], dtype=float),
-                    "coulomb": np.asarray(info["coulomb_friction"], dtype=float),
-                }
-            except (KeyError, TypeError):
-                self._grav_free[side] = None
+        self._grav_free: Optional[Dict[str, np.ndarray]] = None
+        if self._grav_orig is not None:
+            ov = cc.leader_arm_overrides()
+            self._grav_free = {
+                "factor": _override_vec(self._grav_orig["factor"], ov.get("gravity_comp_factor")),
+                "coulomb": _override_vec(self._grav_orig["coulomb"], ov.get("coulomb_friction")),
+                "kd": _override_vec(self._grav_orig["kd"], ov.get("grav_comp_kd")),
+            }
         self._leader_held: Dict[str, Optional[bool]] = {s: None for s in self.pairs}  # None -> set on first tick
 
     def _sync_leader_feel(self, pair: Any, side: str, held: bool) -> None:
@@ -157,7 +157,7 @@ class BaseController:
         if self._leader_held.get(side) == held:
             return
         self._leader_held[side] = held
-        vals = self._grav_free.get(side) if held else self._grav_orig
+        vals = self._grav_free if held else self._grav_orig
         if vals is None:
             return
         leader = pair.leader
@@ -168,6 +168,11 @@ class BaseController:
                 leader.set_coulomb_friction(vals["coulomb"])
         except Exception:
             pass
+
+    def _free_kd(self) -> Optional[np.ndarray]:
+        """The human-held free-mode damping (leader_grav_comp_kd resolved), or None
+        to use the leader's built-in (original) kd."""
+        return self._grav_free["kd"] if self._grav_free is not None else None
 
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
@@ -382,7 +387,7 @@ class TeleopController(BaseController):
                     if self.bilateral_kp > 0.0 and self._caught_up[side]:
                         self._drive_leader(pair, np.asarray(pair.follower.get_joint_pos())[: pair.leader.num_dofs()])
                     else:
-                        self._free_leader(pair)
+                        self._free_leader(pair, kd=self._free_kd())
                     lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
                 elif state == TeleopStateMachine.HOMING:
                     # Cosine velocity profile: ease in/out at the ends, faster through
@@ -395,10 +400,10 @@ class TeleopController(BaseController):
                     fsm.max_step = lsm.max_step = self._home_step * self._ease_vel_scale(p)
                     applied = fsm.step(self.home_full)
                     self._home_leader(pair, lsm.step(self.home_arm))
-                else:  # IDLE — free, but with the ORIGINAL damping (human not holding yet)
+                else:  # IDLE — free with the built-in ORIGINAL damping (human not holding yet)
                     fsm.max_step = self._ramp_step
                     applied = fsm.step(self.home_full)
-                    self._free_leader(pair, kd=self._grav_orig["kd"] if self._grav_orig else None)
+                    self._free_leader(pair)
                     lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
 
                 applied_list = self._apply(pair.follower, applied)
@@ -777,13 +782,17 @@ class DaggerController(BaseController):
             pass
 
     def _free_leader(self, pair: ArmPair) -> None:
-        """Leader free, teleop-identical feel: grav-comp idle with the leader's own
-        configured kd (i.e. the leader_grav_comp_kd override when set)."""
+        """Leader free, teleop-identical feel: grav-comp idle with the resolved
+        leader_grav_comp_kd override (the leader is BUILT with the original kd)."""
         leader = pair.leader
         if not hasattr(leader, "enter_gravity_comp_idle"):
             return
         try:
-            leader.enter_gravity_comp_idle()
+            kd = self._free_kd()
+            if kd is None:
+                leader.enter_gravity_comp_idle()
+            else:
+                leader.enter_gravity_comp_idle(kd=kd)
         except Exception:
             pass
 
