@@ -40,7 +40,7 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # phase (homing, idle/before engage, policy mirroring) uses yam.yml originals.
   # leader_grav_comp_kd: [0.05, 0.05, 0.05, 0.15, 0.025, 0.025]
   leader_grav_comp_kd: [0.000, 0.000, 0.000, 0.000, 0.0000, 0.0000]      # viscous drag; lower = lighter in motion
-  leader_coulomb_friction: [0.5, 0.6, 0.7, 0.08, 0.08, 0.08] # friction feedforward, Nm; higher = less sticky, too high buzzes
+  leader_coulomb_friction: [0.55, 0.65, 0.7, 0.08, 0.08, 0.08] # friction feedforward, Nm; higher = less sticky, too high buzzes
   # leader_gravity_comp_factor: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # >1 floats the arm up
   # leader_gravity_comp_factor: [1.0, 1.1, 1.1, 1.2, 1.0, 1.0] # >1 floats the arm up
   # follower_effort_limit: 30.0          # Nm; collision/overload soft-stop (omit = off)
