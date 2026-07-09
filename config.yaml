@@ -48,8 +48,8 @@ control:                     # overrides i2rt/serving/control_config (robot serv
 
 cameras:                     # RealSense serials by role (run `yam-data cams` to list)
   agentview: "246322303794"              # D455
-  wrist_left: "409122274199"             # D405
-  wrist_right: "352122271652"           # D405
+  wrist_left: "352122271652"             # D405
+  wrist_right: "409122274199"           # D405
 
 recorder:
   repo_id: jellyho/close_bottle_cap
