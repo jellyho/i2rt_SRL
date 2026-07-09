@@ -52,6 +52,45 @@ def dataset_dir(root: str, repo_id: str) -> str:
     return os.path.join(os.path.expanduser(root), name)
 
 
+def list_datasets(root: str) -> List[str]:
+    """Dataset folder names under the parent ``root`` (for the setup-page picker).
+
+    Every non-hidden subdirectory counts — a fresh dataset has no metadata yet.
+    Sorted; [] when the root doesn't exist."""
+    path = os.path.expanduser(root)
+    try:
+        return sorted(
+            d for d in os.listdir(path)
+            if not d.startswith(".") and os.path.isdir(os.path.join(path, d))
+        )
+    except OSError:
+        return []
+
+
+def dataset_tasks(ds_dir: str) -> List[str]:
+    """Task strings already used by the dataset at ``ds_dir`` (best-effort).
+
+    Reads LeRobot v3 ``meta/tasks.parquet`` (tasks are the index) or the v2
+    ``meta/tasks.jsonl`` fallback. [] when neither exists or parsing fails."""
+    meta = os.path.join(os.path.expanduser(ds_dir), "meta")
+    parquet = os.path.join(meta, "tasks.parquet")
+    if os.path.exists(parquet):
+        try:
+            import pandas as pd
+
+            return [str(t) for t in pd.read_parquet(parquet).index]
+        except Exception:
+            return []
+    jsonl = os.path.join(meta, "tasks.jsonl")
+    if os.path.exists(jsonl):
+        try:
+            with open(jsonl) as fh:
+                return [json.loads(line)["task"] for line in fh if line.strip()]
+        except Exception:
+            return []
+    return []
+
+
 def dataset_info(root: str) -> Dict:
     """Inspect the dataset dir at ``root`` for the setup page — no lerobot import.
 

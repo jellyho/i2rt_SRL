@@ -31,7 +31,13 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import detect_cameras
 from workstation.lerobot_recorder.config import RecorderConfig
-from workstation.lerobot_recorder.dataset_writer import dataset_dir, dataset_info, remove_dataset_root
+from workstation.lerobot_recorder.dataset_writer import (
+    dataset_dir,
+    dataset_info,
+    dataset_tasks,
+    list_datasets,
+    remove_dataset_root,
+)
 from workstation.lerobot_recorder.recorder import Recorder
 from workstation.lerobot_recorder.sound import Cues
 from workstation.lerobot_recorder.views import compose_camera_strip
@@ -150,19 +156,25 @@ class RecorderGUI(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout(box)
         form.setSpacing(10)
 
-        self.repo_edit = QtWidgets.QLineEdit(self.cfg.repo_id)
+        # Dataset picker: existing datasets under root are selectable; the combo is
+        # editable so typing a fresh name creates a new dataset.
         self.root_edit = QtWidgets.QLineEdit(self.cfg.root)
-        self.repo_edit.textChanged.connect(lambda *_: self._update_setup_status())
-        self.root_edit.textChanged.connect(lambda *_: self._update_setup_status())
+        self.repo_combo = QtWidgets.QComboBox()
+        self.repo_combo.setEditable(True)
+        self.repo_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self._refresh_dataset_choices()
+        self.repo_combo.setCurrentText(self.cfg.repo_id)
 
+        # Task picker: tasks already used by the selected dataset + config tasks;
+        # editable so a new instruction can be typed in.
         self.task_combo = QtWidgets.QComboBox()
-        self.task_combo.setEditable(False)
-        seen = []
-        for t in [self.cfg.task, *self.cfg.tasks]:
-            if t and t not in seen:
-                seen.append(t)
-        self.task_combo.addItems(seen)
+        self.task_combo.setEditable(True)
+        self.task_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self._refresh_task_choices()
         self.task_combo.setCurrentText(self.cfg.task)
+
+        self.root_edit.textChanged.connect(self._on_root_changed)
+        self.repo_combo.editTextChanged.connect(self._on_dataset_changed)
 
         self.source_combo = QtWidgets.QComboBox()
         self.source_combo.addItems(["teleop", "dagger", "eval"])
@@ -189,7 +201,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.discount_spin.setDecimals(3)
         self.discount_spin.setValue(float(getattr(self.cfg, "discount_factor", 0.99)))
 
-        form.addRow("repo_id", self.repo_edit)
+        form.addRow("repo_id", self.repo_combo)
         form.addRow("root", self.root_edit)
         form.addRow("task", self.task_combo)
         form.addRow("source", self.source_combo)
@@ -304,6 +316,44 @@ class RecorderGUI(QtWidgets.QWidget):
         lay.addWidget(self.hint)
         return page
 
+    # ------------------------------------------------------------------ setup pickers
+    def _refresh_dataset_choices(self) -> None:
+        """Repopulate the dataset picker from the folders under root, keeping
+        whatever is currently typed (a new name stays a new name)."""
+        current = self.repo_combo.currentText()
+        root = self.root_edit.text().strip() if hasattr(self, "root_edit") else self.cfg.root
+        self.repo_combo.blockSignals(True)
+        self.repo_combo.clear()
+        self.repo_combo.addItems(list_datasets(root))
+        self.repo_combo.setCurrentText(current)
+        self.repo_combo.blockSignals(False)
+
+    def _refresh_task_choices(self) -> None:
+        """Task choices = tasks already in the selected dataset (kept consistent on
+        resume) + the config.yaml tasks; the current/typed text is preserved."""
+        current = self.task_combo.currentText()
+        root = self.root_edit.text().strip()
+        repo = self.repo_combo.currentText().strip()
+        ds_tasks = dataset_tasks(dataset_dir(root, repo)) if repo else []
+        seen = []
+        for t in [*ds_tasks, self.cfg.task, *self.cfg.tasks]:
+            if t and t not in seen:
+                seen.append(t)
+        self.task_combo.blockSignals(True)
+        self.task_combo.clear()
+        self.task_combo.addItems(seen)
+        self.task_combo.setCurrentText(current if current else (seen[0] if seen else ""))
+        self.task_combo.blockSignals(False)
+
+    def _on_root_changed(self) -> None:
+        self._refresh_dataset_choices()
+        self._refresh_task_choices()
+        self._update_setup_status()
+
+    def _on_dataset_changed(self) -> None:
+        self._refresh_task_choices()
+        self._update_setup_status()
+
     # ------------------------------------------------------------------ setup status
     def _update_setup_status(self, rescan: bool = False) -> None:
         """Refresh the camera-detected + dataset-exists line on the setup page."""
@@ -317,7 +367,7 @@ class RecorderGUI(QtWidgets.QWidget):
             cam_txt += f' (missing: {", ".join(cam["missing"])})'
 
         root = self.root_edit.text().strip() if hasattr(self, "root_edit") else self.cfg.root
-        repo = self.repo_edit.text().strip() if hasattr(self, "repo_edit") else self.cfg.repo_id
+        repo = self.repo_combo.currentText().strip() if hasattr(self, "repo_combo") else self.cfg.repo_id
         ds_dir = dataset_dir(root, repo)
         info = dataset_info(ds_dir)
         where = f' <span style="color:{theme.MUTED};">→ {ds_dir}</span>'
@@ -342,7 +392,7 @@ class RecorderGUI(QtWidgets.QWidget):
 
     def _on_start(self) -> None:
         cfg = self.cfg
-        cfg.repo_id = self.repo_edit.text().strip()
+        cfg.repo_id = self.repo_combo.currentText().strip()
         cfg.root = self.root_edit.text().strip()
         cfg.task = self.task_combo.currentText().strip()
         cfg.record_source = self.source_combo.currentText().strip()
