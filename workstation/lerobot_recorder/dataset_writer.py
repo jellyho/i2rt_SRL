@@ -146,6 +146,8 @@ class AsyncDatasetWriter:
         # Episodes already in the dataset before this session (resume); re-synced to
         # the authoritative count in open(). total/new_episodes build on this.
         self._initial_episodes = int(dataset_info(self._root)["episodes"] or 0) if cfg.resume else 0
+        # Whole-dataset ✓/✗ counts from the outcome sidecar (grow as episodes save).
+        self._outcome_totals = self._read_outcome_totals() if cfg.resume else {"success": 0, "fail": 0}
 
         self._queue: "queue.Queue" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
@@ -375,6 +377,7 @@ class AsyncDatasetWriter:
                 logger.info("abcdl dataset at %s (format=abcdl, size=%d)",
                             self._root, int(getattr(self.cfg, "abcdl_size", 224)))
             self._initial_episodes = self._n_episodes  # authoritative pre-session count
+            self._outcome_totals = self._read_outcome_totals()
             self._worker = threading.Thread(target=self._run, daemon=True)
             self._worker.start()
             return
@@ -427,8 +430,26 @@ class AsyncDatasetWriter:
             logger.info("MOCK writer (repo_id=%s); features=%s", self.cfg.repo_id, sorted(self._features))
 
         self._initial_episodes = self._n_episodes  # authoritative pre-session count
+        self._outcome_totals = self._read_outcome_totals()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+
+    def _read_outcome_totals(self) -> Dict[str, int]:
+        """Whole-dataset success/fail counts from the outcome sidecar (best-effort)."""
+        totals = {"success": 0, "fail": 0}
+        try:
+            with open(self._outcomes_path) as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    outcome = json.loads(line).get("outcome")
+                    if outcome in totals:
+                        totals[outcome] += 1
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning("could not read outcome sidecar totals: %s", e)
+        return totals
 
     def _existing_outcome_count(self) -> int:
         try:
@@ -499,6 +520,12 @@ class AsyncDatasetWriter:
         """Episodes saved THIS session (excludes what a resumed dataset already had)."""
         with self._lock:
             return max(0, self._n_episodes - self._initial_episodes)
+
+    @property
+    def outcome_totals(self) -> Dict[str, int]:
+        """Whole-dataset {success, fail} counts (sidecar history + this session)."""
+        with self._lock:
+            return dict(self._outcome_totals)
 
     @property
     def finalized(self) -> bool:
@@ -598,6 +625,9 @@ class AsyncDatasetWriter:
                 fh.write(json.dumps(entry) + "\n")
         except Exception as e:
             logger.error("could not write outcome sidecar: %s", e)
+        if outcome in ("success", "fail"):
+            with self._lock:
+                self._outcome_totals[outcome] += 1
 
     # ------------------------------------------------------------------ shutdown
     def finalize(self) -> None:

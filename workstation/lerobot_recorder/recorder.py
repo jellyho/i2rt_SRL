@@ -55,6 +55,8 @@ class Recorder:
             "teleop": "—",
             "episodes": 0,
             "episodes_total": 0,  # whole dataset incl. what a resumed one already had
+            "success_total": 0,  # whole-dataset ✓ (sidecar history + this session)
+            "fail_total": 0,  # whole-dataset ✗
             "frames": 0,
             "queue": 0,
             "saving": False,
@@ -178,6 +180,8 @@ class Recorder:
                 pending=False,
                 episodes=self.writer.num_episodes,
                 episodes_total=self.writer.total_episodes,
+                success_total=self.writer.outcome_totals["success"],
+                fail_total=self.writer.outcome_totals["fail"],
                 frames=0,
                 queue=self.writer.queue_depth,
             )
@@ -251,6 +255,8 @@ class Recorder:
                 pending=False,
                 episodes=self.writer.num_episodes if self.writer is not None else 0,
                 episodes_total=self.writer.total_episodes if self.writer is not None else 0,
+                success_total=self.writer.outcome_totals["success"] if self.writer is not None else 0,
+                fail_total=self.writer.outcome_totals["fail"] if self.writer is not None else 0,
                 frames=0,
                 queue=0,
                 saving=False,
@@ -352,6 +358,8 @@ class Recorder:
                 teleop=snap["teleop_state"],
                 episodes=self.writer.num_episodes,
                 episodes_total=self.writer.total_episodes,
+                success_total=self.writer.outcome_totals["success"],
+                fail_total=self.writer.outcome_totals["fail"],
                 frames=len(self._episode),
                 queue=self.writer.queue_depth,
                 cam_ok=self.cameras.healthy,
@@ -395,6 +403,8 @@ class Recorder:
             teleop=snap["teleop_state"],
             episodes=self.writer.num_episodes,
             episodes_total=self.writer.total_episodes,
+                success_total=self.writer.outcome_totals["success"],
+                fail_total=self.writer.outcome_totals["fail"],
             frames=len(self._episode),
             queue=self.writer.queue_depth,
             cam_ok=self.cameras.healthy,

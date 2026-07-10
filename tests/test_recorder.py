@@ -145,6 +145,41 @@ def test_status_reports_dataset_total_across_sessions(tmp_path):
         rec2.shutdown()
 
 
+def test_status_reports_dataset_outcome_totals_across_sessions(tmp_path):
+    # session 1: one success + one fail
+    cfg = RecorderConfig(repo_id="test/outcomes", root=str(tmp_path), fps=60, mock=True, review_before_save=False)
+    rec = Recorder(cfg)
+    rec.start()
+    try:
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec._episode = [rec._sample_frame()]
+        rec._submit("fail")
+        rec.save_dataset()
+        assert rec.writer.outcome_totals == {"success": 1, "fail": 1}
+        st = rec.get_status()
+        assert st["success_total"] == 1 and st["fail_total"] == 1
+    finally:
+        rec.shutdown()
+
+    # session 2: resume — totals seed from the dataset's outcome sidecar, then grow
+    cfg2 = RecorderConfig(
+        repo_id="test/outcomes", root=str(tmp_path), fps=60, mock=True, review_before_save=False, resume=True
+    )
+    rec2 = Recorder(cfg2)
+    rec2.start()
+    try:
+        assert rec2.writer.outcome_totals == {"success": 1, "fail": 1}  # before recording anything
+        rec2._episode = [rec2._sample_frame()]
+        rec2._submit("success")
+        rec2.save_dataset()
+        assert rec2.writer.outcome_totals == {"success": 2, "fail": 1}
+        st = rec2.get_status()
+        assert st["success_total"] == 2 and st["fail_total"] == 1
+    finally:
+        rec2.shutdown()
+
+
 def test_streaming_encoding_kwarg_flows_to_writer(tmp_path):
     from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
 

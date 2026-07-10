@@ -644,9 +644,10 @@ class RecorderGUI(QtWidgets.QWidget):
         kept, suc, fail, disc = st["kept"], st["success"], st["fail"], st["discarded"]
         rate = f"{100 * suc / max(suc + fail, 1):.0f}%" if (suc + fail) else "—"
         total = st.get("episodes_total", st["episodes"])
+        tsuc, tfail = st.get("success_total", 0), st.get("fail_total", 0)
         self.stats.setText(
-            f"dataset total {total} · session kept {kept} (✓{suc} ✗{fail}) · discarded {disc} · "
-            f"success {rate} · frames {st['frames']}"
+            f"dataset {total} (✓{tsuc} ✗{tfail}) · session kept {kept} (✓{suc} ✗{fail}) · "
+            f"discarded {disc} · success {rate} · frames {st['frames']}"
         )
 
     def _update_save_button(self, st: dict) -> None:
