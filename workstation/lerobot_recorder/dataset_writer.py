@@ -143,6 +143,9 @@ class AsyncDatasetWriter:
         # The dataset lives in <root>/<name>; root is just the parent directory.
         self._root = dataset_dir(cfg.root, cfg.repo_id)
         self._outcomes_path = os.path.join(self._root, "outcomes.jsonl")
+        # Episodes already in the dataset before this session (resume); re-synced to
+        # the authoritative count in open(). total/new_episodes build on this.
+        self._initial_episodes = int(dataset_info(self._root)["episodes"] or 0) if cfg.resume else 0
 
         self._queue: "queue.Queue" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
@@ -367,6 +370,7 @@ class AsyncDatasetWriter:
             else:
                 logger.info("abcdl dataset at %s (format=abcdl, size=%d)",
                             self._root, int(getattr(self.cfg, "abcdl_size", 224)))
+            self._initial_episodes = self._n_episodes  # authoritative pre-session count
             self._worker = threading.Thread(target=self._run, daemon=True)
             self._worker.start()
             return
@@ -418,6 +422,7 @@ class AsyncDatasetWriter:
                 self._n_episodes = self._existing_outcome_count()
             logger.info("MOCK writer (repo_id=%s); features=%s", self.cfg.repo_id, sorted(self._features))
 
+        self._initial_episodes = self._n_episodes  # authoritative pre-session count
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -478,6 +483,18 @@ class AsyncDatasetWriter:
     def num_episodes(self) -> int:
         with self._lock:
             return self._n_episodes
+
+    @property
+    def total_episodes(self) -> int:
+        """Episodes in the WHOLE dataset: pre-session (resume) + saved this session."""
+        with self._lock:
+            return max(self._n_episodes, self._initial_episodes)
+
+    @property
+    def new_episodes(self) -> int:
+        """Episodes saved THIS session (excludes what a resumed dataset already had)."""
+        with self._lock:
+            return max(0, self._n_episodes - self._initial_episodes)
 
     @property
     def finalized(self) -> bool:

@@ -109,6 +109,42 @@ def test_manual_save_preserves_armed_idle_state(tmp_path):
         rec.shutdown()
 
 
+def test_status_reports_dataset_total_across_sessions(tmp_path):
+    # session 1: fresh dataset — total grows with the saves
+    cfg = RecorderConfig(repo_id="test/total", root=str(tmp_path), fps=60, mock=True, review_before_save=False)
+    rec = Recorder(cfg)
+    rec.start()
+    try:
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec._episode = [rec._sample_frame()]
+        rec._submit("success")
+        rec.save_dataset()
+        assert rec.writer.total_episodes == 2
+        assert rec.writer.new_episodes == 2
+        assert rec.get_status()["episodes_total"] == 2
+    finally:
+        rec.shutdown()
+
+    # session 2: resume — the dashboard total starts at the EXISTING count, not 0
+    cfg2 = RecorderConfig(
+        repo_id="test/total", root=str(tmp_path), fps=60, mock=True, review_before_save=False, resume=True
+    )
+    rec2 = Recorder(cfg2)
+    rec2.start()
+    try:
+        assert rec2.writer.total_episodes == 2  # before any new episode this session
+        assert rec2.writer.new_episodes == 0
+        rec2._episode = [rec2._sample_frame()]
+        rec2._submit("fail")
+        rec2.save_dataset()
+        assert rec2.writer.total_episodes == 3
+        assert rec2.writer.new_episodes == 1
+        assert rec2.get_status()["episodes_total"] == 3
+    finally:
+        rec2.shutdown()
+
+
 def test_control_mode_in_frame():
     cfg = RecorderConfig(record_source="teleop", mock=False)
     rec = Recorder(cfg)

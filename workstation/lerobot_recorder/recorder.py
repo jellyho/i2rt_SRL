@@ -54,6 +54,7 @@ class Recorder:
             "pending": False,
             "teleop": "—",
             "episodes": 0,
+            "episodes_total": 0,  # whole dataset incl. what a resumed one already had
             "frames": 0,
             "queue": 0,
             "saving": False,
@@ -173,7 +174,13 @@ class Recorder:
         """Review decision: keep the pending episode (submit it), with an optional outcome label."""
         if self._pending and self.writer is not None:
             self._submit(outcome)
-            self._set(pending=False, episodes=self.writer.num_episodes, frames=0, queue=self.writer.queue_depth)
+            self._set(
+                pending=False,
+                episodes=self.writer.num_episodes,
+                episodes_total=self.writer.total_episodes,
+                frames=0,
+                queue=self.writer.queue_depth,
+            )
 
     def delete_episode(self) -> None:
         """Review decision: discard the pending episode."""
@@ -243,6 +250,7 @@ class Recorder:
                 recording=False,
                 pending=False,
                 episodes=self.writer.num_episodes if self.writer is not None else 0,
+                episodes_total=self.writer.total_episodes if self.writer is not None else 0,
                 frames=0,
                 queue=0,
                 saving=False,
@@ -343,6 +351,7 @@ class Recorder:
                 pending=self._pending,
                 teleop=snap["teleop_state"],
                 episodes=self.writer.num_episodes,
+                episodes_total=self.writer.total_episodes,
                 frames=len(self._episode),
                 queue=self.writer.queue_depth,
                 cam_ok=self.cameras.healthy,
@@ -385,6 +394,7 @@ class Recorder:
             pending=self._pending,
             teleop=snap["teleop_state"],
             episodes=self.writer.num_episodes,
+            episodes_total=self.writer.total_episodes,
             frames=len(self._episode),
             queue=self.writer.queue_depth,
             cam_ok=self.cameras.healthy,

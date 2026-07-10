@@ -272,7 +272,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.health = QtWidgets.QLabel()
         self.health.setTextFormat(QtCore.Qt.RichText)
         self.health.setStyleSheet("font-size:28px;")  # bigger health/queue strip
-        self.stats = QtWidgets.QLabel("episodes 0")
+        self.stats = QtWidgets.QLabel("dataset total 0")
         self.stats.setStyleSheet(f"color:{theme.MUTED};font-size:26px;")
         self.estop_btn = QtWidgets.QPushButton("■ E-STOP")
         self.estop_btn.setObjectName("estop")
@@ -643,8 +643,9 @@ class RecorderGUI(QtWidgets.QWidget):
     def _update_stats(self, st: dict) -> None:
         kept, suc, fail, disc = st["kept"], st["success"], st["fail"], st["discarded"]
         rate = f"{100 * suc / max(suc + fail, 1):.0f}%" if (suc + fail) else "—"
+        total = st.get("episodes_total", st["episodes"])
         self.stats.setText(
-            f"episodes {st['episodes']} · kept {kept} (✓{suc} ✗{fail}) · discarded {disc} · "
+            f"dataset total {total} · session kept {kept} (✓{suc} ✗{fail}) · discarded {disc} · "
             f"success {rate} · frames {st['frames']}"
         )
 
