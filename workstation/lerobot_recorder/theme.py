@@ -33,8 +33,22 @@ QLabel {{ background: transparent; }}
 QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox {{
     background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px 14px; color: {TEXT}; font-size: 26px;
 }}
-QComboBox::drop-down {{ border: 0; width: 32px; }}
+QComboBox[pickerCombo="true"] {{ border-color: {ACCENT}; padding-right: 92px; }}
+QComboBox[pickerCombo="true"] QLineEdit {{ background: transparent; border: 0; padding: 12px 14px; color: {TEXT}; }}
+QComboBox::drop-down {{
+    background: #21262d; border: 0; border-left: 1px solid #30363d;
+    border-top-right-radius: 8px; border-bottom-right-radius: 8px; width: 56px;
+}}
+QComboBox::down-arrow {{ width: 18px; height: 18px; }}
 QComboBox QAbstractItemView {{ background: {PANEL}; border: 1px solid #30363d; selection-background-color: {ACCENT}; }}
+QToolButton#comboDropButton {{
+    background: {ACCENT}; border: 0; border-left: 1px solid #30363d;
+    border-top-right-radius: 8px; border-bottom-right-radius: 8px;
+    color: white; font-size: 28px; font-weight: 700; padding: 0;
+}}
+QToolButton#comboDropButton:hover {{ background: #6cb1ff; }}
+QToolButton#comboDropButton:pressed {{ background: #388bfd; }}
+QToolButton#comboDropButton:disabled {{ background: #21262d; color: #484f58; }}
 QPushButton {{
     background: #21262d; border: 1px solid #30363d; border-radius: 8px; padding: 16px 26px; color: {TEXT}; font-size: 26px;
 }}

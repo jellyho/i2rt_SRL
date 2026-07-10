@@ -89,6 +89,43 @@ class _LogBuffer(logging.Handler):
             pass
 
 
+class PickerComboBox(QtWidgets.QComboBox):
+    """Combo box with a large, obvious popup target on the right."""
+
+    DROPDOWN_HITBOX = 86
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, *, editable: bool = False) -> None:
+        super().__init__(parent)
+        self.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.setEditable(editable)
+        self.setProperty("pickerCombo", True)
+
+        if editable:
+            edit = self.lineEdit()
+            edit.setFrame(False)
+            edit.setTextMargins(0, 0, self.DROPDOWN_HITBOX, 0)
+
+        self._popup_btn = QtWidgets.QToolButton(self)
+        self._popup_btn.setObjectName("comboDropButton")
+        self._popup_btn.setText("▼")
+        self._popup_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._popup_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        self._popup_btn.setToolTip("Open list")
+        self._popup_btn.clicked.connect(self.showPopup)
+        self._sync_popup_button_geometry()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._sync_popup_button_geometry()
+
+    def _sync_popup_button_geometry(self) -> None:
+        width = min(self.DROPDOWN_HITBOX, max(56, self.width() // 3))
+        if self.isEditable() and self.lineEdit() is not None:
+            self.lineEdit().setTextMargins(0, 0, width, 0)
+        self._popup_btn.setGeometry(self.width() - width, 1, width, max(0, self.height() - 2))
+        self._popup_btn.raise_()
+
+
 class RecorderGUI(QtWidgets.QWidget):
     def __init__(self, cfg: RecorderConfig) -> None:
         super().__init__()
@@ -159,24 +196,20 @@ class RecorderGUI(QtWidgets.QWidget):
         # Dataset picker: existing datasets under root are selectable; the combo is
         # editable so typing a fresh name creates a new dataset.
         self.root_edit = QtWidgets.QLineEdit(self.cfg.root)
-        self.repo_combo = QtWidgets.QComboBox()
-        self.repo_combo.setEditable(True)
-        self.repo_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.repo_combo = PickerComboBox(editable=True)
         self._refresh_dataset_choices()
         self.repo_combo.setCurrentText(self.cfg.repo_id)
 
         # Task picker: tasks already used by the selected dataset + config tasks;
         # editable so a new instruction can be typed in.
-        self.task_combo = QtWidgets.QComboBox()
-        self.task_combo.setEditable(True)
-        self.task_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.task_combo = PickerComboBox(editable=True)
         self._refresh_task_choices()
         self.task_combo.setCurrentText(self.cfg.task)
 
         self.root_edit.textChanged.connect(self._on_root_changed)
         self.repo_combo.editTextChanged.connect(self._on_dataset_changed)
 
-        self.source_combo = QtWidgets.QComboBox()
+        self.source_combo = PickerComboBox()
         self.source_combo.addItems(["teleop", "dagger", "eval"])
         idx = self.source_combo.findText(self.cfg.record_source)
         self.source_combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -191,7 +224,7 @@ class RecorderGUI(QtWidgets.QWidget):
         # disabled to make clear the original scheme is preserved.
         self.rl_check = QtWidgets.QCheckBox("Per-frame RL signals (success / reward / mc_return)")
         self.rl_check.setChecked(bool(getattr(self.cfg, "rl_features", False)))
-        self.reward_combo = QtWidgets.QComboBox()
+        self.reward_combo = PickerComboBox()
         self.reward_combo.addItems(["sparse", "step"])
         ridx = self.reward_combo.findText(getattr(self.cfg, "reward_mode", "sparse"))
         self.reward_combo.setCurrentIndex(ridx if ridx >= 0 else 0)
@@ -377,9 +410,11 @@ class RecorderGUI(QtWidgets.QWidget):
             n = info["episodes"]
             ntxt = f"{n} episode(s)" if n is not None else "existing data"
             if self.resume_check.isChecked():
-                ds_txt = f'<span style="color:{theme.ACCENT};">●</span> dataset: exists ({ntxt}) — will append{where}'
+                append = f'<b><span style="color:{theme.OK};">will append</span></b>'
+                ds_txt = f'<span style="color:{theme.ACCENT};">●</span> dataset: exists ({ntxt}) — {append}{where}'
             else:
-                ds_txt = f'<span style="color:{theme.WARN};">●</span> dataset: exists ({ntxt}) — START will offer to overwrite{where}'
+                overwrite = f'<b><span style="color:{theme.BAD};">START will offer to overwrite</span></b>'
+                ds_txt = f'<span style="color:{theme.WARN};">●</span> dataset: exists ({ntxt}) — {overwrite}{where}'
         self.setup_status.setText(cam_txt + "<br>" + ds_txt)
 
     # ------------------------------------------------------------------ actions
