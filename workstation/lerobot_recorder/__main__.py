@@ -110,6 +110,7 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
     cfg.batch_encoding_size = int(rec_section.get("batch_encoding_size", cfg.batch_encoding_size))
     cfg.image_writer_threads = int(rec_section.get("image_writer_threads", cfg.image_writer_threads))
     cfg.image_writer_processes = int(rec_section.get("image_writer_processes", cfg.image_writer_processes))
+    cfg.streaming_encoding = bool(rec_section.get("streaming_encoding", cfg.streaming_encoding))
     return cfg
 
 

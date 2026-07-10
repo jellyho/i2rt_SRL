@@ -107,6 +107,10 @@ class RecorderConfig:
     # ~4 threads per camera parallelizes it (0 = synchronous; processes>0 adds subprocesses).
     image_writer_threads: int = 0
     image_writer_processes: int = 0
+    # Stream frames straight into the video encoder as they're added (patched LeRobot):
+    # no temp-PNG round-trip at all, save_episode() becomes near-instant. Needs a
+    # lerobot build with the streaming_encoding kwarg; pairs best with vcodec: auto (GPU).
+    streaming_encoding: bool = False
     cameras: List[CameraSpec] = field(default_factory=default_cameras)
     # Robot link: the YAM robot machine running i2rt.serving.run_robot_server (portal).
     robot_host: str = "127.0.0.1"

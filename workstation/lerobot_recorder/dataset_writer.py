@@ -208,6 +208,10 @@ class AsyncDatasetWriter:
         }
         if int(self.cfg.encoder_threads) > 0:
             enc["encoder_threads"] = int(self.cfg.encoder_threads)
+        # Direct-to-encoder streaming (no temp-PNG round-trip). Only passed when
+        # enabled so stock lerobot builds without the kwarg keep working.
+        if bool(getattr(self.cfg, "streaming_encoding", False)):
+            enc["streaming_encoding"] = True
         return enc
 
     def _create_encoding_kwargs(self) -> dict:

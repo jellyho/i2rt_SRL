@@ -66,14 +66,20 @@ recorder:
   review_before_save: false  # auto-save every engage→idle episode (no Keep/Delete hold)
   auto_arm: true             # arm collection on Start; records on the next teleop engage
   # --- saving speed (video encoding) ---
-  # The writer is single-threaded per dataset, but the ENCODER can go faster/parallel:
+  # ACTIVE path: streaming_encoding + vcodec are what matter. Frames go straight
+  # into the GPU encoder while the episode is written — no temp PNGs, ~25s per
+  # 7000-frame episode instead of ~80s+.
   vcodec: auto               # auto = GPU h264_nvenc here (fastest) | h264 (CPU, reliable) | libsvtav1 (slow AV1)
-  encoder_threads: 0         # threads per encode (0 = LeRobot default)
-  batch_encoding_size: 1     # 1 = encode each episode to video immediately (recommended w/ GPU).
-                             # >1 batches/parallelizes encoding but keeps episodes as PNGs until the
-                             # batch fills; the writer flushes leftovers on close so none are lost.
-  # async PNG writer — the slow pre-encode step; parallelize it (LeRobot advises ~4 threads/camera):
-  image_writer_threads: 12   # 0 = synchronous (single-threaded, slow); 12 = 4 x 3 cameras
+  streaming_encoding: true   # stream frames straight into the encoder (no temp PNGs): ~3x faster
+                             # saves, no PNG CPU storm during collection. Needs this env's patched lerobot.
+  # FALLBACK path only (streaming off / stock lerobot) — the knobs below are INERT
+  # while streaming_encoding is true; they're kept at sensible values for the fallback:
+  encoder_threads: 0         # CPU threads per encode; GPU nvenc ignores this (0 = codec default)
+  batch_encoding_size: 1     # 1 = encode each episode immediately. >1 batches episodes and encodes
+                             # them in parallel (only useful for CPU encoding; keeps PNGs until the
+                             # batch fills; the writer flushes leftovers on close so none are lost)
+  image_writer_threads: 12   # temp-PNG writer threads (the slow pre-encode step of the fallback);
+                             # LeRobot advises ~4 per camera. 0 = synchronous (slowest)
   image_writer_processes: 0  # >0 = also use subprocesses if threads alone aren't enough
   # use_videos: true         # false = store raw frames (no encode; fastest save, larger on disk)
   buttons:                   # leader handle button -> episode outcome ("<side>.<index>", upper=0, lower=1)
