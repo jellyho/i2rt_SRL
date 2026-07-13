@@ -70,11 +70,12 @@ python -c "from i2rt.serving.robot_client import RobotClient; c=RobotClient(host
 ```
 - [ ] Homing return is smooth/slow (raise/lower `--home-speed` to taste; engage approach uses `--ramp-speed 0.8`).
 
-## 6. Leader-button end+label+home
+## 6. Fine-grained control + leader-button end/label/home
 
-- [ ] While ENGAGED, press leader **button 1** → robot starts homing (gently), records through homing, and on IDLE the episode is saved **success**.
-- [ ] **button 2** → saved **fail**.  **button 0** → **discarded** (not saved).
-  (If your handle's button indices differ, adjust `HOME_BUTTONS` in `i2rt/serving/control_config.py` and `SUCCESS/FAIL/DISCARD_BUTTON` in `workstation/lerobot_recorder/recorder.py`.)
+- [ ] While ENGAGED, press **left upper (`left.0`)** → fine-grained mode toggles; moving the leader 5× moves the follower 1×. Toggle off and confirm there is no target snap.
+- [ ] **Left lower (`left.1`)** → success + home; **right lower (`right.1`)** → fail + home; **right upper (`right.0`)** → discard + home.
+- [ ] Confirm every home transition turns fine-grained mode off and clears its offset.
+  (If button indices differ, update `control.fine_grained_button`, `control.home_buttons`, and `recorder.buttons` in `config.yaml`.)
 
 ---
 

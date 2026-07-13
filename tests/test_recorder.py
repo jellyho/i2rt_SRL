@@ -271,6 +271,7 @@ def test_dagger_snapshot_carries_state_and_event():
             "homing": False,
             "dagger_state": "policy",
             "last_dagger_event": {"seq": 3, "action": "keep"},
+            "fine_grained": True,
             "left": pose,
             "right": pose,
             "t": 2.0,
@@ -279,6 +280,7 @@ def test_dagger_snapshot_carries_state_and_event():
     assert snap["policy_running"] is True
     assert snap["dagger_state"] == "policy"
     assert snap["last_dagger_event"] == {"seq": 3, "action": "keep"}
+    assert snap["fine_grained"] is True
 
 
 def test_dagger_recorder_events_do_not_use_expert_button_map():
