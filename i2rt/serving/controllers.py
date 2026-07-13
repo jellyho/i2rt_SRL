@@ -29,12 +29,13 @@ from i2rt.serving.safety import TargetSmoother, clamp_limits, is_finite_vector, 
 from i2rt.serving.state_utils import full_state, to_full_target
 from i2rt.serving.teleop_common import (
     ArmPair,
-    LatchingToggle,
+    FineGrainedMapper,
     TeleopStateMachine,
     build_bimanual,
     build_follower_target,
     default_bimanual_specs,
     gate_distance,
+    handle_button_pressed,
     read_handle,
 )
 
@@ -195,6 +196,8 @@ class TeleopConfig:
     dwell: float = cc.DWELL_S
     home_kp: float = cc.HOME_KP
     bilateral_kp: float = cc.BILATERAL_KP
+    fine_grained_scale: float = cc.FINE_GRAINED_SCALE
+    fine_grained_button: str = cc.FINE_GRAINED_BUTTON
     rate: float = 120.0
     ramp_speed: float = cc.RAMP_SPEED
     engage_time: float = cc.ENGAGE_TIME  # fixed-time engage catch-up (s); 0 = speed-based
@@ -212,6 +215,9 @@ class TeleopController(BaseController):
         self.cfg = cfg
         self.bilateral_kp = cfg.bilateral_kp
         self.home_kp = cfg.home_kp
+        self.fine_grained_button = str(cfg.fine_grained_button).lower()
+        self._fine_grained = False
+        self._fine_button_prev = False
         self.pairs = build_bimanual(
             default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
                                    leader_gripper=cfg.leader_gripper,
@@ -235,6 +241,7 @@ class TeleopController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
 
         self.sm = TeleopStateMachine(cfg.engage_thr, cfg.release_thr, cfg.dwell)
         self._sim_engage = False
@@ -279,9 +286,39 @@ class TeleopController(BaseController):
     def set_sim_engage(self, flag: bool) -> None:
         self._sim_engage = bool(flag)
 
-    @staticmethod
-    def _home_button_pressed(buttons: Dict[str, list]) -> bool:
-        return any(idx < len(b) and bool(b[idx]) for b in buttons.values() for idx in cc.HOME_BUTTONS)
+    def _home_button_pressed(self, buttons: Dict[str, list]) -> bool:
+        """Outcome/home buttons exclude the dedicated fine-grained toggle."""
+        for side, btns in buttons.items():
+            for idx, value in enumerate(btns):
+                if not value:
+                    continue
+                key = f"{side}.{idx}".lower()
+                if key == self.fine_grained_button:
+                    continue
+                for configured in cc.HOME_BUTTONS:
+                    if isinstance(configured, int) and idx == configured:
+                        return True
+                    if not isinstance(configured, int) and key == str(configured).lower():
+                        return True
+        return False
+
+    def _reset_fine_grained(self) -> None:
+        self._fine_grained = False
+        for mapper in self._fine_mapper.values():
+            mapper.reset()
+
+    def _update_fine_grained(self, buttons: Dict[str, list], state: str) -> None:
+        pressed = handle_button_pressed(buttons, self.fine_grained_button)
+        rising = pressed and not self._fine_button_prev
+        self._fine_button_prev = pressed
+        # Mapping starts only after every follower has synchronized with its leader.
+        if state == TeleopStateMachine.ENGAGED and all(self._caught_up.values()) and rising:
+            self._fine_grained = not self._fine_grained
+            logger.info(
+                "fine-grained teleop %s (scale=%s)",
+                "ON" if self._fine_grained else "OFF",
+                self.cfg.fine_grained_scale,
+            )
 
     def _homing_done(self) -> bool:
         for side, pair in self.pairs.items():
@@ -328,9 +365,13 @@ class TeleopController(BaseController):
         if state == TeleopStateMachine.ENGAGED and self._home_button_pressed(buttons):
             self.sm.state = state = TeleopStateMachine.HOMING
         if state == TeleopStateMachine.ENGAGED and self._prev_state != TeleopStateMachine.ENGAGED:
+            self._reset_fine_grained()
             for s in self.pairs:
                 self._caught_up[s] = False
                 self._fsmooth[s].reset(self.pairs[s].follower.get_joint_pos())
+        elif state != TeleopStateMachine.ENGAGED and self._prev_state == TeleopStateMachine.ENGAGED:
+            self._reset_fine_grained()
+        self._update_fine_grained(buttons, state)
 
         sides_snap: Dict[str, Dict] = {}
         for side, pair in self.pairs.items():
@@ -343,6 +384,12 @@ class TeleopController(BaseController):
                 self._sync_leader_feel(pair, side, held=state == TeleopStateMachine.ENGAGED)
                 if state == TeleopStateMachine.ENGAGED:
                     desired = build_follower_target(pair.follower, arm_q[side], grip[side])
+                    if self._caught_up[side]:
+                        desired[: self.home_arm.size] = self._fine_mapper[side].map(
+                            arm_q[side][: self.home_arm.size],
+                            fsm.cur[: self.home_arm.size],
+                            self._fine_grained,
+                        )
                     if not is_finite_vector(desired, n):
                         desired = fsm.cur
                     if self._caught_up[side]:
@@ -366,6 +413,11 @@ class TeleopController(BaseController):
                         if tau >= 1.0:
                             self._caught_up[side] = True
                             applied = desired
+                            self._fine_mapper[side].map(
+                                arm_q[side][: self.home_arm.size],
+                                desired[: self.home_arm.size],
+                                enabled=False,
+                            )
                         else:
                             s_blend = 0.5 * (1.0 - np.cos(np.pi * tau))
                             applied = self._engage_start[side] + s_blend * (desired - self._engage_start[side])
@@ -381,6 +433,11 @@ class TeleopController(BaseController):
                         applied = fsm.step(desired)
                         if float(np.max(np.abs(fsm.cur - desired))) < _HOME_TOL:
                             self._caught_up[side] = True
+                            self._fine_mapper[side].map(
+                                arm_q[side][: self.home_arm.size],
+                                applied[: self.home_arm.size],
+                                enabled=False,
+                            )
                     # Only back-drive the leader once the follower has CAUGHT UP. Before
                     # that the follower is still near home while the leader is lifted, so
                     # back-driving would yank the leader toward home — keep it free instead.
@@ -422,6 +479,7 @@ class TeleopController(BaseController):
                 "t": now,
                 "teleop_state": state,
                 "active": state == TeleopStateMachine.ENGAGED,
+                "fine_grained": self._fine_grained,
                 "estop": self._estop,
                 **sides_snap,
             }
@@ -482,6 +540,8 @@ class DaggerConfig:
     home: str = ""
     mirror_kp: float = cc.DAGGER_MIRROR_KP
     feedback_kp: float = cc.DAGGER_FEEDBACK_KP
+    fine_grained_scale: float = cc.FINE_GRAINED_SCALE
+    fine_grained_button: str = cc.FINE_GRAINED_BUTTON
     home_kp: float = cc.HOME_KP
     home_speed: float = cc.HOME_SPEED
     rate: float = 120.0
@@ -509,6 +569,8 @@ class DaggerController(BaseController):
         self.mirror_kp = cfg.mirror_kp
         self.feedback_kp = cfg.feedback_kp
         self.home_kp = cfg.home_kp
+        self.fine_grained_button = str(cfg.fine_grained_button).lower()
+        self._fine_grained = False
         self.pairs = build_bimanual(
             default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
                                    leader_gripper=cfg.leader_gripper,
@@ -539,6 +601,7 @@ class DaggerController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
         self._leader_smooth = {
             s: TargetSmoother(np.asarray(p.leader.get_joint_pos())[: self.home_arm.size], self._home_step)
             for s, p in self.pairs.items()
@@ -550,6 +613,7 @@ class DaggerController(BaseController):
             "mode": self.mode,
             "t": 0.0,
             "intervention": False,
+            "fine_grained": False,
             "policy_running": False,
             "homing": False,
             "dagger_state": "stopped",
@@ -596,14 +660,30 @@ class DaggerController(BaseController):
     def set_intervention(self, flag: bool) -> None:
         if self._homing:
             return
-        self._intervening = bool(flag)
+        flag = bool(flag)
+        if flag == self._intervening:
+            return
+        self._intervening = flag
+        self._reset_fine_grained()
+        # Handoff to policy mirroring starts from the physical leader pose, never
+        # from a potentially distant target left by an offset intervention.
+        for side, pair in self.pairs.items():
+            self._leader_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
 
     def set_policy_running(self, flag: bool) -> None:
         if self._homing:
             return
-        self._policy_running = bool(flag)
+        flag = bool(flag)
+        if flag and not self._policy_running and not self._intervening:
+            for side, pair in self.pairs.items():
+                self._leader_smooth[side].reset(
+                    np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+                )
+        self._policy_running = flag
         if not self._policy_running:
-            self._intervening = False
+            self.set_intervention(False)
 
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
@@ -614,6 +694,7 @@ class DaggerController(BaseController):
         self._last_event = {"seq": self._event_seq, "action": action}
         self._policy_running = False
         self._intervening = False
+        self._reset_fine_grained()
         self._homing = True
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
@@ -632,6 +713,11 @@ class DaggerController(BaseController):
         else:
             logger.warning("unknown dagger button action: %s", action)
 
+    def _reset_fine_grained(self) -> None:
+        self._fine_grained = False
+        for mapper in self._fine_mapper.values():
+            mapper.reset()
+
     def _scan_buttons(self, buttons: Dict[str, list]) -> None:
         if self._homing:
             self._btn_prev = {side: list(btns) for side, btns in buttons.items()}
@@ -642,9 +728,18 @@ class DaggerController(BaseController):
                 pressed = bool(btns[idx])
                 was = idx < len(prev) and bool(prev[idx])
                 if pressed and not was:
-                    action = self._button_map.get(f"{side}.{idx}")
-                    if action:
-                        self._toggle_button_action(action)
+                    key = f"{side}.{idx}".lower()
+                    if key == self.fine_grained_button and self._intervening:
+                        self._fine_grained = not self._fine_grained
+                        logger.info(
+                            "fine-grained intervention %s (scale=%s)",
+                            "ON" if self._fine_grained else "OFF",
+                            self.cfg.fine_grained_scale,
+                        )
+                    else:
+                        action = self._button_map.get(key)
+                        if action:
+                            self._toggle_button_action(action)
             self._btn_prev[side] = list(btns)
 
     def _homing_done(self) -> bool:
@@ -691,6 +786,11 @@ class DaggerController(BaseController):
                     smoother.max_step = self._run_step
                     if valid[side]:
                         human = build_follower_target(pair.follower, arm_q[side], grip_cmd[side])
+                        human[: self.home_arm.size] = self._fine_mapper[side].map(
+                            arm_q[side][: self.home_arm.size],
+                            smoother.cur[: self.home_arm.size],
+                            self._fine_grained,
+                        )
                         desired = human
                         if self.feedback_kp > 0.0:
                             self._drive_leader(
@@ -708,13 +808,20 @@ class DaggerController(BaseController):
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
                         desired = act[:n]
-                        # grav_comp_kd doubles as mirror damping (grav_comp_kd "on")
-                        self._drive_leader(pair, act[: pair.leader.num_dofs()], self.mirror_kp,
-                                           kd=self._mirror_kd)
 
                 if desired is not None:
                     target = smoother.step(desired)
                     applied = self._apply(pair.follower, target)
+                    if not self._intervening and self._policy_running and applied is not None:
+                        # Mirror the command sent after follower smoothing/clamping.
+                        # The independent limiter prevents a PD target jump when an
+                        # offset human intervention hands control back to the policy.
+                        leader_smoother = self._leader_smooth[side]
+                        leader_smoother.max_step = self._run_step
+                        mirror_target = leader_smoother.step(
+                            np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
+                        )
+                        self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
                 else:
                     smoother.reset(pair.follower.get_joint_pos())
 
@@ -737,6 +844,7 @@ class DaggerController(BaseController):
                 "mode": self.mode,
                 "t": now,
                 "intervention": bool(self._intervening),
+                "fine_grained": self._fine_grained,
                 "policy_running": bool(self._policy_running),
                 "homing": bool(self._homing),
                 "dagger_state": dagger_state,

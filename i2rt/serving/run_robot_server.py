@@ -79,6 +79,8 @@ def main() -> None:
     pt.add_argument("--dwell", type=float, default=cc.DWELL_S)
     pt.add_argument("--home-kp", type=float, default=cc.HOME_KP)
     pt.add_argument("--bilateral-kp", type=float, default=cc.BILATERAL_KP)
+    pt.add_argument("--fine-grained-scale", type=float, default=cc.FINE_GRAINED_SCALE)
+    pt.add_argument("--fine-grained-button", default=cc.FINE_GRAINED_BUTTON)
     pt.add_argument("--rate", type=float, default=120.0)
     pt.add_argument("--ramp-speed", type=float, default=cc.RAMP_SPEED)
     pt.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for the (gentle) homing return")
@@ -94,6 +96,8 @@ def main() -> None:
     pd.add_argument("--home", default="")
     pd.add_argument("--mirror-kp", type=float, default=cc.DAGGER_MIRROR_KP)
     pd.add_argument("--feedback-kp", type=float, default=cc.DAGGER_FEEDBACK_KP)
+    pd.add_argument("--fine-grained-scale", type=float, default=cc.FINE_GRAINED_SCALE)
+    pd.add_argument("--fine-grained-button", default=cc.FINE_GRAINED_BUTTON)
     pd.add_argument("--home-kp", type=float, default=cc.HOME_KP)
     pd.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for DAgger keep/discard homing")
     pd.add_argument("--rate", type=float, default=120.0)
@@ -133,6 +137,8 @@ def main() -> None:
                 dwell=args.dwell,
                 home_kp=args.home_kp,
                 bilateral_kp=args.bilateral_kp,
+                fine_grained_scale=args.fine_grained_scale,
+                fine_grained_button=args.fine_grained_button,
                 rate=args.rate,
                 ramp_speed=args.ramp_speed,
                 home_speed=args.home_speed,
@@ -150,6 +156,8 @@ def main() -> None:
                 home=args.home,
                 mirror_kp=args.mirror_kp,
                 feedback_kp=args.feedback_kp,
+                fine_grained_scale=args.fine_grained_scale,
+                fine_grained_button=args.fine_grained_button,
                 home_kp=args.home_kp,
                 home_speed=args.home_speed,
                 rate=args.rate,

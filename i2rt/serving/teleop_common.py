@@ -4,6 +4,7 @@
 * ``LatchingToggle`` — rising-edge latch for a button (press toggles a boolean)
 * ``read_handle`` — read a leader's arm joints, trigger, and buttons
 * ``build_follower_target`` — map a leader's arm + trigger to a follower joint target
+* ``FineGrainedMapper`` — continuous relative leader→follower scaling without jumps
 """
 
 from __future__ import annotations
@@ -83,6 +84,52 @@ class LatchingToggle:
             self.state = not self.state
         self._prev = bool(pressed)
         return self.state
+
+
+class FineGrainedMapper:
+    """Switch between relative 1:1 and scaled leader motion without target jumps.
+
+    On initialization and every mode change, the current leader position and the
+    last follower command become a fresh anchor. Fine mode applies ``scale`` to
+    subsequent leader deltas. Normal mode applies a 1:1 delta while retaining the
+    constant offset accumulated in fine mode.
+    """
+
+    def __init__(self, scale: float = 0.2):
+        scale = float(scale)
+        if not 0.0 < scale <= 1.0:
+            raise ValueError(f"fine_grained_scale must be in (0, 1], got {scale}")
+        self.scale = scale
+        self.reset()
+
+    def reset(self) -> None:
+        self._leader_anchor: Optional[np.ndarray] = None
+        self._follower_anchor: Optional[np.ndarray] = None
+        self._enabled = False
+
+    def map(self, leader: np.ndarray, current_target: np.ndarray, enabled: bool) -> np.ndarray:
+        leader = np.asarray(leader, dtype=float).reshape(-1)
+        current = np.asarray(current_target, dtype=float).reshape(-1)
+        if leader.size != current.size:
+            raise ValueError(f"leader/target size mismatch: {leader.size} != {current.size}")
+        enabled = bool(enabled)
+        if self._leader_anchor is None or enabled != self._enabled:
+            self._leader_anchor = leader.copy()
+            self._follower_anchor = current.copy()
+            self._enabled = enabled
+        gain = self.scale if enabled else 1.0
+        return self._follower_anchor + gain * (leader - self._leader_anchor)
+
+
+def handle_button_pressed(buttons: Dict[str, List[int]], key: str) -> bool:
+    """Return whether a ``"<side>.<index>"`` leader-handle button is held."""
+    try:
+        side, raw_idx = str(key).lower().rsplit(".", 1)
+        idx = int(raw_idx)
+    except (TypeError, ValueError):
+        return False
+    side_buttons = buttons.get(side, [])
+    return 0 <= idx < len(side_buttons) and bool(side_buttons[idx])
 
 
 def read_handle(leader: Any) -> Tuple[np.ndarray, Optional[float], List[int]]:

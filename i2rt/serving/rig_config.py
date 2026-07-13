@@ -37,6 +37,8 @@ _CONTROL_MAP = {
     "gate_joints": "GATE_JOINTS",
     "home_kp": "HOME_KP",
     "bilateral_kp": "BILATERAL_KP",
+    "fine_grained_scale": "FINE_GRAINED_SCALE",
+    "fine_grained_button": "FINE_GRAINED_BUTTON",
     "leader_gravity_comp_factor": "LEADER_GRAVITY_COMP_FACTOR",
     "leader_grav_comp_kd": "LEADER_GRAV_COMP_KD",
     "leader_coulomb_friction": "LEADER_COULOMB_FRICTION",
