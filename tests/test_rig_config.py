@@ -55,6 +55,25 @@ def test_apply_control_overrides(monkeypatch):
     assert apply_control_overrides({}) == {}
 
 
+def test_apply_fine_grained_control_overrides(monkeypatch):
+    monkeypatch.setattr(cc, "FINE_GRAINED_SCALE", 0.2, raising=False)
+    monkeypatch.setattr(cc, "FINE_GRAINED_BUTTON", "left.0", raising=False)
+    monkeypatch.setattr(cc, "HOME_BUTTONS", ["left.1", "right.0", "right.1"], raising=False)
+    applied = apply_control_overrides(
+        {
+            "control": {
+                "fine_grained_scale": 0.1,
+                "fine_grained_button": "left.0",
+                "home_buttons": ["left.1", "right.0", "right.1"],
+            }
+        }
+    )
+    assert cc.FINE_GRAINED_SCALE == 0.1
+    assert cc.FINE_GRAINED_BUTTON == "left.0"
+    assert cc.HOME_BUTTONS == ["left.1", "right.0", "right.1"]
+    assert "FINE_GRAINED_SCALE" in applied
+
+
 def test_apply_control_overrides_leader_keys(monkeypatch):
     for attr in ("LEADER_GRAVITY_COMP_FACTOR", "LEADER_GRAV_COMP_KD", "LEADER_COULOMB_FRICTION"):
         monkeypatch.setattr(cc, attr, None, raising=False)
