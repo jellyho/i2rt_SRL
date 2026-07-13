@@ -382,8 +382,31 @@ class AsyncDatasetWriter:
             self._worker.start()
             return
         if not self._mock:
-            LeRobotDataset = _import_lerobot_dataset()
-            if self.cfg.resume and os.path.isdir(self._root):
+            resume_local = self.cfg.resume and os.path.isdir(self._root)
+            if resume_local:
+                info_path = os.path.join(self._root, "meta", "info.json")
+                if not os.path.isfile(info_path):
+                    raise RuntimeError(
+                        f"Cannot continue local dataset at {self._root}: "
+                        "meta/info.json is missing. Uncheck 'Continue collecting' "
+                        "and confirm overwrite to create it again."
+                    )
+                try:
+                    with open(info_path) as fh:
+                        local_info = json.load(fh)
+                    empty_local = (
+                        int(local_info.get("total_episodes", 0)) == 0
+                        and int(local_info.get("total_frames", 0)) == 0
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"Cannot read local dataset metadata at {info_path}: {exc}") from exc
+                if empty_local:
+                    logger.warning("recreating empty local dataset at %s", self._root)
+                    shutil.rmtree(self._root)
+                    resume_local = False
+
+            if resume_local:
+                LeRobotDataset = _import_lerobot_dataset()
                 enc = self._dataset_encoding_kwargs()
                 try:
                     self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root, **enc)
@@ -399,6 +422,7 @@ class AsyncDatasetWriter:
                     self._root, self._n_episodes, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
             else:
+                LeRobotDataset = _import_lerobot_dataset()
                 enc = self._create_encoding_kwargs()
                 try:
                     self._ds = LeRobotDataset.create(
