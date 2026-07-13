@@ -269,6 +269,10 @@ Dry run: `workstation/yam-data replay --mock`.
   Default: **left upper = fine-grained toggle, left lower = success, right lower =
   fail, right upper = discard**. A label button also
   starts homing, so one press ends + labels + saves (records through homing).
+- **Safe fine-mode exit**: toggling fine-grained control off freezes the follower
+  arm and gripper, pauses dataset appends without closing the episode, and slowly
+  aligns the leader. Recording and normal 1:1 control resume after a stable
+  alignment; timeout leaves the follower held and the leader gravity-comp free.
 - **Operator UI**: a big color status **banner** (IDLE/ARMED/REC/REVIEW/fault), a
   **health strip** (robot link · cameras · save queue), **live stats** (kept ✓/✗,
   discarded, success rate), **audio cues** (start, keep/fail/delete, fault), and a
