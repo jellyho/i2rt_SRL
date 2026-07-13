@@ -106,6 +106,10 @@ class DeployGUI(RecorderGUI):
             text, color = "DEVICE FAULT", theme.STATE_COLORS["ERROR"]
         elif st.get("homing"):
             text, color = "HOMING", theme.STATE_COLORS["REVIEW"]
+        elif st.get("recenter_fault"):
+            text, color = "LEADER ALIGNMENT TIMED OUT — FOLLOWER HELD", theme.STATE_COLORS["ERROR"]
+        elif st.get("leader_recentering"):
+            text, color = "HUMAN INTERVENTION — ALIGNING LEADER (RECORDING PAUSED)", theme.STATE_COLORS["REVIEW"]
         elif st.get("intervention"):
             text = "HUMAN INTERVENTION (FINE-GRAINED)" if st.get("fine_grained") else "HUMAN INTERVENTION"
             color = theme.STATE_COLORS["REC"]
