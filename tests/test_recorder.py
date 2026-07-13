@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -237,6 +238,47 @@ def test_control_mode_in_frame():
     assert "agentview" in frame["images"]
 
 
+def test_recenter_pauses_appends_without_closing_episode():
+    cfg = RecorderConfig(record_source="teleop", mock=True)
+    rec = Recorder(cfg)
+    rec.writer = SimpleNamespace(
+        num_episodes=0,
+        total_episodes=0,
+        outcome_totals={"success": 0, "fail": 0},
+        queue_depth=0,
+        low_disk=False,
+        progress={"saving": False, "queued": 0},
+    )
+    rec.gate.arm()
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+    snap = {
+        "teleop_state": "ENGAGED",
+        "state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "control_mode": 0,
+        "buttons": {},
+        "leader_recentering": False,
+    }
+
+    rec._step(images, snap)
+    assert len(rec._episode) == 1
+    assert rec.gate.recording is True
+
+    snap["leader_recentering"] = True
+    rec._step(images, snap)
+    rec._step(images, snap)
+    assert len(rec._episode) == 1  # no frame, state, or action => no dataset time
+    assert rec.gate.recording is True  # same episode remains open internally
+    assert rec.get_status()["recording"] is False
+
+    snap["leader_recentering"] = False
+    rec._step(images, snap)
+    assert len(rec._episode) == 2
+    assert rec.get_status()["recording"] is True
+
+
 def test_dagger_source_assembly():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     bridge = PortalBridge(cfg)
@@ -272,6 +314,8 @@ def test_dagger_snapshot_carries_state_and_event():
             "dagger_state": "policy",
             "last_dagger_event": {"seq": 3, "action": "keep"},
             "fine_grained": True,
+            "leader_recentering": True,
+            "recenter_fault": False,
             "left": pose,
             "right": pose,
             "t": 2.0,
@@ -281,6 +325,8 @@ def test_dagger_snapshot_carries_state_and_event():
     assert snap["dagger_state"] == "policy"
     assert snap["last_dagger_event"] == {"seq": 3, "action": "keep"}
     assert snap["fine_grained"] is True
+    assert snap["leader_recentering"] is True
+    assert snap["recenter_fault"] is False
 
 
 def test_dagger_recorder_events_do_not_use_expert_button_map():

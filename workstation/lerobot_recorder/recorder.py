@@ -72,6 +72,8 @@ class Recorder:
             "policy_running": False,
             "intervention": False,
             "fine_grained": False,
+            "leader_recentering": False,
+            "recenter_fault": False,
             "homing": False,
             "estop": False,
         }
@@ -305,6 +307,7 @@ class Recorder:
                 not d["writer"].get("finalized")
                 and d["writer"].get("submitted", 0) > 0
                 and not d.get("recording")
+                and not d.get("leader_recentering")
                 and not d.get("pending")
             )
         else:
@@ -360,14 +363,23 @@ class Recorder:
     def _step(self, images: dict, snap: dict) -> None:
         self._scan_buttons(snap)
         self._scan_dagger_event(snap)
+        # Recentring is part of the same episode, but dataset time is paused:
+        # append neither sensors nor actions until physical alignment completes.
+        recording_paused = bool(snap.get("leader_recentering"))
 
         if self._eval:  # continuous rollout while armed; no engage gate
-            if self.gate.armed and self.cameras.healthy and snap["state"] is not None and snap["action"] is not None:
+            if (
+                self.gate.armed
+                and not recording_paused
+                and self.cameras.healthy
+                and snap["state"] is not None
+                and snap["action"] is not None
+            ):
                 self._episode.append(self._frame(images, snap))
                 self._buffer_preview(images)
             self._set(
                 armed=self.gate.armed,
-                recording=self.gate.armed,
+                recording=self.gate.armed and not recording_paused,
                 pending=self._pending,
                 teleop=snap["teleop_state"],
                 episodes=self.writer.num_episodes,
@@ -391,7 +403,12 @@ class Recorder:
                 if self.cfg.record_source == "dagger":
                     with self._lock:
                         self._status["interventions"] += 1
-            if snap["state"] is not None and snap["action"] is not None and self.cameras.healthy:
+            if (
+                not recording_paused
+                and snap["state"] is not None
+                and snap["action"] is not None
+                and self.cameras.healthy
+            ):
                 self._episode.append(self._frame(images, snap))
                 self._buffer_preview(images)
 
@@ -412,7 +429,7 @@ class Recorder:
 
         self._set(
             armed=self.gate.armed,
-            recording=self.gate.recording,
+            recording=self.gate.recording and not recording_paused,
             pending=self._pending,
             teleop=snap["teleop_state"],
             episodes=self.writer.num_episodes,
@@ -433,6 +450,8 @@ class Recorder:
             "policy_running": bool(snap.get("policy_running")),
             "intervention": bool(snap.get("intervention")),
             "fine_grained": bool(snap.get("fine_grained")),
+            "leader_recentering": bool(snap.get("leader_recentering")),
+            "recenter_fault": bool(snap.get("recenter_fault")),
             "homing": bool(snap.get("homing")),
             "estop": bool(snap.get("estop")),
         }
@@ -482,7 +501,11 @@ class Recorder:
             self._btn_prev[side] = list(btns)
 
     def _warn_state(self, snap: dict, warned: bool) -> bool:
-        if self.gate.recording and (snap["state"] is None or snap["action"] is None):
+        if (
+            self.gate.recording
+            and not snap.get("leader_recentering")
+            and (snap["state"] is None or snap["action"] is None)
+        ):
             if not warned:
                 logger.warning("recording but no robot state/action yet — check the robot link")
             return True
