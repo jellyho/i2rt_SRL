@@ -5,7 +5,7 @@ Connects (plain TCP) to the robot machine running
 returns the latest fused frame the recorder records:
 
     {teleop_state, control_mode, state(42,), leader, eef, action, buttons,
-     intervention, stamp}
+     intervention, fine_grained, stamp}
 
 ``state``/``leader``/``eef``/``action`` are float32 vectors (or None if missing).
 ``mock=True`` synthesizes a teleop cycle + fake joints so the pipeline runs with no
@@ -34,6 +34,7 @@ _EMPTY = {
     "action": None,
     "buttons": {},
     "intervention": False,
+    "fine_grained": False,
     "policy_running": False,
     "homing": False,
     "dagger_state": "stopped",
@@ -218,6 +219,7 @@ class PortalBridge:
             "action": action,
             "buttons": buttons,
             "intervention": intervening,
+            "fine_grained": bool(obs.get("fine_grained")),
             "policy_running": bool(obs.get("policy_running")),
             "homing": bool(obs.get("homing")),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),

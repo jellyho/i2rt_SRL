@@ -71,6 +71,7 @@ class Recorder:
             "dagger_state": "stopped",
             "policy_running": False,
             "intervention": False,
+            "fine_grained": False,
             "homing": False,
             "estop": False,
         }
@@ -431,6 +432,7 @@ class Recorder:
             "dagger_state": snap.get("dagger_state", "stopped"),
             "policy_running": bool(snap.get("policy_running")),
             "intervention": bool(snap.get("intervention")),
+            "fine_grained": bool(snap.get("fine_grained")),
             "homing": bool(snap.get("homing")),
             "estop": bool(snap.get("estop")),
         }

@@ -611,7 +611,8 @@ class RecorderGUI(QtWidgets.QWidget):
         elif st["pending"]:
             text, color = "REVIEW — keep [S/F] or delete [D]", theme.STATE_COLORS["REVIEW"]
         elif st["recording"]:
-            text, color = "● REC", theme.STATE_COLORS["REC"]
+            text = "● REC (FINE-GRAINED)" if st.get("fine_grained") else "● REC"
+            color = theme.STATE_COLORS["REC"]
         elif st["armed"]:
             text, color = f"ARMED · {st['teleop']}", theme.STATE_COLORS["ARMED"]
         else:
