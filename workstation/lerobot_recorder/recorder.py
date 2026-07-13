@@ -92,13 +92,26 @@ class Recorder:
     # ------------------------------------------------------------------ control
     def start(self) -> None:
         """Open cameras + robot link + dataset and begin the record loop (gate stays disarmed)."""
-        self.cameras.start()
-        self.robot.start()
-        self.writer = self._open_writer()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        self._set(running=True)
+        try:
+            self.cameras.start()
+            self.robot.start()
+            self.writer = self._open_writer()
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+            self._set(running=True)
+        except Exception:
+            # Startup is transactional: dataset initialization can fail after the
+            # cameras have opened, and leaving them alive makes every retry fail busy.
+            if self.writer is not None and not self.writer.finalized:
+                try:
+                    self.writer.finalize()
+                except Exception:
+                    logger.exception("failed to clean up dataset writer after startup error")
+            self.writer = None
+            self.robot.stop()
+            self.cameras.stop()
+            raise
 
     def _open_writer(self) -> AsyncDatasetWriter:
         shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}

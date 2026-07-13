@@ -105,7 +105,9 @@ def test_async_writer_resume_preserves_encoding_kwargs(tmp_path, monkeypatch):
         batch_encoding_size=4,
         encoder_threads=2,
     )
-    Path(dataset_dir(str(tmp_path), cfg.repo_id)).mkdir(parents=True)
+    ds_dir = Path(dataset_dir(str(tmp_path), cfg.repo_id))
+    (ds_dir / "meta").mkdir(parents=True)
+    (ds_dir / "meta" / "info.json").write_text(json.dumps({"total_episodes": 7}))
 
     w = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (4, 4, 3)})
     w.open(_frame())
@@ -151,7 +153,8 @@ def test_async_writer_resume_recovers_missing_outcome_rows(tmp_path, monkeypatch
 
     cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), mock=False, resume=True)
     ds_dir = Path(dataset_dir(str(tmp_path), cfg.repo_id))
-    ds_dir.mkdir(parents=True)
+    (ds_dir / "meta").mkdir(parents=True)
+    (ds_dir / "meta" / "info.json").write_text(json.dumps({"total_episodes": 3}))
     sidecar = ds_dir / "outcomes.jsonl"
     sidecar.write_text(json.dumps({"episode": 1, "outcome": "success", "task": "pick", "frames": 11}) + "\n")
 
@@ -168,6 +171,62 @@ def test_async_writer_resume_recovers_missing_outcome_rows(tmp_path, monkeypatch
     assert rows[1]["outcome"] == "success"
     assert rows[2]["outcome"] == "unknown"
     assert rows[2]["task"] == "place"
+
+
+def test_async_writer_rejects_incomplete_local_resume_without_hub_lookup(tmp_path, monkeypatch):
+    imported = False
+
+    def fake_import():
+        nonlocal imported
+        imported = True
+        return object
+
+    monkeypatch.setattr(
+        "workstation.lerobot_recorder.dataset_writer._import_lerobot_dataset",
+        fake_import,
+    )
+    cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), mock=False, resume=True)
+    Path(dataset_dir(str(tmp_path), cfg.repo_id)).mkdir(parents=True)
+    writer = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (4, 4, 3)})
+
+    try:
+        writer.open(_frame())
+    except RuntimeError as exc:
+        assert "meta/info.json is missing" in str(exc)
+    else:
+        raise AssertionError("incomplete resume should fail")
+    assert imported is False
+
+
+def test_async_writer_recreates_empty_local_resume_without_hub_lookup(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeDataset:
+        @classmethod
+        def create(cls, **kwargs):
+            calls.append(("create", kwargs))
+            return cls()
+
+        def finalize(self):
+            pass
+
+    monkeypatch.setattr(
+        "workstation.lerobot_recorder.dataset_writer._import_lerobot_dataset",
+        lambda: FakeDataset,
+    )
+    cfg = RecorderConfig(repo_id="test", root=str(tmp_path), mock=False, resume=True)
+    ds_dir = Path(dataset_dir(str(tmp_path), cfg.repo_id))
+    (ds_dir / "meta").mkdir(parents=True)
+    (ds_dir / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 0, "total_frames": 0})
+    )
+
+    writer = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (4, 4, 3)})
+    writer.open(_frame())
+    writer.finalize()
+
+    assert [kind for kind, _ in calls] == ["create"]
+    assert calls[0][1]["root"] == str(ds_dir)
 
 
 def test_dataset_info_prefers_lerobot_episode_count(tmp_path):
