@@ -58,18 +58,27 @@ def test_apply_control_overrides(monkeypatch):
 def test_apply_fine_grained_control_overrides(monkeypatch):
     monkeypatch.setattr(cc, "FINE_GRAINED_SCALE", 0.2, raising=False)
     monkeypatch.setattr(cc, "FINE_GRAINED_BUTTON", "left.0", raising=False)
+    monkeypatch.setattr(cc, "FINE_RECENTER_SPEED", 0.15, raising=False)
+    monkeypatch.setattr(cc, "FINE_RECENTER_MAX_FOLLOWING_ERROR", 0.05, raising=False)
+    monkeypatch.setattr(cc, "FINE_RECENTER_TOLERANCE", 0.03, raising=False)
     monkeypatch.setattr(cc, "HOME_BUTTONS", ["left.1", "right.0", "right.1"], raising=False)
     applied = apply_control_overrides(
         {
             "control": {
                 "fine_grained_scale": 0.1,
                 "fine_grained_button": "left.0",
+                "fine_recenter_speed": 0.12,
+                "fine_recenter_max_following_error": 0.04,
+                "fine_recenter_tolerance": 0.02,
                 "home_buttons": ["left.1", "right.0", "right.1"],
             }
         }
     )
     assert cc.FINE_GRAINED_SCALE == 0.1
     assert cc.FINE_GRAINED_BUTTON == "left.0"
+    assert cc.FINE_RECENTER_SPEED == 0.12
+    assert cc.FINE_RECENTER_MAX_FOLLOWING_ERROR == 0.04
+    assert cc.FINE_RECENTER_TOLERANCE == 0.02
     assert cc.HOME_BUTTONS == ["left.1", "right.0", "right.1"]
     assert "FINE_GRAINED_SCALE" in applied
 
