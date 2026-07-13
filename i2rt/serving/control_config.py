@@ -52,11 +52,26 @@ HOME_KP: float = 0.3  # pulls the leader back to home while homing
 BILATERAL_KP: float = 0.0  # teleop: back-drives the leader while engaged (force feel) # This should be 0.0
 
 # --- Fine-grained relative teleoperation ------------------------------------
-# Press left-upper to toggle a 5:1 leader:follower motion ratio. The mapping is
-# re-anchored on each toggle, so leaving fine mode resumes 1:1 motion with a
-# constant offset instead of snapping the follower to the leader.
+# Press left-upper to toggle a 5:1 leader:follower motion ratio. Leaving fine
+# mode holds the follower still while the leader safely recenters to it; normal
+# 1:1 teleoperation resumes only after physical alignment.
 FINE_GRAINED_SCALE: float = 0.2
 FINE_GRAINED_BUTTON: str = "left.0"
+
+# --- Fine-mode exit: bounded leader recentering -----------------------------
+# Target speed bounds how quickly the commanded leader setpoint advances.
+FINE_RECENTER_SPEED: float = 0.15  # rad/s
+# Fraction of the leader's base arm Kp used to pull it toward that setpoint.
+FINE_RECENTER_KP: float = 0.1
+# Maximum distance between the measured leader and its commanded setpoint. This
+# bounds the PD spring error even if the physical arm cannot keep up.
+FINE_RECENTER_MAX_FOLLOWING_ERROR: float = 0.05  # rad, per joint
+# Both the physical leader and follower must remain this close to the held
+# follower command for the dwell time before recording/teleoperation resumes.
+FINE_RECENTER_TOLERANCE: float = 0.03  # rad, max joint error
+FINE_RECENTER_DWELL: float = 0.2  # s
+# On timeout the follower remains held and the leader becomes gravity-comp free.
+FINE_RECENTER_TIMEOUT: float = 10.0  # s
 
 # --- Leader free-mode feel (grav-comp overrides, LEADER ONLY) ----------------
 # While engaged with BILATERAL_KP=0 the leader runs pure gravity comp; what the

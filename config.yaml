@@ -26,6 +26,12 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   dagger_feedback_kp: 0.0    # human teleop/intervention stays gravity-compensated/free
   fine_grained_scale: 0.2    # left.0 toggle: move leader 5x for 1x follower motion
   fine_grained_button: left.0
+  fine_recenter_speed: 0.15  # rad/s leader target speed while leaving fine mode
+  fine_recenter_kp: 0.1      # fraction of base leader Kp used during alignment
+  fine_recenter_max_following_error: 0.05  # rad; bounds physical leader-to-setpoint error
+  fine_recenter_tolerance: 0.03  # rad max joint error required for completion
+  fine_recenter_dwell: 0.2    # seconds alignment must remain inside tolerance
+  fine_recenter_timeout: 10.0 # seconds before holding follower and freeing leader
   home_buttons: [left.1, right.0, right.1]  # left.0 is reserved for fine-grained control
   ramp_speed: 0.6            # one-time engage approach speed (rad/s)
   engage_time: 2.0         # fixed engage catch-up (s): follower meets the live leader in

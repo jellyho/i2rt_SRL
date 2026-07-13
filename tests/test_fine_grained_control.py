@@ -10,6 +10,8 @@ class StubLeader:
         self.n = n
         self.pos = np.zeros(n)
         self.cmds = []
+        self.gains = []
+        self.free_calls = 0
 
     def num_dofs(self):
         return self.n
@@ -25,13 +27,13 @@ class StubLeader:
         return {"kp": np.full(self.n, 10.0), "kd": np.full(self.n, 1.0)}
 
     def update_kp_kd(self, kp, kd):
-        pass
+        self.gains.append((np.asarray(kp, dtype=float), np.asarray(kd, dtype=float)))
 
     def command_joint_pos(self, pos):
         self.cmds.append(np.asarray(pos, dtype=float))
 
     def enter_gravity_comp_idle(self, kd=None):
-        pass
+        self.free_calls += 1
 
 
 class StubFollower:
@@ -91,7 +93,7 @@ def test_mapper_toggle_off_preserves_offset_without_snap():
     assert np.allclose(mapper.map([3.0], [1.2], enabled=False), [2.2])
 
 
-def test_teleop_left_upper_scales_then_resumes_one_to_one_and_home_resets(monkeypatch):
+def test_teleop_fine_exit_holds_follower_and_recenters_before_resuming(monkeypatch):
     from i2rt.serving import controllers as ctl
 
     pair, leader, follower = _pair(ctl)
@@ -102,7 +104,18 @@ def test_teleop_left_upper_scales_then_resumes_one_to_one_and_home_resets(monkey
         "read_handle",
         lambda _leader: (leader.pos.copy(), 0.0, list(current["buttons"])),
     )
-    ctrl = ctl.TeleopController(ctl.TeleopConfig(fine_grained_scale=0.2, ramp_speed=100.0, home_speed=1.0))
+    ctrl = ctl.TeleopController(
+        ctl.TeleopConfig(
+            fine_grained_scale=0.2,
+            fine_recenter_speed=0.15,
+            fine_recenter_kp=0.1,
+            fine_recenter_max_following_error=0.05,
+            fine_recenter_tolerance=0.03,
+            fine_recenter_dwell=0.0,
+            ramp_speed=100.0,
+            home_speed=1.0,
+        )
+    )
     ctrl.set_sim_engage(True)
     ctrl.step()  # zero-gap catch-up completes
 
@@ -117,19 +130,77 @@ def test_teleop_left_upper_scales_then_resumes_one_to_one_and_home_resets(monkey
     assert abs(follower.cmds[-1][0] - 0.2) < 1e-9
 
     current["buttons"] = [1, 0]
-    ctrl.step()  # toggle off: no target jump
+    ctrl.step()  # toggle off: follower freezes and leader alignment starts
     assert ctrl.snapshot()["fine_grained"] is False
+    assert ctrl.snapshot()["leader_recentering"] is True
     assert abs(follower.cmds[-1][0] - 0.2) < 1e-9
+    assert np.max(np.abs(leader.cmds[-1] - leader.pos)) <= 0.15 / 120.0 + 1e-9
+    assert np.max(np.abs(leader.cmds[-1] - leader.pos)) <= 0.05 + 1e-9
+    assert np.allclose(leader.gains[-1][0], np.ones(6))  # base Kp 10 * recenter Kp 0.1
 
     current["buttons"] = [0, 0]
     leader.pos[0] = 2.0
     ctrl.step()
-    assert abs(follower.cmds[-1][0] - 1.2) < 1e-9  # 1:1 with constant -0.8 offset
+    assert abs(follower.cmds[-1][0] - 0.2) < 1e-9  # leader input is ignored
+    assert ctrl.snapshot()["leader_recentering"] is True
+    assert np.max(np.abs(leader.cmds[-1] - leader.pos)) <= 0.05 + 1e-9
+
+    # Simulate the physical leader arriving. Normal 1:1 control resumes only now.
+    leader.pos[0] = 0.2
+    ctrl.step()
+    assert ctrl.snapshot()["leader_recentering"] is False
+    leader.pos[0] = 0.5
+    ctrl.step()
+    assert abs(follower.cmds[-1][0] - 0.5) < 1e-9
 
     current["buttons"] = [0, 1]  # left.1 outcome/home
     ctrl.step()
     assert ctrl.snapshot()["teleop_state"] == "HOMING"
     assert ctrl.snapshot()["fine_grained"] is False
+    assert ctrl.snapshot()["leader_recentering"] is False
+
+
+def test_teleop_recenter_timeout_holds_follower_and_frees_leader(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    current = {"buttons": [0, 0]}
+    monkeypatch.setattr(
+        ctl,
+        "read_handle",
+        lambda _leader: (leader.pos.copy(), 0.0, list(current["buttons"])),
+    )
+    ctrl = ctl.TeleopController(
+        ctl.TeleopConfig(
+            fine_recenter_timeout=0.0,
+            fine_recenter_dwell=0.0,
+            ramp_speed=100.0,
+        )
+    )
+    ctrl.set_sim_engage(True)
+    ctrl.step()
+    current["buttons"] = [1, 0]
+    ctrl.step()  # fine on
+    current["buttons"] = [0, 0]
+    leader.pos[0] = 1.0
+    ctrl.step()
+    current["buttons"] = [1, 0]
+    ctrl.step()  # fine off, alignment immediately times out
+    assert ctrl.snapshot()["leader_recentering"] is True
+    assert ctrl.snapshot()["recenter_fault"] is True
+    held = follower.pos.copy()
+    current["buttons"] = [0, 0]
+    ctrl.step()
+    assert np.allclose(follower.pos, held)
+    assert leader.free_calls > 0
+
+    # The fine button is an explicit recovery: cancel the fault and re-anchor fine mode.
+    current["buttons"] = [1, 0]
+    ctrl.step()
+    assert ctrl.snapshot()["leader_recentering"] is False
+    assert ctrl.snapshot()["recenter_fault"] is False
+    assert ctrl.snapshot()["fine_grained"] is True
 
 
 def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
@@ -165,12 +236,24 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
     ctrl.step()
     assert abs(ctrl.snapshot()["left"]["human"][0] - 0.2) < 1e-9
 
-    # Hand back at a large leader/follower offset. Fine mode resets, and the first
-    # mirrored leader setpoint moves by at most max_joint_speed/rate.
+    current["buttons"] = [1, 0]
+    ctrl.step()
+    assert ctrl.snapshot()["leader_recentering"] is True
+    assert ctrl.snapshot()["left"]["human"] is None
+    held = follower.pos.copy()
+    current["buttons"] = [0, 0]
+    leader.pos[0] = 2.0
+    ctrl.step()
+    assert np.allclose(follower.pos, held)
+    assert np.max(np.abs(leader.cmds[-1] - leader.pos)) <= 0.05 + 1e-9
+
+    # A direct policy handoff cancels recentering. Its first mirrored leader
+    # setpoint still moves by at most max_joint_speed/rate.
     ctrl.set_intervention(False)
     ctrl.set_policy_action({"left": np.ones(7)})
     ctrl.step()
     assert ctrl.snapshot()["fine_grained"] is False
+    assert ctrl.snapshot()["leader_recentering"] is False
     assert leader.cmds
     assert np.max(np.abs(leader.cmds[-1] - leader.pos)) <= ctrl._run_step + 1e-9
 
