@@ -51,6 +51,13 @@ GATE_JOINTS: List[int] = [1]
 HOME_KP: float = 0.3  # pulls the leader back to home while homing
 BILATERAL_KP: float = 0.0  # teleop: back-drives the leader while engaged (force feel) # This should be 0.0
 
+# --- Fine-grained relative teleoperation ------------------------------------
+# Press left-upper to toggle a 5:1 leader:follower motion ratio. The mapping is
+# re-anchored on each toggle, so leaving fine mode resumes 1:1 motion with a
+# constant offset instead of snapping the follower to the leader.
+FINE_GRAINED_SCALE: float = 0.2
+FINE_GRAINED_BUTTON: str = "left.0"
+
 # --- Leader free-mode feel (grav-comp overrides, LEADER ONLY) ----------------
 # While engaged with BILATERAL_KP=0 the leader runs pure gravity comp; what the
 # hand feels is (gravity model error) + (grav_comp_kd damping) + (uncompensated
@@ -79,12 +86,11 @@ def leader_arm_overrides() -> dict:
 
 # --- DAgger leader gains (separate for the two phases) -----------------------
 # Intervention is TOGGLED by a handle button (press once to take over, press again
-# to hand back). While intervening the human drives the follower (FEEDBACK gain on
-# the leader for force feel); otherwise the policy drives and the leader mirrors
-# the policy action (MIRROR gain). Mirror is usually a touch higher so the human
-# feels/anticipates the policy; feedback is low so it doesn't fight the human.
+# to hand back). While intervening the human drives the follower with a free,
+# gravity-compensated leader (FEEDBACK=0); otherwise the policy drives and the
+# leader mirrors the applied policy command (MIRROR gain).
 DAGGER_MIRROR_KP: float = 0.2  # leader stiffness while the POLICY drives (leader mirrors policy)
-DAGGER_FEEDBACK_KP: float = 0.1  # leader stiffness while the HUMAN intervenes (force feel)
+DAGGER_FEEDBACK_KP: float = 0.0  # human intervention stays gravity-compensated/free
 
 
 # --- Wrist payload for gravity compensation (e.g. a D405 camera) -------------
@@ -99,10 +105,11 @@ FOLLOWER_EE_INERTIA: Optional[List[float]] = None  # optional [ipos(3), quat(4),
 
 # --- Leader handle "end episode" buttons -------------------------------------
 # Pressing any of these leader-handle buttons during teleop forces the rig to
-# start HOMING (ending the episode). The recorder maps the same buttons to an
-# outcome — success / fail / discard — so one press both ends and labels the
-# trajectory (button 0 = discard, 1 = success, 2 = fail; see recorder.py).
-HOME_BUTTONS: List[int] = [0, 1, 2]
+# start HOMING (ending the episode). The recorder maps the same side-specific
+# buttons to success/fail/discard, so one press both ends and labels the trajectory.
+# Side-specific keys avoid treating left.0 (fine-grained toggle) as a home button.
+# Integer entries remain supported by the controller for older configurations.
+HOME_BUTTONS: List[Union[int, str]] = ["left.1", "right.0", "right.1"]
 
 
 # --- Follower workspace (joint) limits ---------------------------------------
