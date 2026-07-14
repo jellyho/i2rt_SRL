@@ -77,7 +77,7 @@ python -c "from i2rt.serving.robot_client import RobotClient; c=RobotClient(host
 - [ ] Temporarily use a short `fine_recenter_timeout` and confirm timeout frees the leader, holds the follower, shows an alignment fault, and pressing `left.0` returns to fine mode.
 - [ ] **Left lower (`left.1`)** → success + home; **right lower (`right.1`)** → fail + home; **right upper (`right.0`)** → discard + home.
 - [ ] Confirm every home transition turns fine-grained/alignment mode off.
-  (If button indices differ, update `control.fine_grained_button`, `control.home_buttons`, and `recorder.buttons` in `config.yaml`.)
+  (If button indices differ, update `control.fine_grained_button` and `recorder.buttons` in `config.yaml`; the robot derives homing from the recorder mapping.)
 
 ---
 

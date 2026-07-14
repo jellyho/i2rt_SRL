@@ -248,6 +248,7 @@ class TeleopConfig:
     fine_recenter_tolerance: float = cc.FINE_RECENTER_TOLERANCE
     fine_recenter_dwell: float = cc.FINE_RECENTER_DWELL
     fine_recenter_timeout: float = cc.FINE_RECENTER_TIMEOUT
+    button_outcomes: Dict[str, str] = field(default_factory=lambda: dict(cc.DEFAULT_TELEOP_BUTTON_OUTCOMES))
     rate: float = 120.0
     ramp_speed: float = cc.RAMP_SPEED
     engage_time: float = cc.ENGAGE_TIME  # fixed-time engage catch-up (s); 0 = speed-based
@@ -266,6 +267,11 @@ class TeleopController(BaseController):
         self.bilateral_kp = cfg.bilateral_kp
         self.home_kp = cfg.home_kp
         self.fine_grained_button = str(cfg.fine_grained_button).lower()
+        self._button_outcomes = {str(key).lower(): str(value).lower() for key, value in cfg.button_outcomes.items()}
+        if self.fine_grained_button in self._button_outcomes:
+            raise ValueError(
+                f"fine-grained button {self.fine_grained_button!r} cannot also be an episode outcome button"
+            )
         self._fine_grained = False
         self._fine_button_prev = False
         self._leader_recentering = False
@@ -352,19 +358,11 @@ class TeleopController(BaseController):
         self._sim_engage = bool(flag)
 
     def _home_button_pressed(self, buttons: Dict[str, list]) -> bool:
-        """Outcome/home buttons exclude the dedicated fine-grained toggle."""
+        """Return whether a button with a configured terminal outcome is held."""
         for side, btns in buttons.items():
             for idx, value in enumerate(btns):
-                if not value:
-                    continue
-                key = f"{side}.{idx}".lower()
-                if key == self.fine_grained_button:
-                    continue
-                for configured in cc.HOME_BUTTONS:
-                    if isinstance(configured, int) and idx == configured:
-                        return True
-                    if not isinstance(configured, int) and key == str(configured).lower():
-                        return True
+                if value and f"{side}.{idx}".lower() in self._button_outcomes:
+                    return True
         return False
 
     def _reset_fine_grained(self) -> None:

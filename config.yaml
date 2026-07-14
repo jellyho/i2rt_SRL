@@ -32,7 +32,6 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   fine_recenter_tolerance: 0.03  # rad max joint error required for completion
   fine_recenter_dwell: 0.2    # seconds alignment must remain inside tolerance
   fine_recenter_timeout: 10.0 # seconds before holding follower and freeing leader
-  home_buttons: [left.1, right.0, right.1]  # left.0 is reserved for fine-grained control
   ramp_speed: 0.6            # one-time engage approach speed (rad/s)
   engage_time: 2.0         # fixed engage catch-up (s): follower meets the live leader in
   #                          # exactly this time (auto-stretched if a joint would exceed
@@ -92,10 +91,12 @@ recorder:
                              # LeRobot advises ~4 per camera. 0 = synchronous (slowest)
   image_writer_processes: 0  # >0 = also use subprocesses if threads alone aren't enough
   # use_videos: true         # false = store raw frames (no encode; fastest save, larger on disk)
-  buttons:                   # leader handle button -> episode outcome ("<side>.<index>", upper=0, lower=1)
-    left.1: success          # left lower button  -> success
-    right.1: fail            # right lower button -> fail
-    right.0: discard         # right upper button -> discard
+  # Single source for teleop end+label behavior. Each mapped button both starts
+  # homing on the robot and assigns this outcome in the recorder.
+  buttons:                   # "<side>.<index>" -> success | fail | discard (upper=0, lower=1)
+    left.1: success          # left lower  -> success + home
+    right.1: fail            # right lower -> fail + home
+    right.0: discard         # right upper -> discard + home
 
 tasks:                       # quick-switch language instructions in the recorder GUI
   - "pick up the cap and close the bottle"

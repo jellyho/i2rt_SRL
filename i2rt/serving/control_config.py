@@ -118,13 +118,16 @@ FOLLOWER_PAYLOAD_KG: Optional[float] = None  # extra wrist mass in kg (D405 ≈ 
 FOLLOWER_EE_INERTIA: Optional[List[float]] = None  # optional [ipos(3), quat(4), diaginertia(3)] to place the COM
 
 
-# --- Leader handle "end episode" buttons -------------------------------------
-# Pressing any of these leader-handle buttons during teleop forces the rig to
-# start HOMING (ending the episode). The recorder maps the same side-specific
-# buttons to success/fail/discard, so one press both ends and labels the trajectory.
-# Side-specific keys avoid treating left.0 (fine-grained toggle) as a home button.
-# Integer entries remain supported by the controller for older configurations.
-HOME_BUTTONS: List[Union[int, str]] = ["left.1", "right.0", "right.1"]
+# --- Leader handle episode outcomes ------------------------------------------
+# This is the shared fallback for config.yaml ``recorder.buttons``. The robot
+# controller derives its home buttons from these terminal outcome mappings, and
+# the recorder derives the episode label from the same mapping. Keeping one map
+# prevents a label button from ending an episode on only one side of the link.
+DEFAULT_TELEOP_BUTTON_OUTCOMES = {
+    "left.1": "success",
+    "right.0": "discard",
+    "right.1": "fail",
+}
 
 
 # --- Follower workspace (joint) limits ---------------------------------------

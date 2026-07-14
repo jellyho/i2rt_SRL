@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from i2rt.robots.utils import ArmType, GripperType
 from i2rt.serving import control_config as cc
 from i2rt.serving.controllers import (
     DaggerConfig,
@@ -21,9 +22,8 @@ from i2rt.serving.controllers import (
     WrapperConfig,
     WrapperController,
 )
-from i2rt.serving.rig_config import apply_control_overrides, load_rig
+from i2rt.serving.rig_config import apply_control_overrides, load_rig, teleop_button_outcomes
 from i2rt.serving.robot_server import DEFAULT_PORT, RobotServer
-from i2rt.robots.utils import ArmType, GripperType
 
 
 class _DropChatter(logging.Filter):
@@ -165,6 +165,7 @@ def main() -> None:
                 fine_recenter_tolerance=args.fine_recenter_tolerance,
                 fine_recenter_dwell=args.fine_recenter_dwell,
                 fine_recenter_timeout=args.fine_recenter_timeout,
+                button_outcomes=teleop_button_outcomes(rig),
                 rate=args.rate,
                 ramp_speed=args.ramp_speed,
                 home_speed=args.home_speed,
