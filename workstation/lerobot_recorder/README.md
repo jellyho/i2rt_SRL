@@ -266,6 +266,8 @@ Dry run: `workstation/yam-data replay --mock`.
   [F] keep fail, [D] delete, [space] toggle collection), or the **leader handle
   buttons**. The button→outcome map is **per-(side, index)** and configurable in
   `config.yaml` under `recorder.buttons` (keyed `<side>.<index>`, upper=0/lower=1).
+  This is also the robot's source for end-of-episode homing, so there is no
+  separate home-button list to keep synchronized.
   Default: **left upper = fine-grained toggle, left lower = success, right lower =
   fail, right upper = discard**. A label button also
   starts homing, so one press ends + labels + saves (records through homing).

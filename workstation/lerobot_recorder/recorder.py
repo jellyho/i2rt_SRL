@@ -14,7 +14,7 @@ plus whatever the robot reports (``observation.state``, ``observation.leader``,
 Review/delete: with ``review_before_save`` (default) each finished episode is held
 unsaved in a PENDING state; the GUI plays back the buffered camera and the user
 keeps (with a success/fail outcome) or deletes it. Two leader buttons can also
-label+save automatically (see ``record_source`` / ``HOME_BUTTONS``).
+label+save automatically (see ``record_source`` / ``recorder.buttons``).
 """
 
 from __future__ import annotations

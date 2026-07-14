@@ -203,6 +203,45 @@ def test_teleop_recenter_timeout_holds_follower_and_frees_leader(monkeypatch):
     assert ctrl.snapshot()["fine_grained"] is True
 
 
+def test_teleop_homing_is_derived_from_outcome_mapping(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, _follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    current = {"buttons": [0, 0, 0]}
+    monkeypatch.setattr(
+        ctl,
+        "read_handle",
+        lambda _leader: (leader.pos.copy(), 0.0, list(current["buttons"])),
+    )
+    ctrl = ctl.TeleopController(
+        ctl.TeleopConfig(button_outcomes={"left.2": "success"}, ramp_speed=100.0)
+    )
+    ctrl.set_sim_engage(True)
+    ctrl.step()
+
+    current["buttons"] = [0, 1, 0]
+    ctrl.step()
+    assert ctrl.snapshot()["teleop_state"] == "ENGAGED"
+
+    current["buttons"] = [0, 0, 1]
+    ctrl.step()
+    assert ctrl.snapshot()["teleop_state"] == "HOMING"
+
+
+def test_teleop_rejects_fine_button_outcome_conflict(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, _leader, _follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    try:
+        ctl.TeleopController(ctl.TeleopConfig(button_outcomes={"left.0": "discard"}))
+    except ValueError as exc:
+        assert "cannot also be" in str(exc)
+    else:
+        raise AssertionError("fine-grained/outcome button conflict was accepted")
+
+
 def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
     from i2rt.serving import controllers as ctl
 
