@@ -23,7 +23,7 @@ import logging
 import os
 import tempfile
 from collections import deque
-from typing import IO, Optional
+from typing import IO, Any, Optional
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -127,9 +127,12 @@ class PickerComboBox(QtWidgets.QComboBox):
 
 
 class RecorderGUI(QtWidgets.QWidget):
-    def __init__(self, cfg: RecorderConfig) -> None:
+    SETTINGS_SCOPE = "record"
+
+    def __init__(self, cfg: RecorderConfig, settings: Optional[QtCore.QSettings] = None) -> None:
         super().__init__()
         self.cfg = cfg
+        self._settings = settings or QtCore.QSettings("i2rt", "yam-workstation")
         self.recorder: "Recorder | None" = None  # created on START (so the source picker applies)
         self.cues = Cues(enabled=True)
         self._review_idx = 0
@@ -149,6 +152,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.setWindowTitle("YAM · LeRobot Recorder")
         self.setStyleSheet(theme.QSS)
         self._build()
+        self._restore_setup_settings()
         self._update_setup_status(rescan=True)
 
         self._timer = QtCore.QTimer(self)
@@ -241,7 +245,7 @@ class RecorderGUI(QtWidgets.QWidget):
         form.addRow("", self.resume_check)
         form.addRow("", self.rl_check)
         form.addRow("reward", self.reward_combo)
-        form.addRow("discount γ", self.discount_spin)
+        form.addRow("discount γ", self.discount_spin)  # noqa: RUF001
         self._sync_rl_enabled()
 
         self.setup_status = QtWidgets.QLabel()
@@ -350,6 +354,59 @@ class RecorderGUI(QtWidgets.QWidget):
         return page
 
     # ------------------------------------------------------------------ setup pickers
+    def _settings_key(self, name: str) -> str:
+        return f"setup/{self.SETTINGS_SCOPE}/{name}"
+
+    def _restore_setup_settings(self) -> None:
+        """Fill the setup page from the last values used by this UI.
+
+        Only widgets are restored here. The recorder configuration is still
+        applied exclusively by START, preserving the existing setup workflow.
+        """
+
+        def saved(name: str, fallback: Any, value_type: type) -> Any:
+            key = self._settings_key(name)
+            if not self._settings.contains(key):
+                return fallback
+            return self._settings.value(key, fallback, type=value_type)
+
+        # Set root/repo/task in this order so their existing change handlers
+        # repopulate the dependent dataset and task choices correctly.
+        self.root_edit.setText(saved("root", self.root_edit.text(), str))
+        self.repo_combo.setCurrentText(saved("repo_id", self.repo_combo.currentText(), str))
+        self.task_combo.setCurrentText(saved("task", self.task_combo.currentText(), str))
+
+        source = saved("source", self.source_combo.currentText(), str)
+        source_idx = self.source_combo.findText(source)
+        if source_idx >= 0:
+            self.source_combo.setCurrentIndex(source_idx)
+
+        self.resume_check.setChecked(saved("resume", self.resume_check.isChecked(), bool))
+        self.rl_check.setChecked(saved("rl_features", self.rl_check.isChecked(), bool))
+
+        reward = saved("reward_mode", self.reward_combo.currentText(), str)
+        reward_idx = self.reward_combo.findText(reward)
+        if reward_idx >= 0:
+            self.reward_combo.setCurrentIndex(reward_idx)
+        self.discount_spin.setValue(saved("discount_factor", self.discount_spin.value(), float))
+        self._sync_rl_enabled()
+
+    def _save_setup_settings(self) -> None:
+        """Persist the setup page as currently filled, even if START was never pressed."""
+        values = {
+            "repo_id": self.repo_combo.currentText().strip(),
+            "root": self.root_edit.text().strip(),
+            "task": self.task_combo.currentText().strip(),
+            "source": self.source_combo.currentText().strip(),
+            "resume": self.resume_check.isChecked(),
+            "rl_features": self.rl_check.isChecked(),
+            "reward_mode": self.reward_combo.currentText().strip(),
+            "discount_factor": float(self.discount_spin.value()),
+        }
+        for name, value in values.items():
+            self._settings.setValue(self._settings_key(name), value)
+        self._settings.sync()
+
     def _refresh_dataset_choices(self) -> None:
         """Repopulate the dataset picker from the folders under root, keeping
         whatever is currently typed (a new name stays a new name)."""
@@ -397,7 +454,7 @@ class RecorderGUI(QtWidgets.QWidget):
         cam_col = theme.OK if cam_ok else theme.BAD
         cam_txt = f'<span style="color:{cam_col};">●</span> cameras {cam["found"]}/{cam["total"]}'
         if cam.get("missing"):
-            cam_txt += f' (missing: {", ".join(cam["missing"])})'
+            cam_txt += f" (missing: {', '.join(cam['missing'])})"
 
         root = self.root_edit.text().strip() if hasattr(self, "root_edit") else self.cfg.root
         repo = self.repo_combo.currentText().strip() if hasattr(self, "repo_combo") else self.cfg.repo_id
@@ -517,10 +574,14 @@ class RecorderGUI(QtWidgets.QWidget):
             return
         st = self.recorder.get_status()
         if st["recording"]:
-            QtWidgets.QMessageBox.information(self, "Recording in progress", "Finish the current episode before saving.")
+            QtWidgets.QMessageBox.information(
+                self, "Recording in progress", "Finish the current episode before saving."
+            )
             return
         if st["pending"]:
-            QtWidgets.QMessageBox.information(self, "Review pending", "Keep or delete the pending episode before saving.")
+            QtWidgets.QMessageBox.information(
+                self, "Review pending", "Keep or delete the pending episode before saving."
+            )
             return
 
         self.save_btn.setEnabled(False)
@@ -701,6 +762,7 @@ class RecorderGUI(QtWidgets.QWidget):
             self.review_lbl.setPixmap(_np_to_pixmap(img).scaled(self.review_lbl.size(), QtCore.Qt.KeepAspectRatio))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        self._save_setup_settings()
         if self.recorder is not None:
             self.recorder.shutdown()
         lock = getattr(self, "_lock", None)
