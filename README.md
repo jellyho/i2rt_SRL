@@ -75,7 +75,7 @@ The recorder opens on a **Setup page**:
 Then teleoperate — **lift both gellos** to start recording, **bring both home** to end the episode:
 
 - With `review_before_save: true` the episode is held for **Keep** / **Delete**. With `false` it **auto-saves** on each engage→idle.
-- **Leader handle buttons:** left upper toggles **fine-grained control** (5:1 by default). When toggled off, recording and teleoperation pause while the follower holds and the leader safely realigns; left lower → **success**, right lower → **fail**, right upper → **discard** (force-home, no save).
+- **Leader handle buttons:** left upper toggles **fine-grained control** (2.5:1 with the checked-in `fine_grained_scale: 0.4`). When toggled off, recording and teleoperation pause while the follower holds and the leader safely realigns; left lower → **success**, right lower → **fail**, right upper → **discard** (force-home, no save).
 - Close the window when done (calls `finalize()` so the dataset is complete). Cameras run on their own capture thread, so the live view and saving never stall on a slow frame.
 
 > **Dry run (no hardware):** `workstation/yam-data record --mock` exercises the whole pipeline with synthetic teleop + fake frames — no robot, cameras, or lerobot needed.
