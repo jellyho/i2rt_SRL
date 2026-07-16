@@ -53,7 +53,15 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # leader_gravity_comp_factor: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # >1 floats the arm up
   # leader_gravity_comp_factor: [1.0, 1.1, 1.1, 1.2, 1.0, 1.0] # >1 floats the arm up
   # follower_effort_limit: 30.0          # Nm; collision/overload soft-stop (omit = off)
-  # follower_joint_limits: [[-3.0, 3.0], [-2.0, 2.0]]   # per-joint clamp [lo, hi]
+  # Six arm joints in radians plus the normalized 0-1 gripper command.
+  follower_joint_limits:
+    - [-2.76799, 3.20433]
+    - [-0.15000, 3.80000]
+    - [-0.15000, 3.81519]
+    - [-1.72080, 1.72080]
+    - [-1.72080, 1.72080]
+    - [-2.24440, 2.24440]
+    - [0.0, 1.0]
 
 
 cameras:                     # RealSense serials by role (run `yam-data cams` to list)
