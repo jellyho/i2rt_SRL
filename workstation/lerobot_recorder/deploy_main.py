@@ -28,9 +28,12 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     p.add_argument("--robot-port", type=int, default=11331)
     p.add_argument("--policy-host", default="127.0.0.1")
     p.add_argument("--policy-port", type=int, default=8000)
+    p.add_argument("--contract", default="yam_bimanual_v1")
     p.add_argument("--rate", type=float, default=30.0)
-    p.add_argument("--action-horizon", type=int, default=16)
+    p.add_argument("--execution-horizon", "--action-horizon", dest="execution_horizon", type=int, default=16)
     p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--camera-max-age", type=float, default=0.25)
+    p.add_argument("--inference-timeout", type=float, default=2.0)
     p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch")
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
@@ -88,11 +91,14 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
         robot_port=recorder_cfg.robot_port,
         policy_host=pol.get("policy_host", key="host"),
         policy_port=int(pol.get("policy_port", key="port")),
-        action_horizon=args.action_horizon,
-        rate_hz=args.rate,
-        image_size=args.image_size,
+        contract=str(pol.get("contract")),
+        execution_horizon=int(pol.get("execution_horizon")),
+        rate_hz=float(pol.get("rate", key="rate_hz")),
+        image_size=int(pol.get("image_size")),
         prompt=task,
         use_async=not args.no_async,
+        camera_max_age_s=float(pol.get("camera_max_age", key="camera_max_age_s")),
+        inference_timeout_s=float(pol.get("inference_timeout", key="inference_timeout_s")),
     )
     return recorder_cfg, bridge_cfg
 

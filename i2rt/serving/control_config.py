@@ -144,6 +144,10 @@ FOLLOWER_JOINT_LIMITS: Optional[List[tuple]] = None
 # doesn't false-trip). The gripper joint is excluded (grasping is legitimately high).
 FOLLOWER_EFFORT_LIMIT: Optional[float] = None
 
+# Maximum age of an external policy/replay command before the robot-side
+# controller ignores it and holds the last safe target.
+COMMAND_TIMEOUT: float = 0.5
+
 
 def _gripper_base_mass(gripper_type: Any) -> Optional[float]:
     """Read the gripper body's own inertial mass (kg) from its MJCF, or None."""

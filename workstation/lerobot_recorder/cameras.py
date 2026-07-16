@@ -31,6 +31,7 @@ class CameraManager:
         self._pipelines: Dict[str, object] = {}
         self._serials: Dict[str, str] = {}  # resolved serial per key (for reconnect)
         self._last: Dict[str, np.ndarray] = {}  # latest frame per key (written by the capture thread)
+        self._last_t: Dict[str, float] = {}
         self._healthy: Dict[str, bool] = {}
         self._next_retry: Dict[str, float] = {}
         self._fps: Dict[str, int] = {}  # resolved color fps per key (decided once, reused on reconnect)
@@ -84,6 +85,7 @@ class CameraManager:
                     img = np.asanyarray(frames.get_color_frame().get_data())  # HxWx3 uint8 (rgb8)
                     with self._cap_lock:
                         self._last[spec.key] = img
+                        self._last_t[spec.key] = time.monotonic()
                     if not self._healthy.get(spec.key, True):  # was down -> recovered
                         logger.info("camera '%s' recovered", spec.key)
                     self._healthy[spec.key] = True
@@ -182,6 +184,15 @@ class CameraManager:
     def healthy(self) -> bool:
         """True iff every camera delivered a frame on the latest read (always True in mock)."""
         return all(self._healthy.values()) if self._healthy else True
+
+    @property
+    def frame_ages(self) -> Dict[str, float]:
+        """Age in seconds of each role's newest frame (infinity before first frame)."""
+        if self.cfg.mock:
+            return {spec.key: 0.0 for spec in self.specs}
+        now = time.monotonic()
+        with self._cap_lock:
+            return {spec.key: now - self._last_t.get(spec.key, -np.inf) for spec in self.specs}
 
     def stop(self) -> None:
         self._cap_stop.set()
