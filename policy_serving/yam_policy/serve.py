@@ -72,7 +72,10 @@ def main() -> None:
         metadata.update(policy.obs_spec)
 
     server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=metadata)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logging.info("Policy server stopped by operator")
 
 
 if __name__ == "__main__":

@@ -16,11 +16,17 @@ from .action_chunk_broker import ActionChunkBroker, AsyncActionChunkBroker
 from .base_policy import BasePolicy
 from .websocket_client import WebsocketClientPolicy
 from .websocket_server import WebsocketPolicyServer
+from .yam_contract import CONTRACT, ContractSpec, validate_action_chunk, validate_action_step, validate_server_metadata
 
 __all__ = [
+    "CONTRACT",
     "ActionChunkBroker",
     "AsyncActionChunkBroker",
     "BasePolicy",
+    "ContractSpec",
     "WebsocketClientPolicy",
     "WebsocketPolicyServer",
+    "validate_action_chunk",
+    "validate_action_step",
+    "validate_server_metadata",
 ]

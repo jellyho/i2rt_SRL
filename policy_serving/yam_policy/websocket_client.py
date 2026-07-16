@@ -21,9 +21,16 @@ logger = logging.getLogger(__name__)
 
 
 class WebsocketClientPolicy(BasePolicy):
-    def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: Optional[int] = None,
+        api_key: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
         self._uri = f"ws://{host}" if port is None else f"ws://{host}:{port}"
         self._api_key = api_key
+        self._timeout = timeout
         self._packer = msgpack_numpy.Packer()
         self._ws, self._server_metadata = self._wait_for_server()
 
@@ -47,7 +54,7 @@ class WebsocketClientPolicy(BasePolicy):
 
     def infer(self, obs: Dict) -> Dict:
         self._ws.send(self._packer.pack(obs))
-        response = self._ws.recv()
+        response = self._ws.recv(timeout=self._timeout)
         if isinstance(response, str):
             # the server sends a traceback as a plain string on error
             raise RuntimeError(f"Policy server error:\n{response}")

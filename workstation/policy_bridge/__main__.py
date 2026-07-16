@@ -27,11 +27,18 @@ def main() -> None:
     p.add_argument("--robot-port", type=int, default=11331)
     p.add_argument("--policy-host", default="127.0.0.1")
     p.add_argument("--policy-port", type=int, default=8000)
-    p.add_argument("--action-horizon", type=int, default=16)
+    p.add_argument("--contract", default="yam_bimanual_v1")
+    p.add_argument("--execution-horizon", "--action-horizon", dest="execution_horizon", type=int, default=16)
     p.add_argument("--rate", type=float, default=30.0)
     p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--camera-max-age", type=float, default=0.25)
+    p.add_argument("--inference-timeout", type=float, default=2.0)
     p.add_argument("--prompt", default="do the task")
     p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch (query synchronously)")
+    p.add_argument("--arm", action="store_true", help="operator confirmation: permit real policy motion")
+    p.add_argument(
+        "--allow-legacy-metadata", action="store_true", help="allow dummy/legacy servers without full metadata"
+    )
     p.add_argument("--serials", default="", help="comma-separated RealSense serials: wrist_left,wrist_right,agentview")
     p.add_argument("--mock", action="store_true", help="synthetic cameras (no RealSense)")
     args = p.parse_args()
@@ -51,11 +58,17 @@ def main() -> None:
         robot_port=int(rob.get("robot_port", key="port")),
         policy_host=pol.get("policy_host", key="host"),
         policy_port=int(pol.get("policy_port", key="port")),
-        action_horizon=args.action_horizon,
-        rate_hz=args.rate,
-        image_size=args.image_size,
-        prompt=args.prompt,
+        contract=str(pol.get("contract")),
+        execution_horizon=int(pol.get("execution_horizon")),
+        rate_hz=float(pol.get("rate", key="rate_hz")),
+        image_size=int(pol.get("image_size")),
+        prompt=str(pol.get("prompt")),
         use_async=not args.no_async,
+        require_operator_arm=bool(pol.section.get("require_operator_arm", True)),
+        arm_on_start=args.arm,
+        allow_legacy_metadata=args.allow_legacy_metadata,
+        camera_max_age_s=float(pol.get("camera_max_age", key="camera_max_age_s")),
+        inference_timeout_s=float(pol.get("inference_timeout", key="inference_timeout_s")),
     )
     PolicyBridge(cfg, recorder_cfg).run()
 

@@ -73,7 +73,18 @@ class DeployGUI(RecorderGUI):
         self.bridge_cfg.prompt = self.task_combo.currentText().strip()
         super()._on_start()
         if self.recorder is not None and self.runner is None:
-            self.runner = DeploymentPolicyRunner(self.bridge_cfg, self.cfg, self.recorder.get_last_images)
+            self.runner = DeploymentPolicyRunner(
+                self.bridge_cfg,
+                self.cfg,
+                self.recorder.get_last_images,
+                lambda: (
+                    self.recorder is not None
+                    and self.recorder.cameras.healthy
+                    and all(
+                        age <= self.bridge_cfg.camera_max_age_s for age in self.recorder.cameras.frame_ages.values()
+                    )
+                ),
+            )
             self.runner.start()
 
     def _on_policy_toggle(self) -> None:
@@ -151,7 +162,7 @@ class DeployGUI(RecorderGUI):
         for btn in (self.policy_btn, self.intervention_btn, self.keep_home_btn, self.discard_home_btn):
             btn.setEnabled(not blocked)
         runner = self.runner.get_status() if self.runner is not None else {}
-        horizon = runner.get("action_horizon", self.bridge_cfg.action_horizon)
+        horizon = runner.get("execution_horizon", self.bridge_cfg.execution_horizon)
         img = runner.get("image_size", self.bridge_cfg.image_size)
         self.runner_status.setText(f"policy horizon {horizon} · image {img}px")
 

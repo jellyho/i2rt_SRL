@@ -1,157 +1,209 @@
-"""Policy bridge: robot (portal) <-> policy (websocket), on the workstation.
-
-Topology 2 (deployment):
-
-    robot server  ──portal──▶  THIS bridge  ──websocket+msgpack──▶  policy server
-       (i2rt.serving)              │ build openpi obs, infer            (yam_policy)
-                       ◀──portal───┘ set_policy_action(chunk step)
-
-Each tick the bridge:
-  1. reads robot state via ``RobotClient.get_observation()`` and cameras locally,
-  2. builds an openpi-style obs dict (``observation/state``, ``observation/images/*``,
-     ``prompt``),
-  3. queries the policy via ``ActionChunkBroker(WebsocketClientPolicy)`` — only
-     hitting the (possibly remote) server every ``action_horizon`` steps,
-  4. splits the action into per-arm targets and sends them with
-     ``RobotClient.set_policy_action({"left": ..., "right": ...})``.
-
-The robot must run in **dagger** mode (policy drives the followers; a human can take
-over with a handle button), or **wrapper** mode. The policy env is unconstrained —
-it never imports i2rt.
-"""
+"""Fail-closed robot-to-policy bridge for the ``yam_bimanual_v1`` contract."""
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List
+from enum import Enum
 
 import numpy as np
-from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClientPolicy, image_tools
+from yam_policy import (
+    ActionChunkBroker,
+    AsyncActionChunkBroker,
+    WebsocketClientPolicy,
+    validate_action_step,
+    validate_server_metadata,
+)
 
 from workstation.lerobot_recorder.cameras import CameraManager
-from workstation.lerobot_recorder.config import ARM_DOF, ARMS, CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
+from workstation.lerobot_recorder.config import ARM_DOF, ARMS, RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
+from workstation.policy_bridge.observation import build_observation
 
 logger = logging.getLogger(__name__)
+
+
+class RolloutState(str, Enum):
+    DISCONNECTED = "DISCONNECTED"
+    READY = "READY"
+    ARMED = "ARMED"
+    RUNNING = "RUNNING"
+    INTERVENING = "INTERVENING"
+    STOPPED = "STOPPED"
+    ESTOP = "ESTOP"
+
 
 class PolicyBridge:
     def __init__(self, cfg: BridgeConfig, recorder_cfg: RecorderConfig):
         from i2rt.serving.robot_client import RobotClient
 
         self.cfg = cfg
+        self.simulated = recorder_cfg.mock
         self.cameras = CameraManager(recorder_cfg)
-        self.robot = RobotClient(host=cfg.robot_host, port=cfg.robot_port)
-
-        client = WebsocketClientPolicy(host=cfg.policy_host, port=cfg.policy_port)
-        # Let the server's metadata override the obs/action spec so we don't have to
-        # hand-match action_horizon / image keys / image size to the policy.
-        meta = client.get_server_metadata() or {}
-        self.action_horizon = int(meta.get("action_horizon", cfg.action_horizon))
-        self.image_keys = meta.get("image_keys", cfg.image_keys)
-        image_shape = meta.get("image_shape")
-        if isinstance(image_shape, (list, tuple)) and len(image_shape) == 2:
-            self.image_shape = (int(image_shape[0]), int(image_shape[1]))
-        else:
-            image_size = int(meta.get("image_size", cfg.image_size))
-            self.image_shape = (image_size, image_size)
-        if meta:
-            logger.info("policy server metadata: %s", meta)
-
+        self.robot = RobotClient(host=cfg.robot_host, port=cfg.robot_port, timeout=2.0)
+        client = WebsocketClientPolicy(
+            host=cfg.policy_host,
+            port=cfg.policy_port,
+            timeout=cfg.inference_timeout_s,
+        )
+        metadata = client.get_server_metadata() or {}
+        self.spec = validate_server_metadata(
+            metadata,
+            configured_contract=cfg.contract,
+            configured_execution_horizon=cfg.execution_horizon,
+            configured_control_hz=cfg.rate_hz,
+            allow_legacy=cfg.allow_legacy_metadata,
+        )
+        camera_roles = set(self.cameras.image_keys)
+        missing = sorted(set(self.spec.image_keys) - camera_roles)
+        if missing:
+            raise ValueError(f"Configured cameras are missing policy roles: {missing}")
+        self.execution_horizon = self.spec.execution_horizon
+        self.model_action_horizon = self.spec.model_action_horizon
+        self.image_keys = self.spec.image_keys
+        self.image_shape = self.spec.image_shape
         broker_cls = AsyncActionChunkBroker if cfg.use_async else ActionChunkBroker
-        self.policy = broker_cls(client, action_horizon=self.action_horizon)
+        self.policy = broker_cls(client, action_horizon=self.execution_horizon)
         self._stop = False
+        self._armed = not cfg.require_operator_arm or cfg.arm_on_start
+        self.state = RolloutState.DISCONNECTED
+        self._intervening = False
+        logger.info("validated policy server metadata: %s", metadata)
 
-    # ---- obs assembly -------------------------------------------------------
-    @staticmethod
-    def _fuse(sides: List[Dict], fields: tuple, per_arm: int | None = None) -> np.ndarray | None:
-        parts = []
-        for side in sides:
-            if not side or any(side.get(field) is None for field in fields):
-                return None
-            vec = np.concatenate([np.asarray(side[field], dtype=np.float32).reshape(-1) for field in fields])
-            if per_arm is not None and vec.size != per_arm:
-                return None
-            parts.append(vec)
-        return np.concatenate(parts).astype(np.float32)
+    def arm(self) -> None:
+        if self.state in {RolloutState.ESTOP, RolloutState.STOPPED}:
+            raise RuntimeError(f"Cannot arm bridge in state {self.state.value}; restart after clearing the fault")
+        self._armed = True
+        self.state = RolloutState.ARMED
+        logger.warning("Rollout ARMED by operator; policy motion will begin when all health gates pass")
 
-    @staticmethod
-    def _fit(value: np.ndarray | None, dim: int) -> np.ndarray:
-        out = np.zeros(dim, dtype=np.float32)
-        if value is None:
-            return out
-        arr = np.asarray(value, dtype=np.float32).reshape(-1)
-        n = min(dim, arr.size)
-        if n:
-            out[:n] = arr[:n]
-        return out
+    def _reset_policy_chunk(self) -> None:
+        try:
+            self.policy.reset()
+        except Exception as exc:
+            logger.warning("policy chunk reset failed: %s", exc)
 
-    def _build_obs(self, robot_obs: Dict, images: Dict[str, np.ndarray]) -> Dict:
-        sides = [robot_obs.get(a) for a in ARMS]
-        pos = self._fuse(sides, ("pos",), ARM_DOF)
-        if pos is None:
-            return {}
+    def _set_policy_running(self, flag: bool) -> None:
+        try:
+            self.robot.set_policy_running(flag)
+        except Exception as exc:
+            logger.warning("failed to set robot policy_running=%s: %s", flag, exc)
 
-        obs = {"observation/state": pos, "prompt": self.cfg.prompt}
-        full_state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
-        if full_state is not None:
-            obs["observation.state"] = full_state
-        obs["observation.leader"] = self._fit(self._fuse(sides, ("leader_pos",)), LEADER_DIM)
-        obs["observation.eef"] = self._fit(self._fuse(sides, ("eef",)), EEF_DIM)
-        obs["observation.control_mode"] = np.array([CONTROL_MODE["teleop"]], dtype=np.float32)
+    def _fail_closed(self, reason: str, *, estop: bool = False) -> None:
+        self._reset_policy_chunk()
+        self._armed = False
+        self.state = RolloutState.ESTOP if estop else RolloutState.STOPPED
+        self._set_policy_running(False)
+        logger.error("rollout fail-closed (%s): robot receives no further policy commands", reason)
 
-        height, width = self.image_shape
-        for role, key in self.image_keys.items():
-            if role in images:
-                img = image_tools.resize_with_pad(images[role], height, width)
-                obs[key] = image_tools.convert_to_uint8(img)
-        return obs
+    def _build_obs(self, robot_obs: dict, images: dict[str, np.ndarray]) -> dict:
+        return build_observation(
+            robot_obs,
+            images,
+            prompt=self.cfg.prompt,
+            image_keys=self.image_keys,
+            image_shape=self.image_shape,
+        )
 
-    @staticmethod
-    def _split(action: np.ndarray) -> Dict[str, np.ndarray]:
-        return {arm: np.asarray(action[i * ARM_DOF : (i + 1) * ARM_DOF], dtype=float) for i, arm in enumerate(ARMS)}
+    def _split(self, action: object) -> dict[str, np.ndarray]:
+        action = validate_action_step(action, action_dim=self.spec.action_dim)
+        if self.cfg.action_limits:
+            action = action.copy()
+            for index, limits in enumerate(self.cfg.action_limits[: action.size]):
+                action[index] = np.clip(action[index], float(limits[0]), float(limits[1]))
+        return {arm: action[index * ARM_DOF : (index + 1) * ARM_DOF].astype(float) for index, arm in enumerate(ARMS)}
 
-    # ---- run loop -----------------------------------------------------------
+    def _handle_intervention(self, active: bool) -> bool:
+        if active and not self._intervening:
+            self._reset_policy_chunk()
+            self.state = RolloutState.INTERVENING
+            logger.info("human intervention started; discarded current and prefetched policy chunks")
+        elif not active and self._intervening:
+            self._reset_policy_chunk()
+            self.state = RolloutState.ARMED
+            logger.info("human intervention ended; next action will use the post-intervention state")
+        self._intervening = active
+        return active
+
     def run(self) -> None:
         self.cameras.start()
         logger.info(
-            "PolicyBridge up: robot=%s:%d policy=%s:%d horizon=%d image=%dx%d rate=%.0f Hz",
+            "PolicyBridge connected: contract=%s robot=%s:%d policy=%s:%d model_horizon=%d "
+            "execution_horizon=%d image=%dx%d rate=%.0fHz prompt=%r mode=%s armed=%s",
+            self.spec.contract,
             self.cfg.robot_host,
             self.cfg.robot_port,
             self.cfg.policy_host,
             self.cfg.policy_port,
-            self.action_horizon,
+            self.model_action_horizon,
+            self.execution_horizon,
             self.image_shape[1],
             self.image_shape[0],
-            self.cfg.rate_hz,
+            self.spec.control_hz,
+            self.cfg.prompt,
+            "simulated" if self.simulated else "real",
+            self._armed,
         )
-        period = 1.0 / max(self.cfg.rate_hz, 1.0)
+        if self._armed:
+            self.arm()
+        period = 1.0 / self.spec.control_hz
         try:
-            try:
-                self.robot.set_policy_running(True)
-            except Exception:
-                pass
             while not self._stop:
-                t0 = time.monotonic()
+                started = time.monotonic()
                 try:
                     robot_obs = self.robot.get_observation()
+                    if bool(robot_obs.get("estop")):
+                        self._fail_closed("robot e-stop is active", estop=True)
+                        break
                     images = self.cameras.read()
-                    obs = self._build_obs(robot_obs, images)
-                    if obs:
-                        action = self.policy.infer(obs)["actions"]
-                        self.robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
-                except Exception as e:
-                    logger.warning("bridge tick failed: %s", e)
-                remaining = period - (time.monotonic() - t0)
-                if remaining > 0:
-                    time.sleep(remaining)
+                    if self._handle_intervention(bool(robot_obs.get("intervention"))):
+                        continue
+                    camera_healthy = self.cameras.healthy
+                    stale = {
+                        role: age for role, age in self.cameras.frame_ages.items() if age > self.cfg.camera_max_age_s
+                    }
+                    if not self._armed:
+                        self.state = RolloutState.READY if camera_healthy and not stale else RolloutState.DISCONNECTED
+                        continue
+                    if not camera_healthy:
+                        self._fail_closed("one or more required cameras are missing or stale")
+                        break
+                    if stale:
+                        self._fail_closed(
+                            f"required camera frames exceeded max age {self.cfg.camera_max_age_s}s: {stale}"
+                        )
+                        break
+                    if self.state == RolloutState.ARMED:
+                        self._set_policy_running(True)
+                        self.state = RolloutState.RUNNING
+                    response = self.policy.infer(self._build_obs(robot_obs, images))
+                    action = validate_action_step(response.get("actions"), action_dim=self.spec.action_dim)
+                    self.robot.set_policy_action(self._split(action))
+                    timing = response.get("broker_timing", {})
+                    chunk_step = int(timing.get("chunk_step", 0))
+                    log = logger.info if chunk_step == 0 else logger.debug
+                    log(
+                        "policy action server_infer_ms=%s model_infer_ms=%s chunk_age_ms=%.1f chunk_step=%d",
+                        response.get("server_timing", {}).get("infer_ms", "cached"),
+                        response.get("policy_timing", {}).get("infer_ms", "cached"),
+                        float(timing.get("chunk_age_ms", 0.0)),
+                        chunk_step,
+                    )
+                except Exception as exc:
+                    self._fail_closed(f"{type(exc).__name__}: {exc}")
+                    break
+                finally:
+                    remaining = period - (time.monotonic() - started)
+                    if remaining > 0:
+                        time.sleep(remaining)
         except KeyboardInterrupt:
-            pass
+            logger.info("operator stopped bridge")
         finally:
-            try:
-                self.robot.set_policy_running(False)
-            except Exception:
-                pass
+            self.state = RolloutState.STOPPED
+            self._set_policy_running(False)
+            self._reset_policy_chunk()
+            if hasattr(self.policy, "close"):
+                self.policy.close()
             self.cameras.stop()
 
     def stop(self) -> None:

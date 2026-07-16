@@ -11,16 +11,24 @@ Each ``infer`` returns the same dict with array fields sliced to the current ste
 
 from __future__ import annotations
 
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional
 
 import numpy as np
 
 from .base_policy import BasePolicy
+from .yam_contract import validate_action_chunk
 
 
-def _slice_step(results: Dict, step: int) -> Dict:
-    return {k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 else v) for k, v in results.items()}
+def _slice_step(results: Dict, step: int, created_at: float) -> Dict:
+    sliced = {k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 else v) for k, v in results.items()}
+    sliced["broker_timing"] = {
+        "chunk_age_ms": (time.monotonic() - created_at) * 1000.0,
+        "chunk_step": step,
+    }
+    return sliced
 
 
 class ActionChunkBroker(BasePolicy):
@@ -29,13 +37,15 @@ class ActionChunkBroker(BasePolicy):
         self._action_horizon = int(action_horizon)
         self._cur_step = 0
         self._last_results: Dict | None = None
+        self._chunk_created_at = 0.0
 
     def infer(self, obs: Dict) -> Dict:
         if self._last_results is None:
-            self._last_results = self._policy.infer(obs)
+            self._last_results = validate_action_chunk(self._policy.infer(obs), execution_horizon=self._action_horizon)
             self._cur_step = 0
+            self._chunk_created_at = time.monotonic()
 
-        results = _slice_step(self._last_results, self._cur_step)
+        results = _slice_step(self._last_results, self._cur_step, self._chunk_created_at)
 
         self._cur_step += 1
         if self._cur_step >= self._action_horizon:
@@ -46,6 +56,7 @@ class ActionChunkBroker(BasePolicy):
     def reset(self) -> None:
         self._last_results = None
         self._cur_step = 0
+        self._chunk_created_at = 0.0
         self._policy.reset()
 
 
@@ -68,36 +79,50 @@ class AsyncActionChunkBroker(BasePolicy):
         self._step = 0
         self._next = None  # Future for the upcoming chunk
         self._last_obs: Dict | None = None
+        self._generation = 0
+        self._chunk_created_at = 0.0
+        self._infer_lock = threading.Lock()
+
+    def _infer_chunk(self, obs: Dict, generation: int) -> tuple[int, Dict, float]:
+        # A reset can invalidate a running prefetch. Serialize access to the
+        # underlying websocket/model so the fresh post-reset request cannot race it.
+        with self._infer_lock:
+            result = validate_action_chunk(self._policy.infer(obs), execution_horizon=self._h)
+        return generation, result, time.monotonic()
 
     def infer(self, obs: Dict) -> Dict:
         self._last_obs = obs
         if self._cur is None:
-            self._cur = self._policy.infer(obs)
+            _, self._cur, self._chunk_created_at = self._infer_chunk(obs, self._generation)
             self._step = 0
 
-        out = _slice_step(self._cur, self._step)
+        out = _slice_step(self._cur, self._step, self._chunk_created_at)
         self._step += 1
 
         if self._step == self._prefetch_at and self._next is None:
-            self._next = self._exec.submit(self._policy.infer, self._last_obs)
+            self._next = self._exec.submit(self._infer_chunk, self._last_obs, self._generation)
 
         if self._step >= self._h:
-            self._cur = self._next.result() if self._next is not None else self._policy.infer(self._last_obs)
+            prefetched = self._next.result() if self._next is not None else None
             self._next = None
+            if prefetched is not None and prefetched[0] == self._generation:
+                _, self._cur, self._chunk_created_at = prefetched
+            else:
+                _, self._cur, self._chunk_created_at = self._infer_chunk(self._last_obs, self._generation)
             self._step = 0
 
         return out
 
     def reset(self) -> None:
+        self._generation += 1
         if self._next is not None:
-            try:
-                self._next.result(timeout=0)
-            except Exception:
-                pass
+            self._next.cancel()
             self._next = None
         self._cur = None
         self._step = 0
+        self._chunk_created_at = 0.0
         self._policy.reset()
 
     def close(self) -> None:
-        self._exec.shutdown(wait=False)
+        self.reset()
+        self._exec.shutdown(wait=False, cancel_futures=True)

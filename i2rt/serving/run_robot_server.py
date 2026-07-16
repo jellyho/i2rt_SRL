@@ -45,6 +45,22 @@ class _DropChatter(logging.Filter):
         return not any(s in msg for s in self._NOISE)
 
 
+def validate_real_dagger_safety(max_joint_speed: float, command_timeout: float) -> None:
+    """Fail before constructing hardware when required policy safety limits are absent."""
+    missing = []
+    limits = cc.FOLLOWER_JOINT_LIMITS
+    if not limits or len(limits) < 7:
+        missing.append("control.follower_joint_limits (7 arm/gripper entries)")
+    if cc.FOLLOWER_EFFORT_LIMIT is None or float(cc.FOLLOWER_EFFORT_LIMIT) <= 0:
+        missing.append("control.follower_effort_limit (>0)")
+    if float(max_joint_speed) <= 0:
+        missing.append("--max-joint-speed (>0)")
+    if not 0 < float(command_timeout) <= 0.5:
+        missing.append("control.command_timeout/--command-timeout in (0, 0.5] seconds")
+    if missing:
+        raise ValueError("Real DAgger policy startup requires: " + "; ".join(missing))
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     for _h in logging.getLogger().handlers:
@@ -122,6 +138,7 @@ def main() -> None:
     pd.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for DAgger keep/discard homing")
     pd.add_argument("--rate", type=float, default=120.0)
     pd.add_argument("--max-joint-speed", type=float, default=1.5)
+    pd.add_argument("--command-timeout", type=float, default=cc.COMMAND_TIMEOUT)
     pd.add_argument("--arm-type", default=default_arm)
     pd.add_argument("--gripper", default=default_gripper, help="follower (end-effector) gripper type")
     pd.add_argument("--leader-gripper", default=default_leader_gripper)
@@ -134,9 +151,16 @@ def main() -> None:
     pw.add_argument("--gripper", default=default_gripper)
     pw.add_argument("--rate", type=float, default=100.0)
     pw.add_argument("--max-joint-speed", type=float, default=1.5)
+    pw.add_argument("--command-timeout", type=float, default=cc.COMMAND_TIMEOUT)
     pw.add_argument("--control", choices=["joint", "eef"], default="joint", help="command space (eef is experimental)")
 
     args = p.parse_args()
+
+    if args.mode == "dagger" and not args.sim:
+        try:
+            validate_real_dagger_safety(args.max_joint_speed, args.command_timeout)
+        except ValueError as exc:
+            p.error(str(exc))
 
     # Fail fast (with the valid list) if a config/CLI gripper or arm is misspelled,
     # instead of deep in robot construction.
@@ -195,6 +219,7 @@ def main() -> None:
                 home_speed=args.home_speed,
                 rate=args.rate,
                 max_joint_speed=args.max_joint_speed,
+                command_timeout=args.command_timeout,
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
                 else DaggerConfig().button_map,
@@ -210,6 +235,7 @@ def main() -> None:
             gripper=args.gripper,
             rate=args.rate,
             max_joint_speed=args.max_joint_speed,
+            command_timeout=args.command_timeout,
             control=args.control,
         )
         if robot_sec.get("channels"):  # {left: can_follower_l, right: can_follower_r}
