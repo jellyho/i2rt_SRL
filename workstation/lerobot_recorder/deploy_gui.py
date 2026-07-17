@@ -6,7 +6,7 @@ for deployment / DAgger collection.
 
 from __future__ import annotations
 
-from PyQt5 import QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -25,8 +25,16 @@ class DeployGUI(RecorderGUI):
         self.source_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.source_combo.setEnabled(False)
         self.hint.setText(
-            "space toggles collection · policy/intervention/rewind/keep/discard can use UI or handle buttons"
+            "Space engages E-STOP · R rewinds + hands to human · other controls use UI or handle buttons"
         )
+        self._estop_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Space"), self)
+        self._estop_shortcut.setContext(QtCore.Qt.WindowShortcut)
+        self._estop_shortcut.setAutoRepeat(False)
+        self._estop_shortcut.activated.connect(self._on_estop_shortcut)
+        self._rewind_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("R"), self)
+        self._rewind_shortcut.setContext(QtCore.Qt.WindowShortcut)
+        self._rewind_shortcut.setAutoRepeat(False)
+        self._rewind_shortcut.activated.connect(self._on_rewind_shortcut)
 
     def _build_collect_page(self) -> QtWidgets.QWidget:
         page = super()._build_collect_page()
@@ -40,7 +48,7 @@ class DeployGUI(RecorderGUI):
         self.intervention_btn = QtWidgets.QPushButton("Human Intervention")
         self.intervention_btn.setCheckable(True)
         self.intervention_btn.clicked.connect(self._on_intervention_toggle)
-        self.rewind_btn = QtWidgets.QPushButton("Rewind + Human")
+        self.rewind_btn = QtWidgets.QPushButton("Rewind + Human  [R]")
         self.rewind_btn.clicked.connect(lambda: self._on_rewind(resume_policy=False))
         self.rewind_rollout_btn = QtWidgets.QPushButton("Rewind + Rollout")
         self.rewind_rollout_btn.clicked.connect(lambda: self._on_rewind(resume_policy=True))
@@ -116,6 +124,15 @@ class DeployGUI(RecorderGUI):
         if self.recorder is not None:
             self.recorder.rewind_rollout(resume_policy=resume_policy)
 
+    def _on_estop_shortcut(self) -> None:
+        """Keyboard E-stop is engage-only; clearing requires the visible button."""
+        if self.recorder is not None:
+            self.estop_btn.setChecked(True)
+
+    def _on_rewind_shortcut(self) -> None:
+        if self.recorder is not None and self.rewind_btn.isEnabled():
+            self._on_rewind(resume_policy=False)
+
     def _refresh(self) -> None:
         super()._refresh()
         if self.recorder is not None:
@@ -179,7 +196,9 @@ class DeployGUI(RecorderGUI):
         self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
-        self.rewind_btn.setText(f"Rewind {rewind_s:.1f}s + Human" if rewind_frames else "Rewind + Human")
+        self.rewind_btn.setText(
+            f"Rewind {rewind_s:.1f}s + Human  [R]" if rewind_frames else "Rewind + Human  [R]"
+        )
         self.rewind_rollout_btn.setText(
             f"Rewind {rewind_s:.1f}s + Rollout" if rewind_frames else "Rewind + Rollout"
         )
