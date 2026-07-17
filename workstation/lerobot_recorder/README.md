@@ -182,7 +182,7 @@ workstation/yam-data record --mock
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
 robot/yam canup
-robot/yam dagger --mirror-kp 0.2
+robot/yam dagger --mirror-kp 0.2 --rewind-window-s 5
 
 # 2. [policy]   serve your policy (own env; openpi-compatible websocket)
 #               see policy_serving/README.md
@@ -194,6 +194,8 @@ workstation/yam-data deploy \
     --serials <wrist_left_sn>,<wrist_right_sn>,<agentview_sn> \
     --repo-id user/yam_pick --prompt "pick up the cube"
 # UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
+# Rewind + Human reverses recent robot-applied policy motion, invalidates cached
+# policy chunks, and finishes in human intervention.
 ```
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
@@ -257,7 +259,7 @@ Dry run: `workstation/yam-data replay --mock`.
 - **Always-on provenance (fixed schema)**: every frame carries
   `observation.state(42)`, `observation.leader(12)`, `observation.eef(14)` (FK from
   the company `Kinematics`; zeros if no model), `observation.control_mode(1)`
-  (teleop/policy/intervention), and `action(14)`. The schema is **predefined from the
+  (teleop/policy/intervention/rewind), and `action(14)`. The schema is **predefined from the
   robot's known outputs** (no runtime probe).
 - **Async writer**: a finished episode is queued and saved by a background worker
   (one at a time), so LeRobot's per-trajectory encoding never blocks the next
@@ -283,12 +285,12 @@ Dry run: `workstation/yam-data replay --mock`.
   gives a quick-switch dropdown; the active task **persists until you change it**
   (editable — type a new one on the fly).
 - **Eval rollouts**: `--source eval` records a continuous policy rollout from
-  Start to Stop (action = the executed command, labeled policy/intervention) — for
+  Start to Stop (action = the executed command, labeled policy/intervention/rewind) — for
   saving evaluation episodes as datasets.
 - **DAgger rollouts**: `--source dagger` records the complete policy run as one
   episode, including periods with no takeover. `action` is always the command
   executed by the robot and `observation.control_mode` marks policy (1) versus
-  human intervention (2). Keep/Discard applies to the entire rollout.
+  human intervention (2), or rewind (4). Keep/Discard applies to the entire rollout.
 - **Camera fault tolerance**: a faulted RealSense shows a red ⚠ warning, recording
   pauses (no garbage frames), and the capture thread auto-reconnects in the
   background (logging only the down/recovered transitions, not every retry).
