@@ -33,6 +33,14 @@ class _WarmupClient:
         return self.response
 
 
+class _ResettablePolicy:
+    def __init__(self):
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+
+
 def test_deploy_runner_builds_yam_bimanual_v1_observation_schema():
     runner = DeploymentPolicyRunner(
         BridgeConfig(prompt="pick up the banana cloth"),
@@ -91,6 +99,20 @@ def test_deploy_runner_reuses_recorder_robot_connection():
 
     assert runner._robot is shared
     assert runner.get_status()["robot_connected"] is True
+
+
+def test_deploy_runner_rewind_invalidates_cached_and_prefetched_actions():
+    runner = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=False), lambda: {})
+    policy = _ResettablePolicy()
+    runner._policy = policy
+    runner._was_streaming = True
+
+    runner._pause_streaming({"policy_running": True, "rewinding": True})
+
+    assert policy.resets == 1
+    assert runner._was_streaming is False
+    assert runner.get_status()["streaming"] is False
+    assert runner.get_status()["rollout_state"] == "REWINDING"
 
 
 @pytest.mark.parametrize(

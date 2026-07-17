@@ -29,6 +29,7 @@ class RolloutState(str, Enum):
     ARMED = "ARMED"
     RUNNING = "RUNNING"
     INTERVENING = "INTERVENING"
+    REWINDING = "REWINDING"
     STOPPED = "STOPPED"
     ESTOP = "ESTOP"
 
@@ -155,6 +156,12 @@ class PolicyBridge:
                     if bool(robot_obs.get("estop")):
                         self._fail_closed("robot e-stop is active", estop=True)
                         break
+                    if bool(robot_obs.get("rewinding")):
+                        if self.state != RolloutState.REWINDING:
+                            self._reset_policy_chunk()
+                            logger.info("robot rewind started; discarded current and prefetched policy chunks")
+                        self.state = RolloutState.REWINDING
+                        continue
                     images = self.cameras.read()
                     if self._handle_intervention(bool(robot_obs.get("intervention"))):
                         continue
