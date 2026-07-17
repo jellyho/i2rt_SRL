@@ -3,7 +3,7 @@
 Unlike the headless bridge, this runner does not own cameras and does not decide
 whether policy rollout is active. The robot-side DAgger controller is the source
 of truth; this runner only sends policy actions while the robot snapshot reports
-``policy_running`` and not intervention/homing/e-stop.
+``policy_running`` and not intervention/rewind/homing/e-stop.
 """
 
 from __future__ import annotations
@@ -182,7 +182,7 @@ class DeploymentPolicyRunner:
                 else:
                     self._connect_robot()
                     obs = self._robot.get_observation()
-                    blocked = bool(obs.get("homing") or obs.get("estop"))
+                    blocked = bool(obs.get("rewinding") or obs.get("homing") or obs.get("estop"))
                     images = None
                     if not self._policy_warmed and not blocked and self.camera_health_fn():
                         images = self.images_fn()
@@ -191,7 +191,10 @@ class DeploymentPolicyRunner:
                         self._warm_policy(self._build_obs(obs, images))
                         stage = "robot"
                     should_stream = bool(obs.get("policy_running")) and not (
-                        obs.get("intervention") or obs.get("homing") or obs.get("estop")
+                        obs.get("intervention")
+                        or obs.get("rewinding")
+                        or obs.get("homing")
+                        or obs.get("estop")
                     )
                     if should_stream:
                         if not self.camera_health_fn():
@@ -228,11 +231,7 @@ class DeploymentPolicyRunner:
                         )
                         self._was_streaming = True
                     else:
-                        if self._was_streaming:
-                            self._reset_policy_chunk()
-                        state = "INTERVENING" if obs.get("intervention") else "ESTOP" if obs.get("estop") else "READY"
-                        self._set(streaming=False, rollout_state=state, last_error="")
-                        self._was_streaming = False
+                        self._pause_streaming(obs)
             except Exception as e:
                 self._reset_policy_chunk()
                 self._set(
@@ -263,6 +262,22 @@ class DeploymentPolicyRunner:
             self._policy.reset()
         except Exception as e:
             logger.warning("policy reset failed: %s", e)
+
+    def _pause_streaming(self, obs: Dict) -> None:
+        """Stop action delivery and invalidate every pre-pause chunk."""
+        if self._was_streaming:
+            self._reset_policy_chunk()
+        state = (
+            "REWINDING"
+            if obs.get("rewinding")
+            else "INTERVENING"
+            if obs.get("intervention")
+            else "ESTOP"
+            if obs.get("estop")
+            else "READY"
+        )
+        self._set(streaming=False, rollout_state=state, last_error="")
+        self._was_streaming = False
 
     def _build_obs(self, robot_obs: Dict, images: Dict[str, np.ndarray]) -> Dict:
         return build_observation(
