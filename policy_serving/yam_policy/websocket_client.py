@@ -52,9 +52,9 @@ class WebsocketClientPolicy(BasePolicy):
                 logger.info("Policy server not up yet, retrying in 5 s ...")
                 time.sleep(5)
 
-    def infer(self, obs: Dict) -> Dict:
+    def infer(self, obs: Dict, *, timeout: Optional[float] = None) -> Dict:
         self._ws.send(self._packer.pack(obs))
-        response = self._ws.recv(timeout=self._timeout)
+        response = self._ws.recv(timeout=self._timeout if timeout is None else timeout)
         if isinstance(response, str):
             # the server sends a traceback as a plain string on error
             raise RuntimeError(f"Policy server error:\n{response}")

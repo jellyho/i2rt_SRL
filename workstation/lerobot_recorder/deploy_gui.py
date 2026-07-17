@@ -6,7 +6,7 @@ for deployment / DAgger collection.
 
 from __future__ import annotations
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -84,6 +84,7 @@ class DeployGUI(RecorderGUI):
                         age <= self.bridge_cfg.camera_max_age_s for age in self.recorder.cameras.frame_ages.values()
                     )
                 ),
+                robot_io=self.recorder.robot,
             )
             self.runner.start()
 
@@ -157,16 +158,19 @@ class DeployGUI(RecorderGUI):
         intervention = bool(st.get("intervention"))
         homing = bool(st.get("homing"))
         blocked = homing or bool(st.get("estop"))
+        runner = self.runner.get_status() if self.runner is not None else {}
+        policy_ready = bool(runner.get("policy_ready"))
         self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
         self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")
-        for btn in (self.policy_btn, self.intervention_btn, self.keep_home_btn, self.discard_home_btn):
+        self.policy_btn.setEnabled(not blocked and (running or policy_ready))
+        for btn in (self.intervention_btn, self.keep_home_btn, self.discard_home_btn):
             btn.setEnabled(not blocked)
-        runner = self.runner.get_status() if self.runner is not None else {}
         horizon = runner.get("execution_horizon", self.bridge_cfg.execution_horizon)
         img = runner.get("image_size", self.bridge_cfg.image_size)
-        self.runner_status.setText(f"policy horizon {horizon} · image {img}px")
+        readiness = "ready" if policy_ready else runner.get("rollout_state", "connecting").lower()
+        self.runner_status.setText(f"policy {readiness} · horizon {horizon} · image {img}px")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.runner is not None:
