@@ -300,3 +300,35 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
     ctrl.step()  # next takeover starts anchored in normal mode, without a snap
     assert ctrl.snapshot()["fine_grained"] is False
     assert np.allclose(ctrl.snapshot()["left"]["human"][:6], follower.pos[:6])
+
+
+def test_dagger_intervention_tracks_directly_and_policy_handoff_stays_limited(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    grip = {"value": 0.0}
+    monkeypatch.setattr(
+        ctl,
+        "read_handle",
+        lambda _leader: (leader.pos.copy(), grip["value"], [0, 0]),
+    )
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=1.2, rate=120.0))
+
+    ctrl.set_policy_running(True)
+    ctrl.set_intervention(True)
+    ctrl.step()  # anchor takeover at the current follower pose
+
+    leader.pos[0] = 0.5
+    grip["value"] = 1.0
+    ctrl.step()
+    assert np.allclose(follower.pos[0], 0.5)
+    assert np.allclose(follower.pos[-1], 1.0)
+
+    # Returning to policy still starts at the final human command and remains
+    # bounded by max_joint_speed/rate instead of jumping to the policy target.
+    human_final = follower.pos.copy()
+    ctrl.set_intervention(False)
+    ctrl.set_policy_action({"left": np.zeros(7)})
+    ctrl.step()
+    assert np.max(np.abs(follower.pos - human_final)) <= ctrl._run_step + 1e-9
