@@ -45,7 +45,7 @@ python -m yam_policy.serve
 # a real LeRobot policy (template — adapt policies/lerobot_policy.py):
 python -m yam_policy.serve \
     --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
-    --config pretrained_path=/abs/path --config device=cuda
+    --config pretrained_path=/abs/path --config execution_horizon=4 --config device=cuda
 
 # a real openpi checkpoint (template — needs openpi installed here):
 python -m yam_policy.serve \

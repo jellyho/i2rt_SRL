@@ -6,6 +6,7 @@ needs the robot's Python.
     python -m yam_policy.serve \
         --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
         --config pretrained_path=outputs/train/my_act/checkpoints/last/pretrained_model \
+        --config execution_horizon=4 \
         --config device=cuda
 """
 
@@ -20,12 +21,19 @@ from typing import Dict
 import numpy as np
 
 from ..base_policy import BasePolicy
+from ..yam_contract import ACTION_DIM, CONTRACT, validate_action_chunk
 
 
 class LeRobotPolicy(BasePolicy):
-    def __init__(self, pretrained_path: str, device: str = "cuda") -> None:
+    def __init__(
+        self,
+        pretrained_path: str,
+        device: str = "cuda",
+        execution_horizon: int | None = None,
+        control_hz: float = 30.0,
+    ) -> None:
         import draccus
-        from lerobot.policies.factory import get_policy_class, make_pre_post_processors, make_policy_config
+        from lerobot.policies.factory import get_policy_class, make_policy_config, make_pre_post_processors
 
         self._device = device
         self._pretrained_path = Path(pretrained_path)
@@ -38,11 +46,15 @@ class LeRobotPolicy(BasePolicy):
         )
         self._policy.reset()
 
-        self.action_horizon = int(getattr(config, "n_action_steps", 1))
-        self.obs_spec = self._obs_spec(config)
+        contract_spec = self._contract_spec(config, execution_horizon, control_hz)
+        self.action_horizon = int(contract_spec["action_horizon"])
+        self.obs_spec = {
+            **self._obs_spec(config),
+            **contract_spec,
+        }
 
     @staticmethod
-    def _load_config(draccus, make_policy_config, pretrained_path: Path, device: str):  # noqa: ANN001
+    def _load_config(draccus, make_policy_config, pretrained_path: Path, device: str) -> object:  # noqa: ANN001
         """Load older LeRobot checkpoints under the current draccus-based config API."""
         raw = json.loads((pretrained_path / "config.json").read_text())
         policy_type = raw.pop("type")
@@ -72,6 +84,23 @@ class LeRobotPolicy(BasePolicy):
         if image_shape is not None:
             spec["image_shape"] = image_shape
         return spec
+
+    @staticmethod
+    def _contract_spec(config, execution_horizon: int | None, control_hz: float) -> Dict:  # noqa: ANN001
+        model_horizon = int(getattr(config, "chunk_size", getattr(config, "n_action_steps", 1)))
+        default_horizon = int(getattr(config, "n_action_steps", model_horizon))
+        action_horizon = int(execution_horizon if execution_horizon is not None else default_horizon)
+        if not 0 < action_horizon <= model_horizon:
+            raise ValueError(f"execution_horizon must be in [1, {model_horizon}], got {action_horizon}")
+        if float(control_hz) <= 0:
+            raise ValueError(f"control_hz must be positive, got {control_hz}")
+        return {
+            "contract": CONTRACT,
+            "action_dim": ACTION_DIM,
+            "action_horizon": action_horizon,
+            "model_action_horizon": model_horizon,
+            "control_hz": float(control_hz),
+        }
 
     @staticmethod
     def _canonical_key(key: str) -> str:
@@ -135,7 +164,10 @@ class LeRobotPolicy(BasePolicy):
             actions = self._policy.predict_action_chunk(self._build_batch(obs))
             actions = self._postprocessor(actions)
 
-        return {"actions": actions.squeeze(0).detach().cpu().numpy().astype(np.float32)}
+        return validate_action_chunk(
+            {"actions": actions.squeeze(0).detach().cpu().numpy().astype(np.float32)},
+            execution_horizon=self.action_horizon,
+        )
 
     def reset(self) -> None:
         self._policy.reset()
