@@ -88,6 +88,12 @@ class BaseController:
     command_timeout = 0.5  # s; external commands older than this are considered stale (link loss)
     _last_cmd_t = -1e9
 
+    def __init__(self) -> None:
+        self._estop = False
+        # Portal setters and the control loop run on different threads. This lock
+        # makes an e-stop transition atomic with respect to motor commands.
+        self._estop_lock = threading.RLock()
+
     def snapshot(self) -> Dict:
         with self._lock:
             return dict(self._snap)
@@ -96,8 +102,21 @@ class BaseController:
         return dict(self._metadata)
 
     def set_estop(self, flag: bool) -> None:
-        """Engage/release the e-stop. While engaged, no follower commands are sent."""
-        self._estop = bool(flag)
+        """Engage/release the e-stop.
+
+        Followers retain their last position command.  Leaders are switched out of
+        any homing/bilateral position controller immediately so a stale target
+        cannot keep moving them while the e-stop is active.
+        """
+        with self._estop_lock:
+            self._estop = bool(flag)
+            if self._estop:
+                # This setter runs on the portal thread, so do not wait for the next
+                # control tick to cancel an in-flight leader position command.
+                free_leader = getattr(self, "_free_leader", None)
+                if callable(free_leader):
+                    for pair in getattr(self, "pairs", {}).values():
+                        free_leader(pair)
 
     def _effort_guard(self, robot: Any) -> None:
         """Collision/overload guard: trip the e-stop if a follower arm effort exceeds
@@ -129,11 +148,12 @@ class BaseController:
         Returns the commanded target as a list (for the snapshot), or None when
         e-stopped (the follower simply holds its last command).
         """
-        if self._estop:
-            return None
-        target = clamp_limits(target, cc.FOLLOWER_JOINT_LIMITS)
-        robot.command_joint_pos(target)
-        return np.asarray(target, dtype=float).tolist()
+        with self._estop_lock:
+            if self._estop:
+                return None
+            target = clamp_limits(target, cc.FOLLOWER_JOINT_LIMITS)
+            robot.command_joint_pos(target)
+            return np.asarray(target, dtype=float).tolist()
 
     def _init_leader_grav_sets(self, arm_type: str) -> None:
         """Capture the two leader grav-comp feel sets: the yam.yml ORIGINALS (the
@@ -175,8 +195,8 @@ class BaseController:
         to use the leader's built-in (original) kd."""
         return self._grav_free["kd"] if self._grav_free is not None else None
 
-    @staticmethod
     def _bounded_recenter_leader(
+        self,
         pair: ArmPair,
         smoother: TargetSmoother,
         destination: np.ndarray,
@@ -190,34 +210,37 @@ class BaseController:
         or simply lags. Resetting the smoother to the clamped command prevents
         hidden target windup.
         """
-        leader = pair.leader
-        if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
-            return
-        try:
-            m = leader.num_dofs()
-            measured = np.asarray(leader.get_joint_pos(), dtype=float)[:m]
-            destination = np.asarray(destination, dtype=float)[:m]
-            planned = smoother.step(destination)
-            destination_error = destination - measured
-            planned_error = planned - measured
-            # If the physical arm catches or crosses the virtual setpoint, never
-            # command it back away from the destination. Restart that joint's
-            # setpoint directly from the measured pose instead.
-            wrong_direction = planned_error * destination_error <= 0.0
-            planned_error = np.where(
-                wrong_direction,
-                np.clip(destination_error, -smoother.max_step, smoother.max_step),
-                planned_error,
-            )
-            error = np.clip(planned_error, -max_following_error, max_following_error)
-            error = np.sign(destination_error) * np.minimum(np.abs(error), np.abs(destination_error))
-            command = measured + error
-            smoother.reset(command)
-            kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
-            leader.update_kp_kd(pair.base_kp[:m] * kp_scale, kd)
-            leader.command_joint_pos(command)
-        except Exception:
-            pass
+        with self._estop_lock:
+            if self._estop:
+                return
+            leader = pair.leader
+            if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+                return
+            try:
+                m = leader.num_dofs()
+                measured = np.asarray(leader.get_joint_pos(), dtype=float)[:m]
+                destination = np.asarray(destination, dtype=float)[:m]
+                planned = smoother.step(destination)
+                destination_error = destination - measured
+                planned_error = planned - measured
+                # If the physical arm catches or crosses the virtual setpoint, never
+                # command it back away from the destination. Restart that joint's
+                # setpoint directly from the measured pose instead.
+                wrong_direction = planned_error * destination_error <= 0.0
+                planned_error = np.where(
+                    wrong_direction,
+                    np.clip(destination_error, -smoother.max_step, smoother.max_step),
+                    planned_error,
+                )
+                error = np.clip(planned_error, -max_following_error, max_following_error)
+                error = np.sign(destination_error) * np.minimum(np.abs(error), np.abs(destination_error))
+                command = measured + error
+                smoother.reset(command)
+                kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
+                leader.update_kp_kd(pair.base_kp[:m] * kp_scale, kd)
+                leader.command_joint_pos(command)
+            except Exception:
+                pass
 
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
@@ -263,6 +286,7 @@ class TeleopController(BaseController):
     mode = "teleop"
 
     def __init__(self, cfg: TeleopConfig):
+        super().__init__()
         self.cfg = cfg
         self.bilateral_kp = cfg.bilateral_kp
         self.home_kp = cfg.home_kp
@@ -645,16 +669,19 @@ class TeleopController(BaseController):
 
     # ---- leader modes ------------------------------------------------------
     def _home_leader(self, pair: ArmPair, target_arm: np.ndarray) -> None:
-        leader = pair.leader
-        if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
-            return
-        try:
-            m = leader.num_dofs()
-            kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
-            leader.update_kp_kd(pair.base_kp[:m] * self.home_kp, kd)
-            leader.command_joint_pos(np.asarray(target_arm, dtype=float)[:m])
-        except Exception:
-            pass
+        with self._estop_lock:
+            if self._estop:
+                return
+            leader = pair.leader
+            if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+                return
+            try:
+                m = leader.num_dofs()
+                kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
+                leader.update_kp_kd(pair.base_kp[:m] * self.home_kp, kd)
+                leader.command_joint_pos(np.asarray(target_arm, dtype=float)[:m])
+            except Exception:
+                pass
 
     def _free_leader(self, pair: ArmPair, kd: Optional[np.ndarray] = None) -> None:
         """Grav-comp idle; ``kd=None`` uses the leader's own configured (override)
@@ -670,15 +697,18 @@ class TeleopController(BaseController):
                 pass
 
     def _drive_leader(self, pair: ArmPair, target_q: np.ndarray) -> None:
-        leader = pair.leader
-        if self.bilateral_kp <= 0.0 or not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
-            return
-        try:
-            m = leader.num_dofs()
-            leader.update_kp_kd(pair.base_kp[:m] * self.bilateral_kp, np.zeros(m))
-            leader.command_joint_pos(np.asarray(target_q, dtype=float)[:m])
-        except Exception:
-            pass
+        with self._estop_lock:
+            if self._estop:
+                return
+            leader = pair.leader
+            if self.bilateral_kp <= 0.0 or not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+                return
+            try:
+                m = leader.num_dofs()
+                leader.update_kp_kd(pair.base_kp[:m] * self.bilateral_kp, np.zeros(m))
+                leader.command_joint_pos(np.asarray(target_q, dtype=float)[:m])
+            except Exception:
+                pass
 
     def close(self) -> None:
         for pair in self.pairs.values():
@@ -728,6 +758,7 @@ class DaggerController(BaseController):
     mode = "dagger"
 
     def __init__(self, cfg: DaggerConfig):
+        super().__init__()
         self.cfg = cfg
         self.command_timeout = cfg.command_timeout
         self.mirror_kp = cfg.mirror_kp
@@ -1134,29 +1165,35 @@ class DaggerController(BaseController):
         return "stopped"
 
     def _home_leader(self, pair: ArmPair, target_arm: np.ndarray) -> None:
-        leader = pair.leader
-        if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
-            return
-        try:
-            m = leader.num_dofs()
-            kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
-            leader.update_kp_kd(pair.base_kp[:m] * self.home_kp, kd)
-            leader.command_joint_pos(np.asarray(target_arm, dtype=float)[:m])
-        except Exception:
-            pass
+        with self._estop_lock:
+            if self._estop:
+                return
+            leader = pair.leader
+            if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+                return
+            try:
+                m = leader.num_dofs()
+                kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
+                leader.update_kp_kd(pair.base_kp[:m] * self.home_kp, kd)
+                leader.command_joint_pos(np.asarray(target_arm, dtype=float)[:m])
+            except Exception:
+                pass
 
     def _drive_leader(self, pair: ArmPair, target_q: np.ndarray, kp_scale: float,
                       kd: Optional[np.ndarray] = None) -> None:
-        leader = pair.leader
-        if kp_scale <= 0.0 or not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
-            return
-        try:
-            m = leader.num_dofs()
-            kd_vec = np.zeros(m) if kd is None else np.asarray(kd, dtype=float)[:m]
-            leader.update_kp_kd(pair.base_kp[:m] * kp_scale, kd_vec)
-            leader.command_joint_pos(np.asarray(target_q, dtype=float)[:m])
-        except Exception:
-            pass
+        with self._estop_lock:
+            if self._estop:
+                return
+            leader = pair.leader
+            if kp_scale <= 0.0 or not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+                return
+            try:
+                m = leader.num_dofs()
+                kd_vec = np.zeros(m) if kd is None else np.asarray(kd, dtype=float)[:m]
+                leader.update_kp_kd(pair.base_kp[:m] * kp_scale, kd_vec)
+                leader.command_joint_pos(np.asarray(target_q, dtype=float)[:m])
+            except Exception:
+                pass
 
     def _free_leader(self, pair: ArmPair) -> None:
         """Leader free, teleop-identical feel: grav-comp idle with the resolved
@@ -1201,6 +1238,7 @@ class WrapperController(BaseController):
     mode = "wrapper"
 
     def __init__(self, cfg: WrapperConfig):
+        super().__init__()
         from i2rt.robots.get_robot import get_yam_robot
         from i2rt.robots.utils import ArmType, GripperType
 

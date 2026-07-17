@@ -247,6 +247,41 @@ def test_intervention_with_feedback_kp_keeps_pd_force_feel(monkeypatch):
     assert np.allclose(kd, np.zeros(6))  # unchanged legacy behavior
 
 
+def test_estop_immediately_frees_teleop_leader_and_blocks_homing(monkeypatch):
+    tc, leader, follower = _make_teleop(monkeypatch)
+    leader.pos[1] = 0.5  # keep the controller in HOMING
+    tc.step()
+    assert leader.cmd_calls
+
+    leader_commands = len(leader.cmd_calls)
+    follower_commands = len(follower.cmds)
+    tc.set_estop(True)
+
+    # The portal setter cancels the active PD target immediately; it does not wait
+    # for another control-loop iteration.
+    assert leader.idle_calls
+    tc.step()
+    assert len(leader.cmd_calls) == leader_commands
+    assert len(follower.cmds) == follower_commands
+
+
+def test_estop_immediately_frees_dagger_leader_and_blocks_homing(monkeypatch):
+    dc, leader, follower = _make_dagger(monkeypatch, feedback_kp=0.1)
+    leader.pos[1] = 0.5
+    dc.finish_dagger_run("keep")
+    dc.step()
+    assert leader.cmd_calls
+
+    leader_commands = len(leader.cmd_calls)
+    follower_commands = len(follower.cmds)
+    dc.set_estop(True)
+
+    assert leader.idle_calls
+    dc.step()
+    assert len(leader.cmd_calls) == leader_commands
+    assert len(follower.cmds) == follower_commands
+
+
 def test_enter_gravity_comp_idle_kd_override():
     from i2rt.robots.motor_chain_robot import MotorChainRobot
 

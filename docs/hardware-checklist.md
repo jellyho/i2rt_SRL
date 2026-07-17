@@ -122,7 +122,7 @@ cat ~/lerobot_data/outcomes.jsonl
 python -c "from i2rt.serving.robot_client import RobotClient; import numpy as np,time; c=RobotClient(host='<ROBOT_IP>'); c.command({'left':np.zeros(7),'right':np.zeros(7)}); print('sent')"
 ```
 - [ ] After the client exits (no more commands), the follower **holds** within ~0.5 s instead of replaying the last target (watchdog). Tune `command_timeout`.
-- [ ] `RobotClient(...).set_estop(True)` → robot stops commanding (holds); `set_estop(False)` resumes. Snapshot `estop` reflects it.
+- [ ] `RobotClient(...).set_estop(True)` → followers hold and leaders enter gravity-compensation idle; `set_estop(False)` resumes. Snapshot `estop` reflects it.
 - [ ] (Optional) set `control_config.FOLLOWER_JOINT_LIMITS` and confirm targets are clamped.
 
 ---
