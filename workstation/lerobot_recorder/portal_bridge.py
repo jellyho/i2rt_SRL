@@ -39,6 +39,9 @@ _EMPTY = {
     "recenter_fault": False,
     "policy_running": False,
     "homing": False,
+    "rewinding": False,
+    "rewind_available_s": 0.0,
+    "rewind_buffer_frames": 0,
     "dagger_state": "stopped",
     "last_dagger_event": None,
     "estop": False,
@@ -64,6 +67,9 @@ class PortalBridge:
         self._intervention_req: Optional[bool] = None
         self._intervention_sent: Optional[bool] = None
         self._finish_req: Optional[str] = None
+        self._rewind_req = False
+        self._mock_rewind_until = 0.0
+        self._mock_rewind_handoff_pending = False
         self._policy_action_req: Optional[Dict[str, np.ndarray]] = None
         self._policy_action_seq = 0
         self._policy_action_sent_seq = 0
@@ -77,6 +83,11 @@ class PortalBridge:
     def set_estop(self, flag: bool) -> None:
         """Request a robot e-stop; applied (and re-applied on reconnect) by the poll loop."""
         self._estop_req = bool(flag)
+        if flag:
+            self._rewind_req = False
+            self._mock_rewind_until = 0.0
+            with self._lock:
+                self._policy_action_req = None
 
     def set_policy_running(self, flag: bool) -> None:
         """Request DAgger policy rollout start/stop."""
@@ -86,6 +97,8 @@ class PortalBridge:
         # state since then.
         self._policy_running_sent = None
         if not flag:
+            self._rewind_req = False
+            self._mock_rewind_until = 0.0
             # Never carry a pre-stop action into a later rollout/reconnect.
             with self._lock:
                 self._policy_action_req = None
@@ -99,6 +112,9 @@ class PortalBridge:
         """
         action = {side: np.asarray(value, dtype=float).copy() for side, value in data.items()}
         with self._lock:
+            raw = self._raw_obs or {}
+            if raw.get("intervention") or raw.get("rewinding") or raw.get("homing") or raw.get("estop"):
+                return
             self._policy_action_req = action
             self._policy_action_seq += 1
 
@@ -112,6 +128,8 @@ class PortalBridge:
         action = str(action).lower()
         if action in {"keep", "discard"}:
             self._finish_req = action
+            self._rewind_req = False
+            self._mock_rewind_until = 0.0
             # finish_dagger_run atomically emits the keep/discard event and stops
             # the rollout robot-side. Mirror that desired state locally without
             # sending a separate stop RPC that could race ahead of the event.
@@ -121,6 +139,18 @@ class PortalBridge:
             self._intervention_sent = False
             with self._lock:
                 self._policy_action_req = None
+
+    def rewind_rollout(self) -> None:
+        """Request robot-side deterministic rewind and discard queued policy output."""
+        if self.cfg.mock:
+            self._mock_rewind_until = time.time() + 1.0
+            self._mock_rewind_handoff_pending = True
+        else:
+            self._rewind_req = True
+        self._intervention_req = None
+        self._intervention_sent = None
+        with self._lock:
+            self._policy_action_req = None
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -203,14 +233,24 @@ class PortalBridge:
                     action = self._finish_req
                     self._finish_req = None
                     self._client.finish_dagger_run(action)
+                if self._rewind_req:
+                    self._rewind_req = False
+                    self._client.rewind_rollout()
                 with self._lock:
+                    if obs.get("rewinding"):
+                        self._policy_action_req = None
                     policy_action = self._policy_action_req
                     policy_action_seq = self._policy_action_seq
                 if (
                     policy_action is not None
                     and policy_action_seq != self._policy_action_sent_seq
                     and bool(obs.get("policy_running"))
-                    and not bool(obs.get("intervention") or obs.get("homing") or obs.get("estop"))
+                    and not bool(
+                        obs.get("intervention")
+                        or obs.get("rewinding")
+                        or obs.get("homing")
+                        or obs.get("estop")
+                    )
                 ):
                     self._client.set_policy_action(policy_action)
                     self._policy_action_sent_seq = policy_action_seq
@@ -253,6 +293,7 @@ class PortalBridge:
         leader = self._fuse(sides, ("leader_pos",))  # variable per-arm dof; saved when present
         eef = self._fuse(sides, ("eef",))  # follower end-effector pose (FK), when the robot provides it
         intervening = bool(obs.get("intervention"))
+        rewinding = bool(obs.get("rewinding"))
         buttons = {a: (obs.get(a, {}) or {}).get("buttons", []) for a in ARMS}
 
         if self.cfg.record_source == "dagger":
@@ -261,13 +302,19 @@ class PortalBridge:
             # followers in both phases; control_mode identifies its producer.
             teleop_state = "ENGAGED" if obs.get("policy_running") else "IDLE"
             action = self._fuse(sides, ("applied",), ARM_DOF)
-            control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
+            if rewinding:
+                control_mode = CONTROL_MODE["rewind"]
+            else:
+                control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
         elif self.cfg.record_source == "eval":
             # Evaluation rollout: record the executed action every tick, labeled by
             # who produced it (policy vs human intervention). Episode = arm..disarm.
             teleop_state = "ENGAGED"
             action = self._fuse(sides, ("applied",), ARM_DOF)
-            control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
+            if rewinding:
+                control_mode = CONTROL_MODE["rewind"]
+            else:
+                control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
         else:
             teleop_state = obs.get("teleop_state") or ("ENGAGED" if intervening else "IDLE")
             action = self._fuse(sides, ("applied",), ARM_DOF)
@@ -287,6 +334,9 @@ class PortalBridge:
             "recenter_fault": bool(obs.get("recenter_fault")),
             "policy_running": bool(obs.get("policy_running")),
             "homing": bool(obs.get("homing")),
+            "rewinding": rewinding,
+            "rewind_available_s": float(obs.get("rewind_available_s", 0.0) or 0.0),
+            "rewind_buffer_frames": int(obs.get("rewind_buffer_frames", 0) or 0),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
             "last_dagger_event": obs.get("last_dagger_event"),
             "estop": bool(obs.get("estop")),
@@ -312,6 +362,10 @@ class PortalBridge:
             action = np.concatenate([pos for _ in ARMS]).astype(np.float32)
             leader = np.concatenate([pos[:6] for _ in ARMS]).astype(np.float32)  # 6-dof leader per arm
             if self.cfg.record_source == "dagger":
+                rewinding = now < self._mock_rewind_until
+                if self._mock_rewind_handoff_pending and not rewinding:
+                    self._mock_rewind_handoff_pending = False
+                    self._intervention_req = True
                 if self._finish_req is not None:
                     dagger_event_seq += 1
                     last_dagger_event = {"seq": dagger_event_seq, "action": self._finish_req}
@@ -319,11 +373,19 @@ class PortalBridge:
                     self._policy_running_req = False
                     self._intervention_req = False
                 policy_running = bool(self._policy_running_req)
-                intervening = policy_running and bool(self._intervention_req)
+                intervening = policy_running and bool(self._intervention_req) and not rewinding
                 source_state = "ENGAGED" if policy_running else "IDLE"
-                control_mode = CONTROL_MODE["intervention" if intervening else "policy"]
+                control_mode = CONTROL_MODE["rewind" if rewinding else "intervention" if intervening else "policy"]
                 source_action = action if policy_running else None
-                dagger_state = "intervention" if intervening else "policy" if policy_running else "stopped"
+                dagger_state = (
+                    "rewinding"
+                    if rewinding
+                    else "intervention"
+                    if intervening
+                    else "policy"
+                    if policy_running
+                    else "stopped"
+                )
             else:
                 policy_running = bool(self._policy_running_req)
                 intervening = name == "ENGAGED"
@@ -341,6 +403,9 @@ class PortalBridge:
                     "action": source_action,
                     "policy_running": policy_running,
                     "intervention": intervening,
+                    "rewinding": rewinding if self.cfg.record_source == "dagger" else False,
+                    "rewind_available_s": 0.0 if rewinding else 5.0 if policy_running and not intervening else 0.0,
+                    "rewind_buffer_frames": 100 if rewinding else 150 if policy_running and not intervening else 0,
                     "dagger_state": dagger_state,
                     "last_dagger_event": last_dagger_event,
                     "stamp": now,

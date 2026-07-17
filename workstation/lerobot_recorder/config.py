@@ -28,8 +28,8 @@ EEF_DIM = len(ARMS) * EEF_POSE_DIM  # 14 (zeros when the robot can't provide FK)
 
 # Per-frame control-mode label (always written as observation.control_mode), so a
 # dataset records whether each frame came from teleop, a policy, an intervention,
-# or replay — useful for HG-DAgger filtering and provenance.
-CONTROL_MODE = {"teleop": 0, "policy": 1, "intervention": 2, "replay": 3}
+# rewind, or replay — useful for HG-DAgger filtering and provenance.
+CONTROL_MODE = {"teleop": 0, "policy": 1, "intervention": 2, "replay": 3, "rewind": 4}
 
 
 def state_names() -> List[str]:
