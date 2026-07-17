@@ -180,3 +180,21 @@ def test_websocket_inference_timeout_fails_closed():
     with pytest.raises(TimeoutError):
         client.infer({})
     client.close()
+
+
+def test_websocket_inference_allows_per_call_warmup_timeout():
+    class SlowPolicy:
+        def infer(self, obs):
+            time.sleep(0.05)
+            return {"actions": np.zeros((HORIZON, 14), dtype=np.float32)}
+
+    port = free_port()
+    server = WebsocketPolicyServer(SlowPolicy(), host="127.0.0.1", port=port, metadata={})
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    assert wait_port(port)
+    client = WebsocketClientPolicy(host="127.0.0.1", port=port, timeout=0.01)
+
+    response = client.infer({}, timeout=0.2)
+
+    assert response["actions"].shape == (HORIZON, 14)
+    client.close()
