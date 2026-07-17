@@ -224,7 +224,7 @@ class BaseController:
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
     def finish_dagger_run(self, action: str) -> None: ...
-    def rewind_rollout(self) -> None: ...
+    def rewind_rollout(self, resume_policy: bool = False) -> None: ...
     def command(self, data: Dict) -> None: ...
     def set_sim_engage(self, flag: bool) -> None: ...
     def close(self) -> None: ...
@@ -759,6 +759,8 @@ class DaggerController(BaseController):
         # transitions are performed by step(), on the control-loop thread.
         self._rewind_lock = threading.RLock()
         self._rewind_requested = False
+        self._rewind_resume_requested = False
+        self._rewind_resume_policy = False
         self._action_history: deque[tuple[float, Dict[str, np.ndarray]]] = deque()
         self._rewind_queue: deque[Dict[str, np.ndarray]] = deque()
         self._btn_prev: Dict[str, list] = {}
@@ -809,6 +811,7 @@ class DaggerController(BaseController):
             "policy_running": False,
             "homing": False,
             "rewinding": False,
+            "rewind_resume_policy": False,
             "rewind_available_s": 0.0,
             "rewind_buffer_frames": 0,
             "dagger_state": "stopped",
@@ -913,10 +916,12 @@ class DaggerController(BaseController):
             self.finish_dagger_run("discard")
         elif action in {"rewind", "rewind_rollout"}:
             self.rewind_rollout()
+        elif action in {"rewind_resume", "rewind_and_resume"}:
+            self.rewind_rollout(resume_policy=True)
         else:
             logger.warning("unknown dagger button action: %s", action)
 
-    def rewind_rollout(self) -> None:
+    def rewind_rollout(self, resume_policy: bool = False) -> None:
         """Latch a request to replay recent policy-applied targets backward.
 
         The portal server invokes this method on a transport thread. The control
@@ -926,6 +931,7 @@ class DaggerController(BaseController):
         with self._rewind_lock:
             if not self._rewinding:
                 self._rewind_requested = True
+                self._rewind_resume_requested = bool(resume_policy)
 
     def set_estop(self, flag: bool) -> None:
         super().set_estop(flag)
@@ -935,6 +941,8 @@ class DaggerController(BaseController):
     def _cancel_rewind(self, *, clear_history: bool) -> None:
         with self._rewind_lock:
             self._rewind_requested = False
+            self._rewind_resume_requested = False
+            self._rewind_resume_policy = False
             self._rewinding = False
             self._rewind_queue.clear()
             if clear_history:
@@ -977,6 +985,8 @@ class DaggerController(BaseController):
             if not self._rewind_requested:
                 return
             self._rewind_requested = False
+            resume_policy = self._rewind_resume_requested
+            self._rewind_resume_requested = False
             self._trim_action_history_locked(now)
             blocked = (
                 self._homing
@@ -998,9 +1008,11 @@ class DaggerController(BaseController):
             )
             self._action_history.clear()
             self._rewinding = True
+            self._rewind_resume_policy = resume_policy
             first = self._rewind_queue[0]
 
         self._reset_fine_grained()
+        self._invalidate_policy_action()
         for side, target in first.items():
             if side in self._smooth:
                 self._smooth[side].reset(target)
@@ -1011,14 +1023,26 @@ class DaggerController(BaseController):
             if not self._rewinding or self._rewind_queue:
                 return
             self._rewinding = False
-        self._intervening = True
+            resume_policy = self._rewind_resume_policy
+            self._rewind_resume_policy = False
+        self._intervening = not resume_policy
+        self._invalidate_policy_action()
         self._reset_fine_grained()
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
             self._leader_smooth[side].reset(
                 np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
             )
-        logger.info("rewind complete; human intervention enabled")
+        if resume_policy:
+            logger.info("rewind complete; holding for a fresh post-rewind policy action")
+        else:
+            logger.info("rewind complete; human intervention enabled")
+
+    def _invalidate_policy_action(self) -> None:
+        """Hold until a newly received policy command refreshes the watchdog."""
+        for side in self._policy_action:
+            self._policy_action[side] = None
+        self._last_cmd_t = -1e9
 
     def _reset_fine_grained(self) -> None:
         self._fine_grained = False
@@ -1281,6 +1305,7 @@ class DaggerController(BaseController):
                 "policy_running": bool(self._policy_running),
                 "homing": bool(self._homing),
                 "rewinding": bool(self._rewinding),
+                "rewind_resume_policy": bool(self._rewind_resume_policy),
                 "rewind_available_s": rewind_available_s,
                 "rewind_buffer_frames": rewind_buffer_frames,
                 "dagger_state": dagger_state,

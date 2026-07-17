@@ -40,6 +40,7 @@ _EMPTY = {
     "policy_running": False,
     "homing": False,
     "rewinding": False,
+    "rewind_resume_policy": False,
     "rewind_available_s": 0.0,
     "rewind_buffer_frames": 0,
     "dagger_state": "stopped",
@@ -68,6 +69,7 @@ class PortalBridge:
         self._intervention_sent: Optional[bool] = None
         self._finish_req: Optional[str] = None
         self._rewind_req = False
+        self._rewind_resume_policy = False
         self._mock_rewind_until = 0.0
         self._mock_rewind_handoff_pending = False
         self._policy_action_req: Optional[Dict[str, np.ndarray]] = None
@@ -85,6 +87,7 @@ class PortalBridge:
         self._estop_req = bool(flag)
         if flag:
             self._rewind_req = False
+            self._rewind_resume_policy = False
             self._mock_rewind_until = 0.0
             with self._lock:
                 self._policy_action_req = None
@@ -98,6 +101,7 @@ class PortalBridge:
         self._policy_running_sent = None
         if not flag:
             self._rewind_req = False
+            self._rewind_resume_policy = False
             self._mock_rewind_until = 0.0
             # Never carry a pre-stop action into a later rollout/reconnect.
             with self._lock:
@@ -129,6 +133,7 @@ class PortalBridge:
         if action in {"keep", "discard"}:
             self._finish_req = action
             self._rewind_req = False
+            self._rewind_resume_policy = False
             self._mock_rewind_until = 0.0
             # finish_dagger_run atomically emits the keep/discard event and stops
             # the rollout robot-side. Mirror that desired state locally without
@@ -140,8 +145,9 @@ class PortalBridge:
             with self._lock:
                 self._policy_action_req = None
 
-    def rewind_rollout(self) -> None:
+    def rewind_rollout(self, resume_policy: bool = False) -> None:
         """Request robot-side deterministic rewind and discard queued policy output."""
+        self._rewind_resume_policy = bool(resume_policy)
         if self.cfg.mock:
             self._mock_rewind_until = time.time() + 1.0
             self._mock_rewind_handoff_pending = True
@@ -235,7 +241,9 @@ class PortalBridge:
                     self._client.finish_dagger_run(action)
                 if self._rewind_req:
                     self._rewind_req = False
-                    self._client.rewind_rollout()
+                    resume_policy = self._rewind_resume_policy
+                    self._rewind_resume_policy = False
+                    self._client.rewind_rollout(resume_policy=resume_policy)
                 with self._lock:
                     if obs.get("rewinding"):
                         self._policy_action_req = None
@@ -335,6 +343,7 @@ class PortalBridge:
             "policy_running": bool(obs.get("policy_running")),
             "homing": bool(obs.get("homing")),
             "rewinding": rewinding,
+            "rewind_resume_policy": bool(obs.get("rewind_resume_policy")),
             "rewind_available_s": float(obs.get("rewind_available_s", 0.0) or 0.0),
             "rewind_buffer_frames": int(obs.get("rewind_buffer_frames", 0) or 0),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
@@ -365,7 +374,8 @@ class PortalBridge:
                 rewinding = now < self._mock_rewind_until
                 if self._mock_rewind_handoff_pending and not rewinding:
                     self._mock_rewind_handoff_pending = False
-                    self._intervention_req = True
+                    self._intervention_req = not self._rewind_resume_policy
+                    self._rewind_resume_policy = False
                 if self._finish_req is not None:
                     dagger_event_seq += 1
                     last_dagger_event = {"seq": dagger_event_seq, "action": self._finish_req}
@@ -404,6 +414,7 @@ class PortalBridge:
                     "policy_running": policy_running,
                     "intervention": intervening,
                     "rewinding": rewinding if self.cfg.record_source == "dagger" else False,
+                    "rewind_resume_policy": self._rewind_resume_policy if rewinding else False,
                     "rewind_available_s": 0.0 if rewinding else 5.0 if policy_running and not intervening else 0.0,
                     "rewind_buffer_frames": 100 if rewinding else 150 if policy_running and not intervening else 0,
                     "dagger_state": dagger_state,

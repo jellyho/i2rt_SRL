@@ -76,6 +76,7 @@ class Recorder:
             "recenter_fault": False,
             "homing": False,
             "rewinding": False,
+            "rewind_resume_policy": False,
             "rewind_available_s": 0.0,
             "rewind_buffer_frames": 0,
             "estop": False,
@@ -287,9 +288,9 @@ class Recorder:
         """Forward a DAgger keep/discard + home request."""
         self.robot.finish_dagger_run(action)
 
-    def rewind_rollout(self) -> None:
-        """Rewind recent robot-applied policy motion, then hand control to the human."""
-        self.robot.rewind_rollout()
+    def rewind_rollout(self, resume_policy: bool = False) -> None:
+        """Rewind recent robot-applied policy motion, then intervene or replan."""
+        self.robot.rewind_rollout(resume_policy=resume_policy)
 
     def get_status(self) -> dict:
         with self._lock:
@@ -463,6 +464,7 @@ class Recorder:
             "recenter_fault": bool(snap.get("recenter_fault")),
             "homing": bool(snap.get("homing")),
             "rewinding": bool(snap.get("rewinding")),
+            "rewind_resume_policy": bool(snap.get("rewind_resume_policy")),
             "rewind_available_s": float(snap.get("rewind_available_s", 0.0) or 0.0),
             "rewind_buffer_frames": int(snap.get("rewind_buffer_frames", 0) or 0),
             "estop": bool(snap.get("estop")),

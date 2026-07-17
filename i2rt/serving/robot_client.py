@@ -42,8 +42,8 @@ class RobotClient:
     def finish_dagger_run(self, action: str) -> None:
         self._client.finish_dagger_run(str(action))
 
-    def rewind_rollout(self) -> None:
-        self._client.rewind_rollout()
+    def rewind_rollout(self, resume_policy: bool = False) -> None:
+        self._client.rewind_rollout(bool(resume_policy))
 
     def set_sim_engage(self, flag: bool) -> None:
         self._client.set_sim_engage(bool(flag))

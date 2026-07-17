@@ -196,6 +196,8 @@ workstation/yam-data deploy \
 # UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 # Rewind + Human reverses recent robot-applied policy motion, invalidates cached
 # policy chunks, and finishes in human intervention.
+# Rewind + Rollout performs the same reversal but holds at the endpoint until a
+# fresh post-rewind policy chunk arrives, then continues policy control.
 ```
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For

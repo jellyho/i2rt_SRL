@@ -9,7 +9,7 @@ rate, and serves these portal methods to the workstation:
 * ``set_intervention(flag)`` -> external gate override (dagger)
 * ``set_policy_running(flag)`` -> start/stop DAgger policy rollout
 * ``finish_dagger_run(action)`` -> keep/discard current DAgger run and home
-* ``rewind_rollout()``      -> reverse recent applied policy motion, then intervene
+* ``rewind_rollout(resume_policy)`` -> reverse recent policy motion, then intervene/replan
 * ``command(data)``          -> {side: position} direct follower target (wrapper/replay)
 * ``set_sim_engage(flag)``   -> force ENGAGED in sim (teleop)
 

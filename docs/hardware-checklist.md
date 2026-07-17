@@ -151,8 +151,9 @@ small/slow policy movement. Start with `--max-joint-speed 0.2`.
       the robot follows the same applied path backward without exceeding the normal
       joint-speed or joint-limit settings.
 - [ ] Confirm rewind ends in **HUMAN INTERVENTION**, not policy mode.
-- [ ] Release intervention and confirm the next policy action is inferred from the
-      post-rewind state; no pre-rewind cached action is replayed.
+- [ ] In a separate small run, press **Rewind + Rollout**. Confirm the robot holds
+      at the rewind endpoint until a fresh policy action arrives, then replans from
+      that state; no pre-rewind cached action is replayed.
 - [ ] During a second small rewind, engage E-stop. Confirm rewind cancels immediately,
       followers hold, leaders idle, and rewind does not resume when E-stop is cleared.
 
