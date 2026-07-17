@@ -279,7 +279,7 @@ class Recorder:
             )
 
     def set_estop(self, flag: bool) -> None:
-        """Forward an e-stop request to the robot (holds the followers until released)."""
+        """Forward an e-stop request to both leader and follower arms."""
         self.robot.set_estop(flag)
 
     def set_policy_running(self, flag: bool) -> None:

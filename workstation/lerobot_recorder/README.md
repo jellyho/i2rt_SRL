@@ -251,7 +251,7 @@ Dry run: `workstation/yam-data replay --mock`.
   prints episode counts, success rate, and per-task stats from `outcomes.jsonl`
   (and validates the LeRobot dataset if `--repo-id` is given). The replay episode
   list is annotated with ✓/✗ from the same sidecar.
-- **Safety**: E-STOP button in both GUIs (holds the followers); optional collision
+- **Safety**: E-STOP button in both GUIs (holds followers and idles leaders); optional collision
   soft-stop (`control_config.FOLLOWER_EFFORT_LIMIT`); disk-space guard refuses to
   save below `min_free_gb`.
 - **Always-on provenance (fixed schema)**: every frame carries
