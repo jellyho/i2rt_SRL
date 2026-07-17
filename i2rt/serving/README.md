@@ -51,6 +51,7 @@ obs = robot.get_observation()            # {"left": {pos,vel,eff,...}, "right": 
 robot.command({"left": q_l, "right": q_r})        # wrapper/replay: direct follower target
 robot.set_policy_action({"left": q_l, "right": q_r})  # dagger: policy target
 robot.set_intervention(True)             # dagger: external gate override
+robot.rewind_rollout()                   # dagger: reverse recent policy motion, then intervene
 robot.set_estop(True)                    # network e-stop: hold, ignore all commands
 ```
 
@@ -84,6 +85,8 @@ robot.set_estop(True)                    # network e-stop: hold, ignore all comm
 | `teleop_state` | `HOMING`/`IDLE`/`ENGAGED` (teleop) — the episode gate signal |
 | `active` | True iff ENGAGED (teleop) |
 | `intervention` | gate state (dagger) |
+| `rewinding` | recent applied policy targets are being replayed backward (dagger) |
+| `rewind_available_s` / `rewind_buffer_frames` | currently buffered policy history |
 | `<side>.pos/vel/eff` | follower full state (len `num_dofs`, trailing gripper) |
 | `<side>.leader_pos` | leader joints (teleop/dagger) |
 | `<side>.applied` | the rate-limited command actually sent (the action) |

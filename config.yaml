@@ -21,6 +21,9 @@ policy:
   host: 127.0.0.1            # websocket policy server (for the bridge)
   port: 8000
 
+dagger:
+  rewind_window_s: 5.0      # applied policy motion retained for Rewind + Human
+
 control:                     # overrides i2rt/serving/control_config (robot server)
   bilateral_kp: 0.0
   dagger_feedback_kp: 0.0    # human teleop/intervention stays gravity-compensated/free
