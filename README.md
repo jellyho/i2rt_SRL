@@ -90,6 +90,7 @@ workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube" 
 # Other handle buttons toggle intervention and keep/discard + home.
 # Rewind + Human reverses recent applied policy motion, then enters intervention.
 # Rewind + Rollout reverses it, clears stale actions, then replans from the endpoint.
+# Deployment keyboard: Space engages E-stop (UI click required to clear); R runs Rewind + Human.
 ```
 
 ### D · Replay a dataset onto the robot

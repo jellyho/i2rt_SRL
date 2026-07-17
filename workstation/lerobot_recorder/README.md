@@ -198,6 +198,8 @@ workstation/yam-data deploy \
 # policy chunks, and finishes in human intervention.
 # Rewind + Rollout performs the same reversal but holds at the endpoint until a
 # fresh post-rewind policy chunk arrives, then continues policy control.
+# With the deploy window focused: Space engages E-stop (it cannot clear it), and
+# R triggers Rewind + Human when rewind history is available.
 ```
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
