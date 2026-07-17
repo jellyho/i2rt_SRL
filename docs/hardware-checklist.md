@@ -149,7 +149,7 @@ workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
 workstation/yam-data record --source dagger --robot-host <ROBOT_IP> \
     --repo-id user/yam_dagger --serials <wl>,<wr>,<agent>
 ```
-- [ ] An episode = one intervention segment; recorded `action` is the human (leader) action; `control_mode` = intervention. Verify in `outcomes.jsonl` (`source: dagger`).
+- [ ] An episode = one complete policy rollout, including all policy and human-intervention frames. Recorded `action` is the executed command; `control_mode` is `policy` (1) or `intervention` (2) per frame. Verify in `outcomes.jsonl` (`source: dagger`).
 
 ## 12. Eval rollout recording
 
