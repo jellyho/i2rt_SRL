@@ -95,3 +95,4 @@ robot/temp_*/
 CLAUDE.md
 *.mjb
 .venv*/
+outputs/
