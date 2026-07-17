@@ -380,7 +380,17 @@ def test_rewind_request_clears_queued_policy_action():
     bridge.rewind_rollout()
 
     assert bridge._rewind_req is True
+    assert bridge._rewind_resume_policy is False
     assert bridge._policy_action_req is None
+
+
+def test_rewind_rollout_request_preserves_resume_mode():
+    bridge = PortalBridge(RecorderConfig(record_source="dagger", mock=False))
+
+    bridge.rewind_rollout(resume_policy=True)
+
+    assert bridge._rewind_req is True
+    assert bridge._rewind_resume_policy is True
 
 
 def test_dagger_records_one_rollout_across_interventions():

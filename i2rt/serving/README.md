@@ -52,6 +52,7 @@ robot.command({"left": q_l, "right": q_r})        # wrapper/replay: direct follo
 robot.set_policy_action({"left": q_l, "right": q_r})  # dagger: policy target
 robot.set_intervention(True)             # dagger: external gate override
 robot.rewind_rollout()                   # dagger: reverse recent policy motion, then intervene
+robot.rewind_rollout(resume_policy=True) # dagger: reverse, then wait for a fresh policy plan
 robot.set_estop(True)                    # network e-stop: stop both arms, ignore commands
 ```
 
