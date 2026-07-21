@@ -370,6 +370,7 @@ class PortalBridge:
             state = np.concatenate([np.concatenate([pos, vel, eff]) for _ in ARMS]).astype(np.float32)
             action = np.concatenate([pos for _ in ARMS]).astype(np.float32)
             leader = np.concatenate([pos[:6] for _ in ARMS]).astype(np.float32)  # 6-dof leader per arm
+            rewinding = False
             if self.cfg.record_source == "dagger":
                 rewinding = now < self._mock_rewind_until
                 if self._mock_rewind_handoff_pending and not rewinding:
