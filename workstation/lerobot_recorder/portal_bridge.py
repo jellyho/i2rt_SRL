@@ -51,6 +51,8 @@ class PortalBridge:
         self.cfg = cfg
         self._lock = threading.Lock()
         self._snap = dict(_EMPTY)
+        self._raw_obs: Optional[Dict] = None
+        self._raw_received_at = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._client = None
@@ -62,6 +64,9 @@ class PortalBridge:
         self._intervention_req: Optional[bool] = None
         self._intervention_sent: Optional[bool] = None
         self._finish_req: Optional[str] = None
+        self._policy_action_req: Optional[Dict[str, np.ndarray]] = None
+        self._policy_action_seq = 0
+        self._policy_action_sent_seq = 0
         self._last_err: Optional[str] = None
 
     @property
@@ -76,16 +81,46 @@ class PortalBridge:
     def set_policy_running(self, flag: bool) -> None:
         """Request DAgger policy rollout start/stop."""
         self._policy_running_req = bool(flag)
+        # This is an explicit operator request. Send it even if the last request
+        # had the same value, because a handle button may have changed robot-side
+        # state since then.
+        self._policy_running_sent = None
+        if not flag:
+            # Never carry a pre-stop action into a later rollout/reconnect.
+            with self._lock:
+                self._policy_action_req = None
+
+    def set_policy_action(self, data: Dict[str, np.ndarray]) -> None:
+        """Queue the latest policy command for the portal owner's poll thread.
+
+        Portal clients are not safe to drive concurrently from the recorder and
+        deployment threads.  Keeping all RPCs on the poll thread also avoids a
+        second client connection competing with snapshot reads.
+        """
+        action = {side: np.asarray(value, dtype=float).copy() for side, value in data.items()}
+        with self._lock:
+            self._policy_action_req = action
+            self._policy_action_seq += 1
 
     def set_intervention(self, flag: bool) -> None:
         """Request DAgger human intervention state."""
         self._intervention_req = bool(flag)
+        self._intervention_sent = None
 
     def finish_dagger_run(self, action: str) -> None:
         """Request DAgger keep/discard + homing."""
         action = str(action).lower()
         if action in {"keep", "discard"}:
             self._finish_req = action
+            # finish_dagger_run atomically emits the keep/discard event and stops
+            # the rollout robot-side. Mirror that desired state locally without
+            # sending a separate stop RPC that could race ahead of the event.
+            self._policy_running_req = False
+            self._policy_running_sent = False
+            self._intervention_req = False
+            self._intervention_sent = False
+            with self._lock:
+                self._policy_action_req = None
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -101,6 +136,17 @@ class PortalBridge:
     def get_snapshot(self) -> dict:
         with self._lock:
             return dict(self._snap)
+
+    def get_observation(self) -> Dict:
+        """Return the latest raw robot observation for in-process policy serving."""
+        with self._lock:
+            obs = self._raw_obs
+            age = time.monotonic() - self._raw_received_at
+        if not self._connected or obs is None:
+            raise ConnectionError("robot snapshot is not available")
+        if age > 2.0:
+            raise TimeoutError(f"robot snapshot is stale ({age:.1f}s old)")
+        return dict(obs)
 
     def _server_reachable(self) -> bool:
         """Fast TCP preflight. portal's ``send`` blocks forever waiting to connect, so
@@ -134,6 +180,8 @@ class PortalBridge:
                     )
                 obs = self._client.get_observation()
                 with self._lock:
+                    self._raw_obs = obs
+                    self._raw_received_at = time.monotonic()
                     self._snap = self._assemble(obs)
                 if not self._connected:
                     logger.info("robot connected (%s:%d)", self.cfg.robot_host, self.cfg.robot_port)
@@ -155,12 +203,24 @@ class PortalBridge:
                     action = self._finish_req
                     self._finish_req = None
                     self._client.finish_dagger_run(action)
+                with self._lock:
+                    policy_action = self._policy_action_req
+                    policy_action_seq = self._policy_action_seq
+                if (
+                    policy_action is not None
+                    and policy_action_seq != self._policy_action_sent_seq
+                    and bool(obs.get("policy_running"))
+                    and not bool(obs.get("intervention") or obs.get("homing") or obs.get("estop"))
+                ):
+                    self._client.set_policy_action(policy_action)
+                    self._policy_action_sent_seq = policy_action_seq
             except Exception as e:
                 self._client = None  # drop and retry next tick
                 self._connected = False
                 self._estop_sent = None  # force re-apply after reconnect
                 self._policy_running_sent = None
                 self._intervention_sent = None
+                self._policy_action_sent_seq = 0
                 # Surface *why* the link is down instead of failing silently — but only
                 # when the reason changes, so a persistently-down server doesn't spam.
                 msg = f"{type(e).__name__}: {e}"
@@ -196,10 +256,11 @@ class PortalBridge:
         buttons = {a: (obs.get(a, {}) or {}).get("buttons", []) for a in ARMS}
 
         if self.cfg.record_source == "dagger":
-            # HG-DAgger: an episode = an intervention segment; the label is the
-            # human (leader) action, recorded only while intervening.
-            teleop_state = "ENGAGED" if intervening else "IDLE"
-            action = self._fuse(sides, ("human",), ARM_DOF) if intervening else None
+            # A DAgger episode is the complete policy rollout.  Keep recording
+            # through human takeovers and store the command actually sent to the
+            # followers in both phases; control_mode identifies its producer.
+            teleop_state = "ENGAGED" if obs.get("policy_running") else "IDLE"
+            action = self._fuse(sides, ("applied",), ARM_DOF)
             control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
         elif self.cfg.record_source == "eval":
             # Evaluation rollout: record the executed action every tick, labeled by
@@ -238,6 +299,8 @@ class PortalBridge:
         i = 0
         t0 = time.time()
         seg_start = t0
+        dagger_event_seq = 0
+        last_dagger_event = None
         while not self._stop.is_set():
             name, dur = cycle[i]
             now = time.time()
@@ -248,17 +311,38 @@ class PortalBridge:
             state = np.concatenate([np.concatenate([pos, vel, eff]) for _ in ARMS]).astype(np.float32)
             action = np.concatenate([pos for _ in ARMS]).astype(np.float32)
             leader = np.concatenate([pos[:6] for _ in ARMS]).astype(np.float32)  # 6-dof leader per arm
+            if self.cfg.record_source == "dagger":
+                if self._finish_req is not None:
+                    dagger_event_seq += 1
+                    last_dagger_event = {"seq": dagger_event_seq, "action": self._finish_req}
+                    self._finish_req = None
+                    self._policy_running_req = False
+                    self._intervention_req = False
+                policy_running = bool(self._policy_running_req)
+                intervening = policy_running and bool(self._intervention_req)
+                source_state = "ENGAGED" if policy_running else "IDLE"
+                control_mode = CONTROL_MODE["intervention" if intervening else "policy"]
+                source_action = action if policy_running else None
+                dagger_state = "intervention" if intervening else "policy" if policy_running else "stopped"
+            else:
+                policy_running = bool(self._policy_running_req)
+                intervening = name == "ENGAGED"
+                source_state = name
+                control_mode = CONTROL_MODE["teleop"]
+                source_action = action
+                dagger_state = "policy" if policy_running else "stopped"
             with self._lock:
                 self._snap = {
                     **_EMPTY,
-                    "teleop_state": name,
-                    "control_mode": CONTROL_MODE["teleop"],
+                    "teleop_state": source_state,
+                    "control_mode": control_mode,
                     "state": state,
                     "leader": leader,
-                    "action": action,
-                    "policy_running": bool(self._policy_running_req),
-                    "intervention": name == "ENGAGED",
-                    "dagger_state": "policy" if self._policy_running_req else "stopped",
+                    "action": source_action,
+                    "policy_running": policy_running,
+                    "intervention": intervening,
+                    "dagger_state": dagger_state,
+                    "last_dagger_event": last_dagger_event,
                     "stamp": now,
                 }
             if now - seg_start >= dur:
