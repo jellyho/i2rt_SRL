@@ -2,7 +2,7 @@
 
 Runs a fixed-rate loop (``cfg.fps``, 60 Hz to match the cameras). Each tick it
 grabs the latest camera frames and the latest robot snapshot (polled over portal),
-lets the :class:`EpisodeGate` decide start/record/stop from the ``teleop_state``,
+lets the :class:`EpisodeGate` decide start/record/stop from the source gate,
 and **buffers** the frame locally. A finished episode is handed to the
 :class:`AsyncDatasetWriter` queue, so LeRobot's per-trajectory encoding never
 blocks the next collection.
@@ -88,6 +88,7 @@ class Recorder:
         if cfg.record_source == "dagger":
             self._button_outcome = {}  # DAgger buttons are handled by the robot state machine.
         self._last_dagger_event_seq = 0
+        self._dagger_intervention_active = False
         # "eval": record a continuous rollout (policy / intervention) from arm to disarm,
         # instead of gating on the teleop engage signal.
         self._eval = cfg.record_source == "eval"
@@ -152,6 +153,8 @@ class Recorder:
         if self._eval:  # eval: arm starts one continuous rollout
             self._episode, self._preview, self._btn_outcome = [], [], None
             logger.info("collection armed (eval) — recording rollout until you stop")
+        elif self.cfg.record_source == "dagger":
+            logger.info("collection armed — each complete policy rollout is recorded as an episode")
         else:
             logger.info("collection armed — each teleop engage→idle is recorded as an episode")
         self._set(armed=True, recording=self._eval)
@@ -383,13 +386,25 @@ class Recorder:
 
         event = self.gate.update(snap["teleop_state"])
 
+        if self.cfg.record_source == "dagger":
+            # Count actual takeover segments, not rollouts.  Releasing and later
+            # re-entering human control within one rollout counts twice.
+            intervening = bool(snap.get("intervention"))
+            if self.gate.recording:
+                if intervening and not self._dagger_intervention_active:
+                    with self._lock:
+                        self._status["interventions"] += 1
+                self._dagger_intervention_active = intervening
+            else:
+                self._dagger_intervention_active = False
+
         if event in (eg.EV_START, eg.EV_RECORD, eg.EV_STOP):
             if event == eg.EV_START:
                 self._episode, self._preview, self._btn_outcome = [], [], None
-                logger.info("● recording episode (teleop engaged)")
                 if self.cfg.record_source == "dagger":
-                    with self._lock:
-                        self._status["interventions"] += 1
+                    logger.info("● recording DAgger rollout (policy started)")
+                else:
+                    logger.info("● recording episode (teleop engaged)")
             if (
                 not recording_paused
                 and snap["state"] is not None
@@ -494,7 +509,10 @@ class Recorder:
             and (snap["state"] is None or snap["action"] is None)
         ):
             if not warned:
-                logger.warning("recording but no robot state/action yet — check the robot link")
+                if snap["state"] is None:
+                    logger.warning("recording but robot state is missing — check the robot link")
+                else:
+                    logger.warning("recording is waiting for the first applied policy action")
             return True
         return False
 
