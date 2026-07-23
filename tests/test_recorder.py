@@ -14,6 +14,30 @@ from workstation.lerobot_recorder.portal_bridge import PortalBridge
 from workstation.lerobot_recorder.recorder import Recorder
 
 
+def test_recorder_start_failure_releases_hardware(tmp_path, monkeypatch):
+    cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), mock=True)
+    rec = Recorder(cfg)
+    calls = []
+    monkeypatch.setattr(rec.cameras, "start", lambda: calls.append("cameras.start"))
+    monkeypatch.setattr(rec.cameras, "stop", lambda: calls.append("cameras.stop"))
+    monkeypatch.setattr(rec.robot, "start", lambda: calls.append("robot.start"))
+    monkeypatch.setattr(rec.robot, "stop", lambda: calls.append("robot.stop"))
+
+    def fail_writer():
+        raise RuntimeError("dataset initialization failed")
+
+    monkeypatch.setattr(rec, "_open_writer", fail_writer)
+    try:
+        rec.start()
+    except RuntimeError as exc:
+        assert str(exc) == "dataset initialization failed"
+    else:
+        raise AssertionError("startup should fail")
+
+    assert calls == ["cameras.start", "robot.start", "robot.stop", "cameras.stop"]
+    assert rec.writer is None
+
+
 def test_recorder_records_episode_and_outcome(tmp_path):
     cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), fps=60, mock=True)
     rec = Recorder(cfg)
