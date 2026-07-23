@@ -287,6 +287,10 @@ Dry run: `workstation/yam-data replay --mock`.
 - **Eval rollouts**: `--source eval` records a continuous policy rollout from
   Start to Stop (action = the executed command, labeled policy/intervention) — for
   saving evaluation episodes as datasets.
+- **DAgger rollouts**: `--source dagger` records the complete policy run as one
+  episode, including periods with no takeover. `action` is always the command
+  executed by the robot and `observation.control_mode` marks policy (1) versus
+  human intervention (2). Keep/Discard applies to the entire rollout.
 - **Camera fault tolerance**: a faulted RealSense shows a red ⚠ warning, recording
   pauses (no garbage frames), and the capture thread auto-reconnects in the
   background (logging only the down/recovered transitions, not every retry).

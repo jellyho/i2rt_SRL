@@ -259,23 +259,162 @@ def test_dagger_source_assembly():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     bridge = PortalBridge(cfg)
     human_l, human_r = np.arange(7, dtype=float), np.arange(7, 14, dtype=float)
+    applied_l, applied_r = human_l + 20, human_r + 20
     pose = {"pos": [0.0] * 7, "vel": [0.0] * 7, "eff": [0.0] * 7}
 
     intervening = {
         "intervention": True,
-        "left": {**pose, "human": human_l.tolist()},
-        "right": {**pose, "human": human_r.tolist()},
+        "policy_running": True,
+        "left": {**pose, "human": human_l.tolist(), "applied": applied_l.tolist()},
+        "right": {**pose, "human": human_r.tolist(), "applied": applied_r.tolist()},
         "t": 1.0,
     }
     snap = bridge._assemble(intervening)
     assert snap["teleop_state"] == "ENGAGED"
     assert snap["action"] is not None and snap["action"].shape == (14,)
-    assert np.allclose(snap["action"], np.concatenate([human_l, human_r]))
+    assert np.allclose(snap["action"], np.concatenate([applied_l, applied_r]))
+    assert snap["control_mode"] == 2
 
-    idle = {"intervention": False, "left": pose, "right": pose, "t": 2.0}
-    snap_idle = bridge._assemble(idle)
-    assert snap_idle["teleop_state"] == "IDLE"
-    assert snap_idle["action"] is None  # not intervening -> nothing to record
+    policy = {
+        "intervention": False,
+        "policy_running": True,
+        "left": {**pose, "applied": human_l.tolist()},
+        "right": {**pose, "applied": human_r.tolist()},
+        "t": 2.0,
+    }
+    snap_policy = bridge._assemble(policy)
+    assert snap_policy["teleop_state"] == "ENGAGED"
+    assert np.allclose(snap_policy["action"], np.concatenate([human_l, human_r]))
+    assert snap_policy["control_mode"] == 1
+
+    stopped = {"intervention": False, "policy_running": False, "left": pose, "right": pose, "t": 3.0}
+    snap_stopped = bridge._assemble(stopped)
+    assert snap_stopped["teleop_state"] == "IDLE"
+    assert snap_stopped["action"] is None
+
+
+def test_portal_bridge_queues_policy_action_for_its_client_thread():
+    bridge = PortalBridge(RecorderConfig(record_source="dagger", mock=False))
+    action = {"left": np.arange(7), "right": np.arange(7, 14)}
+
+    bridge.set_policy_action(action)
+    action["left"][0] = 99
+
+    assert bridge._policy_action_seq == 1
+    assert bridge._policy_action_req is not None
+    assert bridge._policy_action_req["left"][0] == 0
+
+    bridge.set_policy_running(False)
+    assert bridge._policy_action_req is None
+
+
+def test_portal_bridge_reissues_ui_request_after_handle_changed_robot_state():
+    bridge = PortalBridge(RecorderConfig(record_source="dagger", mock=False))
+    bridge._policy_running_req = True
+    bridge._policy_running_sent = True
+
+    bridge.set_policy_running(True)
+
+    assert bridge._policy_running_req is True
+    assert bridge._policy_running_sent is None
+
+
+def test_finish_clears_policy_action_and_latched_rollout_request():
+    bridge = PortalBridge(RecorderConfig(record_source="dagger", mock=False))
+    bridge.set_policy_running(True)
+    bridge.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+
+    bridge.finish_dagger_run("keep")
+
+    assert bridge._finish_req == "keep"
+    assert bridge._policy_running_req is False
+    assert bridge._intervention_req is False
+    assert bridge._policy_action_req is None
+
+
+def test_dagger_records_one_rollout_across_interventions():
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    rec = Recorder(cfg)
+    submitted = []
+    rec.writer = SimpleNamespace(
+        num_episodes=0,
+        total_episodes=0,
+        outcome_totals={"success": 0, "fail": 0},
+        queue_depth=0,
+        low_disk=False,
+        progress={"saving": False, "queued": 0},
+        finalized=False,
+        submit=lambda frames, outcome, task: submitted.append((list(frames), outcome, task)),
+    )
+    rec.gate.arm()
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+
+    def snap(*, running=True, intervention=False, mode=1, event=None):
+        return {
+            "teleop_state": "ENGAGED" if running else "IDLE",
+            "state": np.zeros(42, np.float32),
+            "action": np.full(14, mode, np.float32) if running else None,
+            "leader": np.zeros(12, np.float32),
+            "eef": np.zeros(14, np.float32),
+            "control_mode": mode,
+            "buttons": {},
+            "intervention": intervention,
+            "leader_recentering": False,
+            "last_dagger_event": event,
+        }
+
+    rec._step(images, snap())
+    rec._step(images, snap(intervention=True, mode=2))
+    rec._step(images, snap())
+    assert rec.gate.recording is True
+    assert len(rec._episode) == 3
+    assert [int(f["observation.control_mode"][0]) for f in rec._episode] == [1, 2, 1]
+    assert rec.get_status()["interventions"] == 1
+
+    rec._step(images, snap(running=False, event={"seq": 1, "action": "keep"}))
+    assert rec.gate.recording is False
+    assert rec._pending is False
+    assert rec._btn_outcome == "keep"
+    assert len(submitted) == 1
+    assert len(submitted[0][0]) == 3
+    assert submitted[0][1] == "keep"
+
+
+def test_dagger_discard_drops_the_complete_rollout():
+    cfg = RecorderConfig(record_source="dagger", mock=False, review_before_save=False)
+    rec = Recorder(cfg)
+    rec.writer = SimpleNamespace(
+        num_episodes=0,
+        total_episodes=0,
+        outcome_totals={"success": 0, "fail": 0},
+        queue_depth=0,
+        low_disk=False,
+        progress={"saving": False, "queued": 0},
+    )
+    rec.gate.arm()
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+    base = {
+        "state": np.zeros(42, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "buttons": {},
+        "intervention": False,
+        "leader_recentering": False,
+    }
+    rec._step(images, {**base, "teleop_state": "ENGAGED", "action": np.zeros(14), "control_mode": 1})
+    rec._step(
+        images,
+        {
+            **base,
+            "teleop_state": "IDLE",
+            "action": None,
+            "control_mode": 1,
+            "last_dagger_event": {"seq": 1, "action": "discard"},
+        },
+    )
+    assert rec._episode == []
+    assert rec.get_status()["discarded"] == 1
+    assert rec.get_status()["kept"] == 0
 
 
 def test_dagger_snapshot_carries_state_and_event():

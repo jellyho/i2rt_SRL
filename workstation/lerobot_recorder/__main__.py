@@ -34,8 +34,9 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
         "--source",
         choices=["teleop", "dagger", "eval"],
         default="teleop",
-        help="teleop = gate on teleop_state (action=applied); dagger = HG-DAgger interventions "
-        "(action=human); eval = record a policy rollout from Start to Stop (action=executed)",
+        help="teleop = gate on teleop_state (action=applied); dagger = complete policy rollout "
+        "with policy/intervention control_mode (action=executed); eval = record continuously "
+        "from Start to Stop (action=executed)",
     )
     p.add_argument("--min-free-gb", type=float, default=1.0, help="refuse to save below this free disk")
     p.add_argument(
