@@ -83,11 +83,14 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ### C · Deployment / DAgger (policy + human takeover)
 
 ```bash
-robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.0      # 🤖 robot
+robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.0 --rewind-window-s 5  # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
 workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
 # Left upper starts/stops rollout, or toggles fine control during intervention.
 # Other handle buttons toggle intervention and keep/discard + home.
+# Rewind + Human reverses recent applied policy motion, then enters intervention.
+# Rewind + Rollout reverses it, clears stale actions, then replans from the endpoint.
+# Deployment keyboard: Space engages E-stop (UI click required to clear); R runs Rewind + Human.
 ```
 
 ### D · Replay a dataset onto the robot

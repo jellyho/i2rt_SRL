@@ -287,6 +287,23 @@ def test_dagger_source_assembly():
     assert np.allclose(snap_policy["action"], np.concatenate([human_l, human_r]))
     assert snap_policy["control_mode"] == 1
 
+    rewinding = {
+        "intervention": False,
+        "policy_running": True,
+        "rewinding": True,
+        "rewind_available_s": 0.0,
+        "rewind_buffer_frames": 42,
+        "left": {**pose, "applied": applied_l.tolist()},
+        "right": {**pose, "applied": applied_r.tolist()},
+        "t": 2.5,
+    }
+    snap_rewind = bridge._assemble(rewinding)
+    assert snap_rewind["teleop_state"] == "ENGAGED"
+    assert snap_rewind["control_mode"] == 4
+    assert snap_rewind["rewinding"] is True
+    assert snap_rewind["rewind_buffer_frames"] == 42
+    assert np.allclose(snap_rewind["action"], np.concatenate([applied_l, applied_r]))
+
     stopped = {"intervention": False, "policy_running": False, "left": pose, "right": pose, "t": 3.0}
     snap_stopped = bridge._assemble(stopped)
     assert snap_stopped["teleop_state"] == "IDLE"
@@ -332,6 +349,26 @@ def test_finish_clears_policy_action_and_latched_rollout_request():
     assert bridge._policy_action_req is None
 
 
+def test_rewind_request_clears_queued_policy_action():
+    bridge = PortalBridge(RecorderConfig(record_source="dagger", mock=False))
+    bridge.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+
+    bridge.rewind_rollout()
+
+    assert bridge._rewind_req is True
+    assert bridge._rewind_resume_policy is False
+    assert bridge._policy_action_req is None
+
+
+def test_rewind_rollout_request_preserves_resume_mode():
+    bridge = PortalBridge(RecorderConfig(record_source="dagger", mock=False))
+
+    bridge.rewind_rollout(resume_policy=True)
+
+    assert bridge._rewind_req is True
+    assert bridge._rewind_resume_policy is True
+
+
 def test_dagger_records_one_rollout_across_interventions():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     rec = Recorder(cfg)
@@ -365,10 +402,11 @@ def test_dagger_records_one_rollout_across_interventions():
 
     rec._step(images, snap())
     rec._step(images, snap(intervention=True, mode=2))
+    rec._step(images, snap(mode=4))
     rec._step(images, snap())
     assert rec.gate.recording is True
-    assert len(rec._episode) == 3
-    assert [int(f["observation.control_mode"][0]) for f in rec._episode] == [1, 2, 1]
+    assert len(rec._episode) == 4
+    assert [int(f["observation.control_mode"][0]) for f in rec._episode] == [1, 2, 4, 1]
     assert rec.get_status()["interventions"] == 1
 
     rec._step(images, snap(running=False, event={"seq": 1, "action": "keep"}))
@@ -376,7 +414,7 @@ def test_dagger_records_one_rollout_across_interventions():
     assert rec._pending is False
     assert rec._btn_outcome == "keep"
     assert len(submitted) == 1
-    assert len(submitted[0][0]) == 3
+    assert len(submitted[0][0]) == 4
     assert submitted[0][1] == "keep"
 
 

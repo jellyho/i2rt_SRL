@@ -81,6 +81,8 @@ def main() -> None:
     default_arm = str(robot_sec.get("arm_type", "yam"))
     default_gripper = str(robot_sec.get("gripper", "linear_4310"))
     default_leader_gripper = str(robot_sec.get("leader_gripper", "yam_teaching_handle"))
+    dagger_sec = rig.get("dagger", {}) or {}
+    default_rewind_window_s = float(dagger_sec.get("rewind_window_s", 5.0))
 
     p = argparse.ArgumentParser(description="YAM robot server (portal)")
     sub = p.add_subparsers(dest="mode", required=True)
@@ -139,6 +141,12 @@ def main() -> None:
     pd.add_argument("--rate", type=float, default=120.0)
     pd.add_argument("--max-joint-speed", type=float, default=1.5)
     pd.add_argument("--command-timeout", type=float, default=cc.COMMAND_TIMEOUT)
+    pd.add_argument(
+        "--rewind-window-s",
+        type=float,
+        default=default_rewind_window_s,
+        help="seconds of applied policy targets retained for deterministic rewind",
+    )
     pd.add_argument("--arm-type", default=default_arm)
     pd.add_argument("--gripper", default=default_gripper, help="follower (end-effector) gripper type")
     pd.add_argument("--leader-gripper", default=default_leader_gripper)
@@ -200,7 +208,6 @@ def main() -> None:
             )
         )
     elif args.mode == "dagger":
-        dagger_sec = rig.get("dagger", {}) or {}
         ctrl = DaggerController(
             DaggerConfig(
                 sim=args.sim,
@@ -220,6 +227,7 @@ def main() -> None:
                 rate=args.rate,
                 max_joint_speed=args.max_joint_speed,
                 command_timeout=args.command_timeout,
+                rewind_window_s=args.rewind_window_s,
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
                 else DaggerConfig().button_map,

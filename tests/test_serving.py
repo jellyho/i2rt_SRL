@@ -98,6 +98,110 @@ def test_dagger_button_map_toggles_rollout(monkeypatch):
     ctrl.close()
 
 
+def test_dagger_rewind_replays_applied_history_and_hands_off_to_human():
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=30.0,
+            max_joint_speed=100.0,
+            command_timeout=10.0,
+            rewind_window_s=5.0,
+        )
+    )
+    try:
+        ctrl.set_policy_running(True)
+        forward = []
+        for value in (0.1, 0.2, 0.3):
+            target = np.full(7, value, dtype=float)
+            ctrl.set_policy_action({"left": target, "right": target})
+            ctrl.step()
+            forward.append(float(ctrl.snapshot()["left"]["applied"][0]))
+
+        assert ctrl.snapshot()["rewind_buffer_frames"] == 3
+        ctrl.rewind_rollout()
+        assert ctrl.snapshot()["rewinding"] is False  # RPC only latches the request
+
+        reverse = []
+        for _ in range(3):
+            ctrl.step()
+            snap = ctrl.snapshot()
+            assert snap["rewinding"] is True
+            reverse.append(float(snap["left"]["applied"][0]))
+
+        ctrl.step()  # drained queue transitions to intervention on the next control tick
+        snap = ctrl.snapshot()
+        assert snap["rewinding"] is False
+        assert snap["intervention"] is True
+        assert snap["dagger_state"] == "intervention"
+        assert np.allclose(reverse, list(reversed(forward)))
+    finally:
+        ctrl.close()
+
+
+def test_dagger_estop_cancels_rewind_without_resuming_queue():
+    ctrl = DaggerController(
+        DaggerConfig(sim=True, rate=30.0, max_joint_speed=100.0, command_timeout=10.0)
+    )
+    try:
+        ctrl.set_policy_running(True)
+        for value in (0.1, 0.2, 0.3):
+            target = np.full(7, value, dtype=float)
+            ctrl.set_policy_action({"left": target, "right": target})
+            ctrl.step()
+        ctrl.rewind_rollout()
+        ctrl.step()
+        assert ctrl.snapshot()["rewinding"] is True
+
+        ctrl.set_estop(True)
+        ctrl.step()
+        snap = ctrl.snapshot()
+        assert snap["estop"] is True
+        assert snap["rewinding"] is False
+        assert snap["rewind_buffer_frames"] == 0
+
+        ctrl.set_estop(False)
+        ctrl.step()
+        assert ctrl.snapshot()["rewinding"] is False
+    finally:
+        ctrl.close()
+
+
+def test_dagger_rewind_rollout_holds_until_fresh_post_rewind_action():
+    ctrl = DaggerController(
+        DaggerConfig(sim=True, rate=30.0, max_joint_speed=100.0, command_timeout=10.0)
+    )
+    try:
+        ctrl.set_policy_running(True)
+        for value in (0.1, 0.2, 0.3):
+            target = np.full(7, value, dtype=float)
+            ctrl.set_policy_action({"left": target, "right": target})
+            ctrl.step()
+
+        ctrl.rewind_rollout(resume_policy=True)
+        for _ in range(3):
+            ctrl.step()
+            assert ctrl.snapshot()["rewinding"] is True
+
+        # Simulate an in-flight pre-rewind command arriving before the workstation
+        # observes the rewind state. The endpoint must invalidate it.
+        stale = np.full(7, 0.9, dtype=float)
+        ctrl.set_policy_action({"left": stale, "right": stale})
+        ctrl.step()
+        snap = ctrl.snapshot()
+        assert snap["rewinding"] is False
+        assert snap["policy_running"] is True
+        assert snap["intervention"] is False
+        assert snap["dagger_state"] == "policy"
+        assert snap["left"]["applied"] is None
+
+        fresh = np.full(7, -0.1, dtype=float)
+        ctrl.set_policy_action({"left": fresh, "right": fresh})
+        ctrl.step()
+        assert ctrl.snapshot()["left"]["applied"] is not None
+    finally:
+        ctrl.close()
+
+
 def test_teleop_bilateral_engage_steps():
     """Engage with bilateral_kp>0 runs through the (fixed) free-until-caught-up path."""
     tc = TeleopController(TeleopConfig(sim=True, bilateral_kp=0.2))

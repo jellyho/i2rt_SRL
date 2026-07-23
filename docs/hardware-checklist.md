@@ -132,7 +132,7 @@ python -c "from i2rt.serving.robot_client import RobotClient; import numpy as np
 ```bash
 # [policy]  smoke test with the zero-model "hold" policy:
 python -m yam_policy.serve            # :8000
-# [robot]  robot/yam dagger --mirror-kp 0.2
+# [robot]  robot/yam dagger --mirror-kp 0.2 --rewind-window-s 5
 # [ws]
 workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
     --serials <wl>,<wr>,<agent> --prompt "do the task"
@@ -140,6 +140,22 @@ workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
 - [ ] Bridge logs the policy **server metadata** and auto-configures `action_horizon`/image keys (no hand-matching).
 - [ ] Policy drives the followers; pressing a handle button hands control to the human (intervention), releasing returns to policy.
 - [ ] Kill the bridge → robot holds within `command_timeout` (link-loss watchdog).
+
+### Supervised rewind verification
+
+Do this only with a clear workspace, a second operator at E-stop, and a deliberately
+small/slow policy movement. Start with `--max-joint-speed 0.2`.
+
+- [ ] Let policy move for 2–3 seconds and confirm the UI rewind buffer grows.
+- [ ] Press **Rewind + Human**. Confirm policy streaming changes to `REWINDING` and
+      the robot follows the same applied path backward without exceeding the normal
+      joint-speed or joint-limit settings.
+- [ ] Confirm rewind ends in **HUMAN INTERVENTION**, not policy mode.
+- [ ] In a separate small run, press **Rewind + Rollout**. Confirm the robot holds
+      at the rewind endpoint until a fresh policy action arrives, then replans from
+      that state; no pre-rewind cached action is replayed.
+- [ ] During a second small rewind, engage E-stop. Confirm rewind cancels immediately,
+      followers hold, leaders idle, and rewind does not resume when E-stop is cleared.
 
 ## 11. HG-DAgger collection
 
@@ -149,7 +165,7 @@ workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
 workstation/yam-data record --source dagger --robot-host <ROBOT_IP> \
     --repo-id user/yam_dagger --serials <wl>,<wr>,<agent>
 ```
-- [ ] An episode = one complete policy rollout, including all policy and human-intervention frames. Recorded `action` is the executed command; `control_mode` is `policy` (1) or `intervention` (2) per frame. Verify in `outcomes.jsonl` (`source: dagger`).
+- [ ] An episode = one complete policy rollout, including policy, rewind, and human-intervention frames. Recorded `action` is the executed command; `control_mode` is `policy` (1), `intervention` (2), or `rewind` (4) per frame. Verify in `outcomes.jsonl` (`source: dagger`).
 
 ## 12. Eval rollout recording
 

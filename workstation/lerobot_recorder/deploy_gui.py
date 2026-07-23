@@ -6,7 +6,7 @@ for deployment / DAgger collection.
 
 from __future__ import annotations
 
-from PyQt5 import QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -24,7 +24,17 @@ class DeployGUI(RecorderGUI):
         idx = self.source_combo.findText("dagger")
         self.source_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.source_combo.setEnabled(False)
-        self.hint.setText("space toggles collection · policy/intervention/keep/discard can use UI or handle buttons")
+        self.hint.setText(
+            "Space engages E-STOP · R rewinds + hands to human · other controls use UI or handle buttons"
+        )
+        self._estop_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Space"), self)
+        self._estop_shortcut.setContext(QtCore.Qt.WindowShortcut)
+        self._estop_shortcut.setAutoRepeat(False)
+        self._estop_shortcut.activated.connect(self._on_estop_shortcut)
+        self._rewind_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("R"), self)
+        self._rewind_shortcut.setContext(QtCore.Qt.WindowShortcut)
+        self._rewind_shortcut.setAutoRepeat(False)
+        self._rewind_shortcut.activated.connect(self._on_rewind_shortcut)
 
     def _build_collect_page(self) -> QtWidgets.QWidget:
         page = super()._build_collect_page()
@@ -38,6 +48,10 @@ class DeployGUI(RecorderGUI):
         self.intervention_btn = QtWidgets.QPushButton("Human Intervention")
         self.intervention_btn.setCheckable(True)
         self.intervention_btn.clicked.connect(self._on_intervention_toggle)
+        self.rewind_btn = QtWidgets.QPushButton("Rewind + Human  [R]")
+        self.rewind_btn.clicked.connect(lambda: self._on_rewind(resume_policy=False))
+        self.rewind_rollout_btn = QtWidgets.QPushButton("Rewind + Rollout")
+        self.rewind_rollout_btn.clicked.connect(lambda: self._on_rewind(resume_policy=True))
         self.keep_home_btn = QtWidgets.QPushButton("Keep + Home")
         self.keep_home_btn.clicked.connect(lambda: self._on_finish("keep"))
         self.discard_home_btn = QtWidgets.QPushButton("Discard + Home")
@@ -55,13 +69,15 @@ class DeployGUI(RecorderGUI):
             "border-radius:8px;padding:10px 12px;font-weight:600;"
         )
 
-        grid.addWidget(self.dagger_state, 0, 0, 1, 4)
+        grid.addWidget(self.dagger_state, 0, 0, 1, 6)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
-        grid.addWidget(self.keep_home_btn, 1, 2)
-        grid.addWidget(self.discard_home_btn, 1, 3)
-        grid.addWidget(self.button_legend, 2, 0, 1, 4)
-        grid.addWidget(self.runner_status, 3, 0, 1, 4)
+        grid.addWidget(self.rewind_btn, 1, 2)
+        grid.addWidget(self.rewind_rollout_btn, 1, 3)
+        grid.addWidget(self.keep_home_btn, 1, 4)
+        grid.addWidget(self.discard_home_btn, 1, 5)
+        grid.addWidget(self.button_legend, 2, 0, 1, 6)
+        grid.addWidget(self.runner_status, 3, 0, 1, 6)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):
@@ -104,6 +120,19 @@ class DeployGUI(RecorderGUI):
         if self.recorder is not None:
             self.recorder.finish_dagger_run(action)
 
+    def _on_rewind(self, *, resume_policy: bool) -> None:
+        if self.recorder is not None:
+            self.recorder.rewind_rollout(resume_policy=resume_policy)
+
+    def _on_estop_shortcut(self) -> None:
+        """Keyboard E-stop is engage-only; clearing requires the visible button."""
+        if self.recorder is not None:
+            self.estop_btn.setChecked(True)
+
+    def _on_rewind_shortcut(self) -> None:
+        if self.recorder is not None and self.rewind_btn.isEnabled():
+            self._on_rewind(resume_policy=False)
+
     def _refresh(self) -> None:
         super()._refresh()
         if self.recorder is not None:
@@ -116,6 +145,9 @@ class DeployGUI(RecorderGUI):
             text, color = "LOW DISK — not saving", theme.STATE_COLORS["ERROR"]
         elif not (st["cam_ok"] and st.get("robot_ok", True)):
             text, color = "DEVICE FAULT", theme.STATE_COLORS["ERROR"]
+        elif st.get("rewinding"):
+            destination = "FRESH ROLLOUT NEXT" if st.get("rewind_resume_policy") else "HANDOFF TO HUMAN NEXT"
+            text, color = f"REWINDING — {destination}", theme.STATE_COLORS["REVIEW"]
         elif st.get("homing"):
             text, color = "HOMING", theme.STATE_COLORS["REVIEW"]
         elif st.get("recenter_fault"):
@@ -155,16 +187,29 @@ class DeployGUI(RecorderGUI):
         running = bool(st.get("policy_running"))
         intervention = bool(st.get("intervention"))
         homing = bool(st.get("homing"))
-        blocked = homing or bool(st.get("estop"))
+        rewinding = bool(st.get("rewinding"))
+        rewind_frames = int(st.get("rewind_buffer_frames", 0) or 0)
+        rewind_s = float(st.get("rewind_available_s", 0.0) or 0.0)
+        blocked = homing or rewinding or bool(st.get("estop"))
         runner = self.runner.get_status() if self.runner is not None else {}
         policy_ready = bool(runner.get("policy_ready"))
         self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
-        self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")
+        self.rewind_btn.setText(
+            f"Rewind {rewind_s:.1f}s + Human  [R]" if rewind_frames else "Rewind + Human  [R]"
+        )
+        self.rewind_rollout_btn.setText(
+            f"Rewind {rewind_s:.1f}s + Rollout" if rewind_frames else "Rewind + Rollout"
+        )
+        self.dagger_state.setText(
+            f"state: {st.get('dagger_state', 'stopped')} · rewind buffer {rewind_frames} frames"
+        )
         self.policy_btn.setEnabled(not blocked and (running or policy_ready))
         for btn in (self.intervention_btn, self.keep_home_btn, self.discard_home_btn):
             btn.setEnabled(not blocked)
+        self.rewind_btn.setEnabled(not blocked and running and not intervention and rewind_frames >= 2)
+        self.rewind_rollout_btn.setEnabled(not blocked and running and not intervention and rewind_frames >= 2)
         horizon = runner.get("execution_horizon", self.bridge_cfg.execution_horizon)
         img = runner.get("image_size", self.bridge_cfg.image_size)
         readiness = "ready" if policy_ready else runner.get("rollout_state", "connecting").lower()
