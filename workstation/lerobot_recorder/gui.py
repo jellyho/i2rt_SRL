@@ -573,10 +573,8 @@ class RecorderGUI(QtWidgets.QWidget):
         if self.recorder is None:
             return
         st = self.recorder.get_status()
-        if st["recording"]:
-            QtWidgets.QMessageBox.information(
-                self, "Recording in progress", "Finish the current episode before saving."
-            )
+        if st["recording"] or st.get("leader_recentering"):
+            QtWidgets.QMessageBox.information(self, "Recording in progress", "Finish the current episode before saving.")
             return
         if st["pending"]:
             QtWidgets.QMessageBox.information(
@@ -671,8 +669,13 @@ class RecorderGUI(QtWidgets.QWidget):
             text, color = "⚠ DEVICE FAULT", theme.STATE_COLORS["ERROR"]
         elif st["pending"]:
             text, color = "REVIEW — keep [S/F] or delete [D]", theme.STATE_COLORS["REVIEW"]
+        elif st.get("recenter_fault"):
+            text, color = "⚠ LEADER ALIGNMENT TIMED OUT — FOLLOWER HELD", theme.STATE_COLORS["ERROR"]
+        elif st.get("leader_recentering"):
+            text, color = "ALIGNING LEADER — RECORDING PAUSED", theme.STATE_COLORS["REVIEW"]
         elif st["recording"]:
-            text, color = "● REC", theme.STATE_COLORS["REC"]
+            text = "● REC (FINE-GRAINED)" if st.get("fine_grained") else "● REC"
+            color = theme.STATE_COLORS["REC"]
         elif st["armed"]:
             text, color = f"ARMED · {st['teleop']}", theme.STATE_COLORS["ARMED"]
         else:
@@ -722,7 +725,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.save_btn.setEnabled(bool(st.get("saveable") and not st.get("recording") and not st.get("pending")))
 
     def _cue_transitions(self, prev: dict, cur: dict) -> None:
-        if cur["recording"] and not prev.get("recording"):
+        if cur["recording"] and not prev.get("recording") and not prev.get("leader_recentering"):
             self.cues.play("start")
         if cur["success"] > prev.get("success", 0):
             self.cues.play("success")

@@ -75,7 +75,7 @@ The recorder opens on a **Setup page**:
 Then teleoperate — **lift both gellos** to start recording, **bring both home** to end the episode:
 
 - With `review_before_save: true` the episode is held for **Keep** / **Delete**. With `false` it **auto-saves** on each engage→idle.
-- **Leader handle buttons** end and label in one press (set in `config.yaml` under `recorder.buttons`, keyed `<side>.<index>`). Default: left lower → **success**, right lower → **fail**, either upper → **discard** (force-home, no save).
+- **Leader handle buttons:** left upper toggles **fine-grained control** (2.5:1 with the checked-in `fine_grained_scale: 0.4`). When toggled off, recording and teleoperation pause while the follower holds and the leader safely realigns; left lower → **success**, right lower → **fail**, right upper → **discard** (force-home, no save).
 - Close the window when done (calls `finalize()` so the dataset is complete). Cameras run on their own capture thread, so the live view and saving never stall on a slow frame.
 
 > **Dry run (no hardware):** `workstation/yam-data record --mock` exercises the whole pipeline with synthetic teleop + fake frames — no robot, cameras, or lerobot needed.
@@ -83,10 +83,11 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ### C · Deployment / DAgger (policy + human takeover)
 
 ```bash
-robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.1      # 🤖 robot
+robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.0      # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
 workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
-# UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
+# Left upper starts/stops rollout, or toggles fine control during intervention.
+# Other handle buttons toggle intervention and keep/discard + home.
 ```
 
 ### D · Replay a dataset onto the robot

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 
+from i2rt.robots.utils import ArmType, GripperType
 from i2rt.serving import control_config as cc
 from i2rt.serving.controllers import (
     DaggerConfig,
@@ -21,9 +22,8 @@ from i2rt.serving.controllers import (
     WrapperConfig,
     WrapperController,
 )
-from i2rt.serving.rig_config import apply_control_overrides, load_rig
+from i2rt.serving.rig_config import apply_control_overrides, load_rig, teleop_button_outcomes
 from i2rt.serving.robot_server import DEFAULT_PORT, RobotServer
-from i2rt.robots.utils import ArmType, GripperType
 
 
 class _DropChatter(logging.Filter):
@@ -79,6 +79,18 @@ def main() -> None:
     pt.add_argument("--dwell", type=float, default=cc.DWELL_S)
     pt.add_argument("--home-kp", type=float, default=cc.HOME_KP)
     pt.add_argument("--bilateral-kp", type=float, default=cc.BILATERAL_KP)
+    pt.add_argument("--fine-grained-scale", type=float, default=cc.FINE_GRAINED_SCALE)
+    pt.add_argument("--fine-grained-button", default=cc.FINE_GRAINED_BUTTON)
+    pt.add_argument("--fine-recenter-speed", type=float, default=cc.FINE_RECENTER_SPEED)
+    pt.add_argument("--fine-recenter-kp", type=float, default=cc.FINE_RECENTER_KP)
+    pt.add_argument(
+        "--fine-recenter-max-following-error",
+        type=float,
+        default=cc.FINE_RECENTER_MAX_FOLLOWING_ERROR,
+    )
+    pt.add_argument("--fine-recenter-tolerance", type=float, default=cc.FINE_RECENTER_TOLERANCE)
+    pt.add_argument("--fine-recenter-dwell", type=float, default=cc.FINE_RECENTER_DWELL)
+    pt.add_argument("--fine-recenter-timeout", type=float, default=cc.FINE_RECENTER_TIMEOUT)
     pt.add_argument("--rate", type=float, default=120.0)
     pt.add_argument("--ramp-speed", type=float, default=cc.RAMP_SPEED)
     pt.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for the (gentle) homing return")
@@ -94,6 +106,18 @@ def main() -> None:
     pd.add_argument("--home", default="")
     pd.add_argument("--mirror-kp", type=float, default=cc.DAGGER_MIRROR_KP)
     pd.add_argument("--feedback-kp", type=float, default=cc.DAGGER_FEEDBACK_KP)
+    pd.add_argument("--fine-grained-scale", type=float, default=cc.FINE_GRAINED_SCALE)
+    pd.add_argument("--fine-grained-button", default=cc.FINE_GRAINED_BUTTON)
+    pd.add_argument("--fine-recenter-speed", type=float, default=cc.FINE_RECENTER_SPEED)
+    pd.add_argument("--fine-recenter-kp", type=float, default=cc.FINE_RECENTER_KP)
+    pd.add_argument(
+        "--fine-recenter-max-following-error",
+        type=float,
+        default=cc.FINE_RECENTER_MAX_FOLLOWING_ERROR,
+    )
+    pd.add_argument("--fine-recenter-tolerance", type=float, default=cc.FINE_RECENTER_TOLERANCE)
+    pd.add_argument("--fine-recenter-dwell", type=float, default=cc.FINE_RECENTER_DWELL)
+    pd.add_argument("--fine-recenter-timeout", type=float, default=cc.FINE_RECENTER_TIMEOUT)
     pd.add_argument("--home-kp", type=float, default=cc.HOME_KP)
     pd.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for DAgger keep/discard homing")
     pd.add_argument("--rate", type=float, default=120.0)
@@ -133,6 +157,15 @@ def main() -> None:
                 dwell=args.dwell,
                 home_kp=args.home_kp,
                 bilateral_kp=args.bilateral_kp,
+                fine_grained_scale=args.fine_grained_scale,
+                fine_grained_button=args.fine_grained_button,
+                fine_recenter_speed=args.fine_recenter_speed,
+                fine_recenter_kp=args.fine_recenter_kp,
+                fine_recenter_max_following_error=args.fine_recenter_max_following_error,
+                fine_recenter_tolerance=args.fine_recenter_tolerance,
+                fine_recenter_dwell=args.fine_recenter_dwell,
+                fine_recenter_timeout=args.fine_recenter_timeout,
+                button_outcomes=teleop_button_outcomes(rig),
                 rate=args.rate,
                 ramp_speed=args.ramp_speed,
                 home_speed=args.home_speed,
@@ -150,6 +183,14 @@ def main() -> None:
                 home=args.home,
                 mirror_kp=args.mirror_kp,
                 feedback_kp=args.feedback_kp,
+                fine_grained_scale=args.fine_grained_scale,
+                fine_grained_button=args.fine_grained_button,
+                fine_recenter_speed=args.fine_recenter_speed,
+                fine_recenter_kp=args.fine_recenter_kp,
+                fine_recenter_max_following_error=args.fine_recenter_max_following_error,
+                fine_recenter_tolerance=args.fine_recenter_tolerance,
+                fine_recenter_dwell=args.fine_recenter_dwell,
+                fine_recenter_timeout=args.fine_recenter_timeout,
                 home_kp=args.home_kp,
                 home_speed=args.home_speed,
                 rate=args.rate,

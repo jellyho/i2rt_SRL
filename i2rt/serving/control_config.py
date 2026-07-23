@@ -51,6 +51,28 @@ GATE_JOINTS: List[int] = [1]
 HOME_KP: float = 0.3  # pulls the leader back to home while homing
 BILATERAL_KP: float = 0.0  # teleop: back-drives the leader while engaged (force feel) # This should be 0.0
 
+# --- Fine-grained relative teleoperation ------------------------------------
+# Press left-upper to toggle a 5:1 leader:follower motion ratio. Leaving fine
+# mode holds the follower still while the leader safely recenters to it; normal
+# 1:1 teleoperation resumes only after physical alignment.
+FINE_GRAINED_SCALE: float = 0.2
+FINE_GRAINED_BUTTON: str = "left.0"
+
+# --- Fine-mode exit: bounded leader recentering -----------------------------
+# Target speed bounds how quickly the commanded leader setpoint advances.
+FINE_RECENTER_SPEED: float = 0.15  # rad/s
+# Fraction of the leader's base arm Kp used to pull it toward that setpoint.
+FINE_RECENTER_KP: float = 0.1
+# Maximum distance between the measured leader and its commanded setpoint. This
+# bounds the PD spring error even if the physical arm cannot keep up.
+FINE_RECENTER_MAX_FOLLOWING_ERROR: float = 0.05  # rad, per joint
+# Both the physical leader and follower must remain this close to the held
+# follower command for the dwell time before recording/teleoperation resumes.
+FINE_RECENTER_TOLERANCE: float = 0.03  # rad, max joint error
+FINE_RECENTER_DWELL: float = 0.2  # s
+# On timeout the follower remains held and the leader becomes gravity-comp free.
+FINE_RECENTER_TIMEOUT: float = 10.0  # s
+
 # --- Leader free-mode feel (grav-comp overrides, LEADER ONLY) ----------------
 # While engaged with BILATERAL_KP=0 the leader runs pure gravity comp; what the
 # hand feels is (gravity model error) + (grav_comp_kd damping) + (uncompensated
@@ -79,12 +101,11 @@ def leader_arm_overrides() -> dict:
 
 # --- DAgger leader gains (separate for the two phases) -----------------------
 # Intervention is TOGGLED by a handle button (press once to take over, press again
-# to hand back). While intervening the human drives the follower (FEEDBACK gain on
-# the leader for force feel); otherwise the policy drives and the leader mirrors
-# the policy action (MIRROR gain). Mirror is usually a touch higher so the human
-# feels/anticipates the policy; feedback is low so it doesn't fight the human.
+# to hand back). While intervening the human drives the follower with a free,
+# gravity-compensated leader (FEEDBACK=0); otherwise the policy drives and the
+# leader mirrors the applied policy command (MIRROR gain).
 DAGGER_MIRROR_KP: float = 0.2  # leader stiffness while the POLICY drives (leader mirrors policy)
-DAGGER_FEEDBACK_KP: float = 0.1  # leader stiffness while the HUMAN intervenes (force feel)
+DAGGER_FEEDBACK_KP: float = 0.0  # human intervention stays gravity-compensated/free
 
 
 # --- Wrist payload for gravity compensation (e.g. a D405 camera) -------------
@@ -97,12 +118,16 @@ FOLLOWER_PAYLOAD_KG: Optional[float] = None  # extra wrist mass in kg (D405 ≈ 
 FOLLOWER_EE_INERTIA: Optional[List[float]] = None  # optional [ipos(3), quat(4), diaginertia(3)] to place the COM
 
 
-# --- Leader handle "end episode" buttons -------------------------------------
-# Pressing any of these leader-handle buttons during teleop forces the rig to
-# start HOMING (ending the episode). The recorder maps the same buttons to an
-# outcome — success / fail / discard — so one press both ends and labels the
-# trajectory (button 0 = discard, 1 = success, 2 = fail; see recorder.py).
-HOME_BUTTONS: List[int] = [0, 1, 2]
+# --- Leader handle episode outcomes ------------------------------------------
+# This is the shared fallback for config.yaml ``recorder.buttons``. The robot
+# controller derives its home buttons from these terminal outcome mappings, and
+# the recorder derives the episode label from the same mapping. Keeping one map
+# prevents a label button from ending an episode on only one side of the link.
+DEFAULT_TELEOP_BUTTON_OUTCOMES = {
+    "left.1": "success",
+    "right.0": "discard",
+    "right.1": "fail",
+}
 
 
 # --- Follower workspace (joint) limits ---------------------------------------

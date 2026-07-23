@@ -47,7 +47,8 @@ class DeployGUI(RecorderGUI):
         self.runner_status = QtWidgets.QLabel("policy: not connected")
         self.runner_status.setStyleSheet(f"color:{theme.MUTED};")
         self.button_legend = QtWidgets.QLabel(
-            "Handle buttons: left upper = start/stop policy rollout, left lower = human intervention on/off, "
+            "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during intervention; "
+            "left lower = human intervention on/off, "
             "right upper = discard + home, right lower = keep + home."
         )
         self.button_legend.setWordWrap(True)
@@ -107,8 +108,13 @@ class DeployGUI(RecorderGUI):
             text, color = "DEVICE FAULT", theme.STATE_COLORS["ERROR"]
         elif st.get("homing"):
             text, color = "HOMING", theme.STATE_COLORS["REVIEW"]
+        elif st.get("recenter_fault"):
+            text, color = "LEADER ALIGNMENT TIMED OUT — FOLLOWER HELD", theme.STATE_COLORS["ERROR"]
+        elif st.get("leader_recentering"):
+            text, color = "HUMAN INTERVENTION — ALIGNING LEADER (RECORDING PAUSED)", theme.STATE_COLORS["REVIEW"]
         elif st.get("intervention"):
-            text, color = "HUMAN INTERVENTION", theme.STATE_COLORS["REC"]
+            text = "HUMAN INTERVENTION (FINE-GRAINED)" if st.get("fine_grained") else "HUMAN INTERVENTION"
+            color = theme.STATE_COLORS["REC"]
         elif st.get("policy_running"):
             text, color = "POLICY RUNNING", theme.STATE_COLORS["ARMED"]
         elif st["armed"]:
