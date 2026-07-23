@@ -156,6 +156,8 @@ workstation/yam-data record \
 The recorder opens on a **Setup page**:
 
 1. Confirm `repo_id` / `root` / `task` and the **source** (teleop / dagger / eval).
+   Closing the window saves the filled setup fields locally; the next Record or
+   DAgger Deploy session restores its own last-used values without pressing START.
    The dataset is written to **`<root>/<name>`** (name = last segment of `repo_id`,
    e.g. `~/lerobot_data` + `hello/pick_and_place` → `~/lerobot_data/pick_and_place`).
    The status line shows cameras detected and whether that dataset already exists.
