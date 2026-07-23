@@ -1072,7 +1072,15 @@ class DaggerController(BaseController):
                         desired = act[:n]
 
                 if desired is not None:
-                    target = desired if self._leader_recentering else smoother.step(desired)
+                    # Human intervention should match engaged teleop: once takeover
+                    # is anchored at the follower's current pose, track the leader
+                    # directly. Keep the smoother synchronized so handing control
+                    # back to the policy still ramps from the final human command.
+                    if self._intervening:
+                        target = desired
+                        smoother.reset(target)
+                    else:
+                        target = smoother.step(desired)
                     applied = self._apply(pair.follower, target)
                     if not self._intervening and self._policy_running and applied is not None:
                         # Mirror the command sent after follower smoothing/clamping.

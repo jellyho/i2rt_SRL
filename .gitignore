@@ -91,6 +91,7 @@ i2rt.egg-info/
 
 # Ignore temporary scripts or generated files
 robot/temp_*/
+deployment_logs/
 
 CLAUDE.md
 *.mjb

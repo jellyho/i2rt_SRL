@@ -1,0 +1,29 @@
+# Safe example only. Keep real robot addresses, camera serials, credentials,
+# checkpoint paths, and operator-specific settings in a local untracked file.
+robot:
+  host: 127.0.0.1
+  port: 11331
+
+policy:
+  host: 127.0.0.1
+  port: 8000
+  contract: yam_bimanual_v1
+  execution_horizon: 16
+  rate_hz: 30
+  image_size: 224
+  prompt: "Insert the USB-C plug into the USB-C port."
+  require_operator_arm: true
+  camera_max_age_s: 0.25
+  inference_timeout_s: 2.0
+
+control:
+  command_timeout: 0.25
+  # Hardware-specific values must be measured and reviewed before a real rollout:
+  # follower_joint_limits: [[-3.0, 3.0], ... seven joint entries reused for each arm]
+  # follower_effort_limit: 10.0
+
+# Populate these only in the local deployment config.
+cameras:
+  agentview: ""
+  wrist_left: ""
+  wrist_right: ""

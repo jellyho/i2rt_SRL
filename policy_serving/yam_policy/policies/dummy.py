@@ -13,6 +13,7 @@ from typing import Dict
 import numpy as np
 
 from ..base_policy import BasePolicy
+from ..yam_contract import CONTRACT, DEFAULT_IMAGE_KEYS
 
 
 class DummyPolicy(BasePolicy):
@@ -21,6 +22,14 @@ class DummyPolicy(BasePolicy):
         self.action_horizon = int(action_horizon)
         self.mode = mode
         self._rng = np.random.default_rng(seed)
+        self.obs_spec = {
+            "contract": CONTRACT,
+            "action_dim": self.action_dim,
+            "model_action_horizon": self.action_horizon,
+            "control_hz": 30,
+            "image_size": 224,
+            "image_keys": dict(DEFAULT_IMAGE_KEYS),
+        }
 
     def infer(self, obs: Dict) -> Dict:
         h, d = self.action_horizon, self.action_dim

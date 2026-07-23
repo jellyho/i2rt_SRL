@@ -52,6 +52,7 @@ _CONTROL_MAP = {
     "dagger_feedback_kp": "DAGGER_FEEDBACK_KP",
     "follower_joint_limits": "FOLLOWER_JOINT_LIMITS",
     "follower_effort_limit": "FOLLOWER_EFFORT_LIMIT",
+    "command_timeout": "COMMAND_TIMEOUT",
     "follower_payload_kg": "FOLLOWER_PAYLOAD_KG",
 }
 
