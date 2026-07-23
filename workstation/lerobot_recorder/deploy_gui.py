@@ -104,6 +104,8 @@ class DeployGUI(RecorderGUI):
             text, color = "■ E-STOP ENGAGED", theme.STATE_COLORS["ERROR"]
         elif not st.get("disk_ok", True):
             text, color = "LOW DISK — not saving", theme.STATE_COLORS["ERROR"]
+        elif not st.get("writer_ok", True):
+            text, color = "DATASET SAVE FAILED — RESTART REQUIRED", theme.STATE_COLORS["ERROR"]
         elif not (st["cam_ok"] and st.get("robot_ok", True)):
             text, color = "DEVICE FAULT", theme.STATE_COLORS["ERROR"]
         elif st.get("homing"):

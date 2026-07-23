@@ -287,11 +287,14 @@ class Recorder:
         d["disk_ok"] = self.writer is None or not self.writer.low_disk
         if self.writer is not None:  # detailed writer pipeline state
             d["writer"] = self.writer.progress
+            d["writer_ok"] = not bool(d["writer"].get("failed"))
+            d["writer_error"] = d["writer"].get("last_error", "")
             d["saving"] = d["writer"]["saving"]
             d["queue"] = d["writer"]["queued"]
             d["saved"] = bool(d["writer"].get("finalized") and d["writer"].get("submitted", 0) > 0)
             d["saveable"] = bool(
                 not d["writer"].get("finalized")
+                and not d["writer"].get("failed")
                 and d["writer"].get("submitted", 0) > 0
                 and not d.get("recording")
                 and not d.get("leader_recentering")
@@ -301,6 +304,8 @@ class Recorder:
             d["saving"] = False
             d["saved"] = False
             d["saveable"] = False
+            d["writer_ok"] = True
+            d["writer_error"] = ""
         return d
 
     def get_last_images(self) -> dict:
