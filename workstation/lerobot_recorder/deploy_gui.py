@@ -6,7 +6,7 @@ for deployment / DAgger collection.
 
 from __future__ import annotations
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -16,6 +16,8 @@ from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
 
 
 class DeployGUI(RecorderGUI):
+    SETTINGS_SCOPE = "deploy"
+
     def __init__(self, cfg: RecorderConfig, bridge_cfg: BridgeConfig) -> None:
         self.bridge_cfg = bridge_cfg
         self.runner: DeploymentPolicyRunner | None = None
