@@ -64,6 +64,11 @@ class CameraSpec:
     width: int = 640
     height: int = 480
     fps: int = 60  # native stream fps (>= record fps so frames don't repeat)
+    # RealSense color-sensor options applied after the stream starts (and on every
+    # reconnect), e.g. {"enable_auto_exposure": 0, "exposure": 300, "gain": 64} to
+    # lock exposure so brightness doesn't drift across an episode. Names are
+    # `rs.option` members; set from config.yaml's per-camera `options:` map.
+    options: dict = field(default_factory=dict)
 
 
 def default_cameras() -> List[CameraSpec]:

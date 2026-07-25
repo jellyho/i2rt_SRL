@@ -35,6 +35,7 @@ bash robot/setup_can_ids.sh        # plug the 4 CAN adapters one-by-one -> persi
 bash workstation/setup_workstation_env.sh # conda create yam_ws + uv pip install + RealSense udev
 conda activate yam_ws
 workstation/yam-data cams                 # list connected RealSense serials
+workstation/yam-data tune                 # live sliders to match camera brightness
 ```
 
 Then edit [`config.yaml`](config.yaml) at the repo root — at minimum the robot address and camera serials:
@@ -257,7 +258,7 @@ takeovers ramp smoothly.
 | Policy serving (websocket) | [`policy_serving/`](policy_serving/README.md) | openpi-compatible `WebsocketPolicyServer`/`Client` + `serve.py` + policy templates |
 | Workstation tools | [`workstation/lerobot_recorder/`](workstation/lerobot_recorder/README.md) | LeRobot recorder (teleop/dagger/eval), replay+overlay, policy bridge; modern themed GUI with status banner, health, live stats, audio cues, success/fail/discard labeling |
 
-Quick CLIs (workstation): `workstation/yam-data {record\|replay\|bridge\|cams\|doctor}`.
+Quick CLIs (workstation): `workstation/yam-data {record\|replay\|bridge\|cams\|tune\|doctor}`.
 
 **One config for everything**: edit the tracked [`config.yaml`](config.yaml) at the
 **repo root** — robot host/port, control gains/limits, camera serials, recorder
