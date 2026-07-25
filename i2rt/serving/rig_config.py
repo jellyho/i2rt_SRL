@@ -14,6 +14,8 @@ Example:
     control:  {bilateral_kp: 0.15, home_speed: 0.4, follower_effort_limit: 30.0,
                follower_joint_limits: [[-3.0, 3.0], ...]}
     cameras:  {agentview: "1234", wrist_left: "5678", wrist_right: "9012"}
+              # or, per camera, with sensor options:
+              #   agentview: {serial: "1234", options: {enable_auto_exposure: 0, exposure: 300}}
     recorder: {repo_id: user/yam_pick, root: ~/lerobot_data, fps: 60, min_free_gb: 2.0}
     tasks:    ["pick the cube", "stack the blocks"]
 """
@@ -155,11 +157,44 @@ def teleop_button_outcomes(rig: Dict[str, Any]) -> Dict[str, str]:
 
 
 def apply_camera_serials(cameras: List[Any], rig: Dict[str, Any]) -> List[Any]:
-    """Set each ``CameraSpec.serial`` from ``rig['cameras']`` (by camera key)."""
+    """Set each ``CameraSpec.serial`` (and optional sensor ``options``) from
+    ``rig['cameras']``, by camera key.
+
+    Two entry shapes per camera, so existing configs keep working:
+
+        agentview: "246322303794"                       # serial only
+        agentview: {serial: "2463...", options: {enable_auto_exposure: 0, exposure: 300}}
+
+    ``options`` are RealSense option names (``rs.option`` members) -> numeric value,
+    applied after the stream starts to whichever sensor owns the color controls (the
+    ``RGB Camera`` on a D455, the ``Stereo Module`` on a D405 — which has no RGB
+    sensor). Booleans map to 1.0/0.0.
+    """
     section = (rig or {}).get("cameras", {}) or {}
     for cam in cameras:
-        if section.get(cam.key):
-            cam.serial = str(section[cam.key])
+        entry = section.get(cam.key)
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            if entry.get("serial"):
+                cam.serial = str(entry["serial"])
+            options = entry.get("options") or {}
+            if not isinstance(options, dict):
+                raise ValueError(f"camera {cam.key!r}: 'options' must be a mapping of option name -> value")
+            resolved = {}
+            for name, value in options.items():
+                if isinstance(value, bool):
+                    value = float(value)
+                elif isinstance(value, (int, float)):
+                    value = float(value)
+                else:
+                    raise ValueError(
+                        f"camera {cam.key!r}: option {name!r} must be a number or boolean, got {value!r}"
+                    )
+                resolved[str(name)] = value
+            cam.options = resolved
+        elif entry:
+            cam.serial = str(entry)
     return cameras
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 import i2rt.serving.rig_config as rc
 from i2rt.serving import control_config as cc
 from i2rt.serving.rig_config import (
@@ -135,6 +137,39 @@ def test_apply_camera_serials():
     by = {c.key: c.serial for c in cams}
     assert by["agentview"] == "AAA" and by["wrist_left"] == "BBB"
     assert by["wrist_right"] == ""  # untouched
+
+
+def test_apply_camera_options():
+    cams = apply_camera_serials(
+        default_cameras(),
+        {
+            "cameras": {
+                "agentview": {"serial": "AAA", "options": {"enable_auto_exposure": 0, "exposure": 300}},
+                "wrist_left": "BBB",  # plain-string form still supported alongside
+            }
+        },
+    )
+    by = {c.key: c for c in cams}
+    assert by["agentview"].serial == "AAA"
+    assert by["agentview"].options == {"enable_auto_exposure": 0.0, "exposure": 300.0}
+    assert by["wrist_left"].serial == "BBB" and by["wrist_left"].options == {}
+
+
+def test_apply_camera_options_bool_and_serial_only_map():
+    cams = apply_camera_serials(
+        default_cameras(),
+        {"cameras": {"agentview": {"options": {"enable_auto_exposure": False}}}},
+    )
+    by = {c.key: c for c in cams}
+    assert by["agentview"].serial == ""  # no serial in the map -> left unpinned
+    assert by["agentview"].options == {"enable_auto_exposure": 0.0}
+
+
+def test_apply_camera_options_rejects_bad_shapes():
+    with pytest.raises(ValueError):
+        apply_camera_serials(default_cameras(), {"cameras": {"agentview": {"options": ["exposure"]}}})
+    with pytest.raises(ValueError):
+        apply_camera_serials(default_cameras(), {"cameras": {"agentview": {"options": {"exposure": "dark"}}}})
 
 
 def test_resolver_precedence():

@@ -11,6 +11,7 @@
 #   workstation/yam-data bridge [args]   # policy bridge (portal robot <-> websocket policy)
 #   workstation/yam-data deploy [args]   # GUI DAgger deployment + policy bridge
 #   workstation/yam-data cams            # list connected RealSense serials
+#   workstation/yam-data tune [args]     # GUI exposure/brightness tuner (match cameras)
 #   workstation/yam-data doctor [args]   # dataset stats / validation
 #
 # Override the conda env:  YAM_WS_ENV=my_env workstation/yam-data record ...
@@ -39,9 +40,10 @@ case "$cmd" in
     bridge) exec python -m workstation.policy_bridge "$@" ;;
     deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
+    tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|bridge|deploy|cams|doctor} [args]" >&2
+        echo "usage: yam-data {record|replay|bridge|deploy|cams|tune|doctor} [args]" >&2
         exit 2
         ;;
 esac

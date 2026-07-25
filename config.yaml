@@ -57,10 +57,42 @@ control:                     # overrides i2rt/serving/control_config (robot serv
 
 
 cameras:                     # RealSense serials by role (run `yam-data cams` to list)
-  agentview: "246322303794"              # D455
-  wrist_left: "352122271652"             # D405
-  wrist_right: "409122274199"           # D405
-
+  # Either `key: "<serial>"`, or a map with `serial:` plus optional `options:`
+  # (rs.option name -> value) applied to the color sensor on open and reconnect.
+  # Exposure is LOCKED on every camera (auto-exposure drifts mid-episode and makes
+  # the same scene look different from frame to frame). Values are tuned so all three
+  # land near luma ~160 with no clipped highlights — retune with `yam-data tune`.
+  #
+  # NOTE: exposure numbers are NOT comparable across models. The D455 has a real RGB
+  # sensor counting in 100us steps (1..10000); the D405 has none, so its color comes
+  # off the Stereo Module counting in 1us steps (1..165000). Hence 120 vs 16000 below
+  # are both ~12-16 ms. Gain ranges differ too: 0..128 (D455 RGB) vs 16..248 (stereo).
+  agentview:  # D455
+    serial: "246322303794"
+    options:
+      enable_auto_exposure: 0
+      exposure: 115
+      gain: 64
+      enable_auto_white_balance: 0
+      white_balance: 4600
+  # Both wrists are D405s, so they share ONE identical block (same units, same ranges).
+  # Keep these two in sync — if you change one, change the other.
+  wrist_left:  # D405
+    serial: "352122271652"
+    options:
+      enable_auto_exposure: 0
+      exposure: 16389
+      gain: 16
+      enable_auto_white_balance: 0
+      white_balance: 4600
+  wrist_right:  # D405
+    serial: "409122274199"
+    options:
+      enable_auto_exposure: 0
+      exposure: 16389
+      gain: 16
+      enable_auto_white_balance: 0
+      white_balance: 4600
 recorder:
   repo_id: jellyho/close_bottle_cap
   root: ~/lerobot_data

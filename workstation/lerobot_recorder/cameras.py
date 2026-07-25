@@ -24,6 +24,31 @@ from workstation.lerobot_recorder.config import CameraSpec, RecorderConfig
 logger = logging.getLogger(__name__)
 
 
+def color_control_sensor(device):
+    """The sensor that owns exposure/gain for a device's COLOR stream.
+
+    Not always the color sensor: the D455 has a real ``RGB Camera`` endpoint, but the
+    D405 has no RGB sensor at all — its color stream is derived from the ``Stereo
+    Module``, so ``device.first_color_sensor()`` raises "Could not find requested
+    sensor type!" and exposure must be set on the stereo sensor instead.
+
+    Consequence for units: RealSense color sensors count exposure in 100 us steps
+    (D455 RGB range 1..10000), while depth/stereo sensors count in 1 us steps (D405
+    range 1..165000). The SAME numeric exposure means a 100x different time on a D405
+    than on a D455 — never copy an exposure value between the two models.
+    """
+    try:
+        return device.first_color_sensor()
+    except Exception:
+        pass
+    import pyrealsense2 as rs
+
+    for sensor in device.query_sensors():
+        if sensor.supports(rs.option.exposure):
+            return sensor
+    raise RuntimeError("no sensor exposing exposure/gain controls")
+
+
 class CameraManager:
     def __init__(self, cfg: RecorderConfig) -> None:
         self.cfg = cfg
@@ -143,9 +168,52 @@ class CameraManager:
         rs_cfg = rs.config()
         rs_cfg.enable_device(serial)
         rs_cfg.enable_stream(rs.stream.color, spec.width, spec.height, rs.format.rgb8, fps)
-        pipe.start(rs_cfg)
+        profile = pipe.start(rs_cfg)
         self._pipelines[spec.key] = pipe
         self._healthy[spec.key] = True
+        self._apply_options(spec, profile)
+
+    def _apply_options(self, spec: CameraSpec, profile) -> None:
+        """Push ``spec.options`` onto the camera's exposure-owning sensor (best effort).
+
+        Runs on every open, so a reconnect restores the same settings. Auto-* toggles
+        are applied first: writing `exposure` while auto-exposure is still on is a
+        no-op on RealSense, so the order decides whether locking works at all. One
+        unsupported option (model-dependent) must not blank the camera, so failures
+        are logged and skipped individually.
+        """
+        if not spec.options:
+            return
+        import pyrealsense2 as rs
+
+        try:
+            sensor = color_control_sensor(profile.get_device())
+        except Exception as e:
+            logger.warning("camera '%s': no sensor to apply options to: %s", spec.key, e)
+            return
+        # auto-exposure/white-balance off before the manual values they gate
+        ordered = sorted(spec.options.items(), key=lambda kv: not kv[0].startswith("enable_auto"))
+        for name, value in ordered:
+            try:
+                option = getattr(rs.option, name)
+            except AttributeError:
+                logger.warning("camera '%s': unknown RealSense option '%s' (ignored)", spec.key, name)
+                continue
+            try:
+                if not sensor.supports(option):
+                    logger.warning("camera '%s': option '%s' unsupported by this model (ignored)", spec.key, name)
+                    continue
+                rng = sensor.get_option_range(option)
+                if not (rng.min <= value <= rng.max):
+                    logger.warning(
+                        "camera '%s': option '%s'=%g out of range [%g, %g] (ignored)",
+                        spec.key, name, value, rng.min, rng.max,
+                    )
+                    continue
+                sensor.set_option(option, value)
+                logger.info("camera '%s': %s = %g", spec.key, name, value)
+            except Exception as e:
+                logger.warning("camera '%s': could not set option '%s'=%g: %s", spec.key, name, value, e)
 
     def read(self) -> Dict[str, np.ndarray]:
         """Return {key: HxWx3 uint8 RGB} — the latest cached frame per camera, copied.
