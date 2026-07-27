@@ -89,6 +89,8 @@ python -m yam_policy.serve                               # 🧠 policy host (:80
 workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
 # Left upper starts/stops rollout, or toggles fine control during intervention.
 # Other handle buttons toggle intervention and keep/discard + home.
+# In the deploy UI, Return + Human (or R) moves to the configured recovery pose
+# before enabling human intervention.
 ```
 
 ### D · Replay a dataset onto the robot

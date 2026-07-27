@@ -258,6 +258,25 @@ workstation/yam-data deploy \
 # UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 ```
 
+For repeatable retry/recovery demonstrations, press **Return + Human** or `R`
+while the policy is running. The robot pauses policy execution, smoothly moves
+both followers and leaders using `control.home_speed`, and enables human
+intervention only after the configured joint target is reached:
+
+```yaml
+control:
+  dagger_return_mode: relative  # relative | absolute
+  # left 7 values, then right 7; each 0 means hold that joint at its press-time position
+  dagger_return_rel_pos: [0, 0, 0.15, 0, 0, 0, 0, 0, 0, 0.15, 0, 0, 0, 0]
+  dagger_return_abs_pos: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+```
+
+Relative nonzero values are added to the measured pose at button press;
+absolute nonzero values replace the corresponding joints. The order per arm is
+six arm joints followed by the gripper. Targets are clamped to the intersection
+of the robot's runtime arm/gripper limits and any narrower
+`control.follower_joint_limits` configured by the operator.
+
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
 normal DAgger collection, use `deploy` so the policy bridge, recorder, live stats,
 and safety controls share one operator UI.
