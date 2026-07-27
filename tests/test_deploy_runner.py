@@ -48,3 +48,13 @@ def test_deploy_runner_builds_lerobot_observation_schema():
     assert obs["observation.control_mode"].tolist() == [CONTROL_MODE["teleop"]]
     assert obs["observation.images.agentview"].shape == (480, 640, 3)
     assert np.allclose(obs["observation.state"][:21], np.concatenate([robot_obs["left"][k] for k in ("pos", "vel", "eff")]))
+
+
+@pytest.mark.parametrize("blocked_key", ["intervention", "returning", "homing", "estop"])
+def test_deploy_runner_pauses_policy_for_robot_control_transitions(blocked_key):
+    obs = {"policy_running": True, blocked_key: True}
+    assert DeploymentPolicyRunner._should_stream(obs) is False
+
+
+def test_deploy_runner_streams_during_unblocked_policy_state():
+    assert DeploymentPolicyRunner._should_stream({"policy_running": True}) is True

@@ -39,6 +39,9 @@ _EMPTY = {
     "recenter_fault": False,
     "policy_running": False,
     "homing": False,
+    "returning": False,
+    "dagger_return_configured": False,
+    "dagger_return_mode": None,
     "dagger_state": "stopped",
     "last_dagger_event": None,
     "estop": False,
@@ -62,6 +65,9 @@ class PortalBridge:
         self._intervention_req: Optional[bool] = None
         self._intervention_sent: Optional[bool] = None
         self._finish_req: Optional[str] = None
+        self._return_req = False
+        self._return_handoff_pending = False
+        self._mock_return_until = 0.0
         self._last_err: Optional[str] = None
 
     @property
@@ -72,20 +78,42 @@ class PortalBridge:
     def set_estop(self, flag: bool) -> None:
         """Request a robot e-stop; applied (and re-applied on reconnect) by the poll loop."""
         self._estop_req = bool(flag)
+        if flag:
+            self._return_req = False
+            self._return_handoff_pending = False
+            self._mock_return_until = 0.0
 
     def set_policy_running(self, flag: bool) -> None:
         """Request DAgger policy rollout start/stop."""
         self._policy_running_req = bool(flag)
+        if not flag:
+            self._return_req = False
+            self._return_handoff_pending = False
+            self._mock_return_until = 0.0
 
     def set_intervention(self, flag: bool) -> None:
         """Request DAgger human intervention state."""
         self._intervention_req = bool(flag)
+        self._return_handoff_pending = False
 
     def finish_dagger_run(self, action: str) -> None:
         """Request DAgger keep/discard + homing."""
         action = str(action).lower()
         if action in {"keep", "discard"}:
             self._finish_req = action
+            self._return_req = False
+            self._return_handoff_pending = False
+            self._mock_return_until = 0.0
+
+    def return_to_dagger_pose(self) -> None:
+        """Request the configured robot-side recovery move and human handoff."""
+        self._return_handoff_pending = True
+        self._intervention_req = None
+        self._intervention_sent = None
+        if self.cfg.mock:
+            self._mock_return_until = time.time() + 0.75
+        else:
+            self._return_req = True
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -135,6 +163,17 @@ class PortalBridge:
                 obs = self._client.get_observation()
                 with self._lock:
                     self._snap = self._assemble(obs)
+                if (
+                    self._return_handoff_pending
+                    and bool(obs.get("intervention"))
+                    and not bool(obs.get("returning"))
+                ):
+                    # Preserve the robot's post-return intervention state across
+                    # a later reconnect without sending intervention early and
+                    # racing the return request itself.
+                    self._return_handoff_pending = False
+                    self._intervention_req = True
+                    self._intervention_sent = True
                 if not self._connected:
                     logger.info("robot connected (%s:%d)", self.cfg.robot_host, self.cfg.robot_port)
                 self._connected = True
@@ -155,6 +194,9 @@ class PortalBridge:
                     action = self._finish_req
                     self._finish_req = None
                     self._client.finish_dagger_run(action)
+                if self._return_req:
+                    self._return_req = False
+                    self._client.return_to_dagger_pose()
             except Exception as e:
                 self._client = None  # drop and retry next tick
                 self._connected = False
@@ -226,6 +268,9 @@ class PortalBridge:
             "recenter_fault": bool(obs.get("recenter_fault")),
             "policy_running": bool(obs.get("policy_running")),
             "homing": bool(obs.get("homing")),
+            "returning": bool(obs.get("returning")),
+            "dagger_return_configured": bool(obs.get("dagger_return_configured")),
+            "dagger_return_mode": obs.get("dagger_return_mode"),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
             "last_dagger_event": obs.get("last_dagger_event"),
             "estop": bool(obs.get("estop")),
@@ -248,6 +293,10 @@ class PortalBridge:
             state = np.concatenate([np.concatenate([pos, vel, eff]) for _ in ARMS]).astype(np.float32)
             action = np.concatenate([pos for _ in ARMS]).astype(np.float32)
             leader = np.concatenate([pos[:6] for _ in ARMS]).astype(np.float32)  # 6-dof leader per arm
+            returning = now < self._mock_return_until
+            if self._return_handoff_pending and not returning:
+                self._return_handoff_pending = False
+                self._intervention_req = True
             with self._lock:
                 self._snap = {
                     **_EMPTY,
@@ -257,8 +306,19 @@ class PortalBridge:
                     "leader": leader,
                     "action": action,
                     "policy_running": bool(self._policy_running_req),
-                    "intervention": name == "ENGAGED",
-                    "dagger_state": "policy" if self._policy_running_req else "stopped",
+                    "intervention": bool(self._intervention_req) and not returning,
+                    "returning": returning,
+                    "dagger_return_configured": True,
+                    "dagger_return_mode": "relative",
+                    "dagger_state": (
+                        "returning"
+                        if returning
+                        else "intervention"
+                        if self._intervention_req
+                        else "policy"
+                        if self._policy_running_req
+                        else "stopped"
+                    ),
                     "stamp": now,
                 }
             if now - seg_start >= dur:

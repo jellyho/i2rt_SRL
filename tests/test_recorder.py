@@ -311,6 +311,9 @@ def test_dagger_snapshot_carries_state_and_event():
             "intervention": False,
             "policy_running": True,
             "homing": False,
+            "returning": True,
+            "dagger_return_configured": True,
+            "dagger_return_mode": "absolute",
             "dagger_state": "policy",
             "last_dagger_event": {"seq": 3, "action": "keep"},
             "fine_grained": True,
@@ -327,6 +330,9 @@ def test_dagger_snapshot_carries_state_and_event():
     assert snap["fine_grained"] is True
     assert snap["leader_recentering"] is True
     assert snap["recenter_fault"] is False
+    assert snap["returning"] is True
+    assert snap["dagger_return_configured"] is True
+    assert snap["dagger_return_mode"] == "absolute"
 
 
 def test_dagger_recorder_events_do_not_use_expert_button_map():

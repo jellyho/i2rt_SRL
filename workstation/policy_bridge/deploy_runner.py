@@ -3,7 +3,7 @@
 Unlike the headless bridge, this runner does not own cameras and does not decide
 whether policy rollout is active. The robot-side DAgger controller is the source
 of truth; this runner only sends policy actions while the robot snapshot reports
-``policy_running`` and not intervention/homing/e-stop.
+``policy_running`` and not intervention/returning/homing/e-stop.
 """
 
 from __future__ import annotations
@@ -116,6 +116,15 @@ class DeploymentPolicyRunner:
         image_size = int(meta.get("image_size", self.cfg.image_size))
         return (image_size, image_size)
 
+    @staticmethod
+    def _should_stream(obs: Dict) -> bool:
+        return bool(obs.get("policy_running")) and not bool(
+            obs.get("intervention")
+            or obs.get("returning")
+            or obs.get("homing")
+            or obs.get("estop")
+        )
+
     def _loop(self) -> None:
         period = 1.0 / max(self.cfg.rate_hz, 1.0)
         while not self._stop.is_set():
@@ -126,9 +135,7 @@ class DeploymentPolicyRunner:
                 else:
                     self._connect_robot()
                     obs = self._robot.get_observation()
-                    should_stream = bool(obs.get("policy_running")) and not (
-                        obs.get("intervention") or obs.get("homing") or obs.get("estop")
-                    )
+                    should_stream = self._should_stream(obs)
                     if should_stream:
                         self._connect_policy()
                         if not self._was_streaming:

@@ -75,6 +75,9 @@ class Recorder:
             "leader_recentering": False,
             "recenter_fault": False,
             "homing": False,
+            "returning": False,
+            "dagger_return_configured": False,
+            "dagger_return_mode": None,
             "estop": False,
         }
         self._last_images: dict = {}
@@ -294,6 +297,10 @@ class Recorder:
         """Forward a DAgger keep/discard + home request."""
         self.robot.finish_dagger_run(action)
 
+    def return_to_dagger_pose(self) -> None:
+        """Move to the configured DAgger recovery pose, then hand off to the human."""
+        self.robot.return_to_dagger_pose()
+
     def get_status(self) -> dict:
         with self._lock:
             d = dict(self._status)
@@ -458,6 +465,9 @@ class Recorder:
             "leader_recentering": bool(snap.get("leader_recentering")),
             "recenter_fault": bool(snap.get("recenter_fault")),
             "homing": bool(snap.get("homing")),
+            "returning": bool(snap.get("returning")),
+            "dagger_return_configured": bool(snap.get("dagger_return_configured")),
+            "dagger_return_mode": snap.get("dagger_return_mode"),
             "estop": bool(snap.get("estop")),
         }
 
