@@ -51,14 +51,17 @@ obs = robot.get_observation()            # {"left": {pos,vel,eff,...}, "right": 
 robot.command({"left": q_l, "right": q_r})        # wrapper/replay: direct follower target
 robot.set_policy_action({"left": q_l, "right": q_r})  # dagger: policy target
 robot.set_intervention(True)             # dagger: external gate override
+robot.return_to_dagger_pose()            # dagger: configured recovery pose -> human control
 robot.set_estop(True)                    # network e-stop: hold, ignore all commands
 ```
 
 **Safety:**
 - `set_estop(True)` makes every controller stop commanding the followers (they hold
   their last pose) until released; the snapshot carries `estop`.
-- Every commanded target is clamped to `control_config.FOLLOWER_JOINT_LIMITS`
-  (optional per-joint `[lo, hi]`).
+- The robot command layer clips arm targets to its runtime XML-derived limits and
+  gripper targets to calibrated endpoints. `control.follower_joint_limits` adds
+  optional stricter per-joint `[lo, hi]` bounds; DAgger recovery targets are
+  pre-clamped to the intersection so their completion state remains reachable.
 - **Link-loss watchdog:** dagger/wrapper followers hold if no fresh
   `set_policy_action`/`command` arrives within `command_timeout` (default 0.5 s) —
   so a workstation crash or network drop can't leave a stale target driving the arm.
@@ -84,6 +87,8 @@ robot.set_estop(True)                    # network e-stop: hold, ignore all comm
 | `teleop_state` | `HOMING`/`IDLE`/`ENGAGED` (teleop) — the episode gate signal |
 | `active` | True iff ENGAGED (teleop) |
 | `intervention` | gate state (dagger) |
+| `returning` | moving to the configured DAgger recovery pose before intervention |
+| `dagger_return_configured` / `dagger_return_mode` | recovery-pose availability and selected mode |
 | `<side>.pos/vel/eff` | follower full state (len `num_dofs`, trailing gripper) |
 | `<side>.leader_pos` | leader joints (teleop/dagger) |
 | `<side>.applied` | the rate-limited command actually sent (the action) |

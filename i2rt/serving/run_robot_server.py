@@ -195,6 +195,9 @@ def main() -> None:
                 home_speed=args.home_speed,
                 rate=args.rate,
                 max_joint_speed=args.max_joint_speed,
+                return_mode=str(cc.DAGGER_RETURN_MODE or ""),
+                return_rel_pos=list(cc.DAGGER_RETURN_REL_POS or []),
+                return_abs_pos=list(cc.DAGGER_RETURN_ABS_POS or []),
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
                 else DaggerConfig().button_map,

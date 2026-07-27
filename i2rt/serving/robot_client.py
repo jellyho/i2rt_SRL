@@ -42,6 +42,9 @@ class RobotClient:
     def finish_dagger_run(self, action: str) -> None:
         self._client.finish_dagger_run(str(action))
 
+    def return_to_dagger_pose(self) -> None:
+        self._client.return_to_dagger_pose()
+
     def set_sim_engage(self, flag: bool) -> None:
         self._client.set_sim_engage(bool(flag))
 

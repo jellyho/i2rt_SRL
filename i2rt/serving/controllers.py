@@ -59,6 +59,51 @@ def _build_kin(robots: Dict[str, Any]) -> Dict[str, ArmKinematics]:
     return {side: ArmKinematics(robot) for side, robot in robots.items()}
 
 
+def _effective_command_limits(robot: Any, configured: Optional[list]) -> list:
+    """Intersect runtime robot limits with optional config-space limits.
+
+    Arm limits come from ``Robot.get_robot_info()`` (the XML-derived limits the
+    motor/sim command path actually enforces). A follower gripper is commanded in
+    normalized coordinates, so its command-space limit is always ``[0, 1]`` even
+    though the calibrated motor endpoints are stored in physical radians.
+    """
+    n = int(robot.num_dofs())
+    native: list[Optional[tuple[float, float]]] = [None] * n
+    try:
+        info = robot.get_robot_info() or {}
+        raw = np.asarray(info.get("joint_limits"), dtype=float)
+        if raw.ndim == 2 and raw.shape[1] == 2:
+            for idx, (lo, hi) in enumerate(raw[:n]):
+                native[idx] = (float(lo), float(hi))
+        gripper_index = info.get("gripper_index")
+        if gripper_index is not None and 0 <= int(gripper_index) < n:
+            native[int(gripper_index)] = (0.0, 1.0)
+    except Exception:
+        pass
+
+    effective: list[Optional[tuple[float, float]]] = []
+    for idx in range(n):
+        bounds = []
+        if native[idx] is not None:
+            bounds.append(native[idx])
+        if configured is not None and idx < len(configured) and configured[idx] is not None:
+            lohi = configured[idx]
+            if len(lohi) != 2:
+                raise ValueError(f"follower_joint_limits[{idx}] must be [lower, upper] or null")
+            bounds.append((float(lohi[0]), float(lohi[1])))
+        if not bounds:
+            effective.append(None)
+            continue
+        lo = max(pair[0] for pair in bounds)
+        hi = min(pair[1] for pair in bounds)
+        if lo > hi:
+            raise ValueError(
+                f"follower_joint_limits[{idx}] does not overlap the robot's native command limits"
+            )
+        effective.append((lo, hi))
+    return effective
+
+
 def _arm_grav_defaults(arm_type: str) -> Optional[Dict[str, np.ndarray]]:
     """The arm-type's ORIGINAL grav-comp terms (yam.yml), before any leader_* override."""
     try:
@@ -223,6 +268,7 @@ class BaseController:
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
     def finish_dagger_run(self, action: str) -> None: ...
+    def return_to_dagger_pose(self) -> None: ...
     def command(self, data: Dict) -> None: ...
     def set_sim_engage(self, flag: bool) -> None: ...
     def close(self) -> None: ...
@@ -711,6 +757,9 @@ class DaggerConfig:
     rate: float = 120.0
     max_joint_speed: float = 1.5
     command_timeout: float = 0.5  # s; stale policy actions (link loss) are ignored -> hold
+    return_mode: str = ""
+    return_rel_pos: list[float] = field(default_factory=list)
+    return_abs_pos: list[float] = field(default_factory=list)
     arm_type: str = "yam"
     leader_gripper: str = "yam_teaching_handle"
     follower_gripper: str = "linear_4310"
@@ -750,6 +799,13 @@ class DaggerController(BaseController):
         self._intervening = False
         self._policy_running = False
         self._homing = False
+        self._returning = False
+        # Portal callbacks only latch the request. The control-loop thread reads
+        # robot positions and constructs the target, avoiding a transport/control
+        # race at the exact moment Return is pressed.
+        self._return_lock = threading.RLock()
+        self._return_requested = False
+        self._return_target: Dict[str, np.ndarray] = {}
         self._btn_prev: Dict[str, list] = {}
         self._button_map: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in cfg.button_map.items()}
         self._event_seq = 0
@@ -763,6 +819,12 @@ class DaggerController(BaseController):
         self._mirror_kd = self._grav_orig["kd"] if self._grav_orig is not None else None
         self._kin = _build_kin({s: p.follower for s, p in self.pairs.items()})
         self._smooth = {s: TargetSmoother(p.follower.get_joint_pos(), self._run_step) for s, p in self.pairs.items()}
+        self._return_limits = {
+            side: _effective_command_limits(pair.follower, cc.FOLLOWER_JOINT_LIMITS)
+            for side, pair in self.pairs.items()
+        }
+        self._return_mode, self._return_values = self._parse_return_config(cfg)
+        self._return_configured = self._return_values is not None
         first = next(iter(self.pairs.values())).follower
         n = int(first.num_dofs())
         self._has_grip = "gripper_pos" in first.get_observations()
@@ -786,6 +848,7 @@ class DaggerController(BaseController):
             for s, p in self.pairs.items()
         }
         self._home_d0 = {s: 0.0 for s in self.pairs}
+        self._return_d0 = {s: 0.0 for s in self.pairs}
 
         self._lock = threading.Lock()
         self._snap: Dict = {
@@ -797,17 +860,22 @@ class DaggerController(BaseController):
             "recenter_fault": False,
             "policy_running": False,
             "homing": False,
+            "returning": False,
+            "dagger_return_configured": self._return_configured,
+            "dagger_return_mode": self._return_mode or None,
             "dagger_state": "stopped",
             "last_dagger_event": None,
         }
         self._metadata = {"mode": self.mode, "sides": list(self.pairs), "has_gripper": self._has_grip}
         logger.info(
-            "DaggerController up: sides=%s home_arm=%s mirror_kp=%s feedback_kp=%s max_joint_speed=%s sim=%s",
+            "DaggerController up: sides=%s home_arm=%s mirror_kp=%s feedback_kp=%s "
+            "max_joint_speed=%s return_mode=%s sim=%s",
             list(self.pairs),
             np.round(self.home_arm, 2).tolist(),
             cfg.mirror_kp,
             cfg.feedback_kp,
             cfg.max_joint_speed,
+            self._return_mode or "disabled",
             cfg.sim,
         )
 
@@ -821,6 +889,41 @@ class DaggerController(BaseController):
         if len(vals) == n_arm + 1:
             return np.asarray(vals[:n_arm]), float(vals[n_arm])
         raise ValueError(f"home expects {n_arm} or {n_arm + 1} values, got {len(vals)}")
+
+    def _parse_return_config(self, cfg: DaggerConfig) -> "tuple[str, Optional[np.ndarray]]":
+        """Validate the selected 14-DoF-style recovery vector at robot startup."""
+        mode = str(cfg.return_mode or "").strip().lower()
+        raw = {
+            "relative": cfg.return_rel_pos,
+            "absolute": cfg.return_abs_pos,
+        }
+        parsed: Dict[str, Optional[np.ndarray]] = {}
+        total_dofs = sum(int(pair.follower.num_dofs()) for pair in self.pairs.values())
+        for name, values in raw.items():
+            arr = np.asarray(values if values is not None else [], dtype=float).reshape(-1)
+            if not arr.size:
+                parsed[name] = None
+                continue
+            if arr.size != total_dofs:
+                raise ValueError(
+                    f"dagger_return_{'rel' if name == 'relative' else 'abs'}_pos expects "
+                    f"{total_dofs} values (left then right), got {arr.size}"
+                )
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"dagger_return_{name[:3]}_pos must contain only finite numbers")
+            parsed[name] = arr
+
+        if not mode:
+            if any(value is not None for value in parsed.values()):
+                raise ValueError("dagger_return_mode is required when a DAgger return position is configured")
+            return "", None
+        if mode not in raw:
+            raise ValueError("dagger_return_mode must be 'relative' or 'absolute'")
+        selected = parsed[mode]
+        if selected is None:
+            key = "dagger_return_rel_pos" if mode == "relative" else "dagger_return_abs_pos"
+            raise ValueError(f"{key} is required when dagger_return_mode is {mode!r}")
+        return mode, selected
 
     @staticmethod
     def _ease_vel_scale(p: float) -> float:
@@ -839,7 +942,7 @@ class DaggerController(BaseController):
         self._touch_cmd()
 
     def set_intervention(self, flag: bool) -> None:
-        if self._homing:
+        if self._homing or self._returning:
             return
         flag = bool(flag)
         if flag == self._intervening:
@@ -857,6 +960,11 @@ class DaggerController(BaseController):
         if self._homing:
             return
         flag = bool(flag)
+        if self._returning:
+            if not flag:
+                self._cancel_return()
+                self._policy_running = False
+            return
         if flag and not self._policy_running and not self._intervening:
             for side, pair in self.pairs.items():
                 self._leader_smooth[side].reset(
@@ -875,12 +983,117 @@ class DaggerController(BaseController):
         self._last_event = {"seq": self._event_seq, "action": action}
         self._policy_running = False
         self._intervening = False
+        self._cancel_return()
         self._reset_fine_grained()
         self._homing = True
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
             self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
             self._home_d0[side] = max(float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6)
+
+    def return_to_dagger_pose(self) -> None:
+        """Latch a configured recovery-pose request for the control-loop thread."""
+        with self._return_lock:
+            if self._return_configured and not self._returning:
+                self._return_requested = True
+
+    def set_estop(self, flag: bool) -> None:
+        super().set_estop(flag)
+        if flag:
+            self._cancel_return()
+            self._invalidate_policy_action()
+
+    def _cancel_return(self) -> None:
+        with self._return_lock:
+            self._return_requested = False
+            self._returning = False
+            self._return_target.clear()
+
+    def _invalidate_policy_action(self) -> None:
+        for side in self._policy_action:
+            self._policy_action[side] = None
+        self._last_cmd_t = -1e9
+
+    def _consume_return_request(self) -> None:
+        with self._return_lock:
+            if not self._return_requested:
+                return
+            self._return_requested = False
+            blocked = (
+                not self._return_configured
+                or self._returning
+                or self._homing
+                or self._intervening
+                or self._leader_recentering
+                or self._estop
+                or not self._policy_running
+            )
+            if blocked:
+                logger.warning("DAgger return request ignored: unavailable in the current state")
+                return
+
+            assert self._return_values is not None
+            offset = 0
+            targets: Dict[str, np.ndarray] = {}
+            for side, pair in self.pairs.items():
+                current = np.asarray(pair.follower.get_joint_pos(), dtype=float).reshape(-1)
+                configured = self._return_values[offset : offset + current.size]
+                offset += current.size
+                active = configured != 0.0
+                if self._return_mode == "relative":
+                    target = current + np.where(active, configured, 0.0)
+                else:
+                    target = np.where(active, configured, current)
+                target = clamp_limits(target, self._return_limits[side])
+                targets[side] = target
+                self._smooth[side].reset(current)
+                self._leader_smooth[side].reset(
+                    np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+                )
+                self._return_d0[side] = max(float(np.linalg.norm(current - target)), 1e-6)
+
+            self._return_target = targets
+            self._returning = True
+
+        self._intervening = False
+        self._invalidate_policy_action()
+        self._reset_fine_grained()
+        logger.info("DAgger returning to configured %s pose", self._return_mode)
+
+    def _returning_done(self) -> bool:
+        for side, pair in self.pairs.items():
+            target = self._return_target.get(side)
+            if target is None:
+                return False
+            # Do not hand control over while the rate-limited command is merely
+            # "close"; finish issuing the exact configured destination first.
+            if float(np.max(np.abs(self._smooth[side].cur - target))) > 1e-9:
+                return False
+            follower = np.asarray(pair.follower.get_joint_pos(), dtype=float).reshape(-1)
+            if follower.size != target.size or float(np.max(np.abs(follower - target))) > _HOME_TOL:
+                return False
+            if hasattr(pair.leader, "update_kp_kd") and pair.base_kp is not None:
+                m = min(int(pair.leader.num_dofs()), target.size)
+                if float(np.max(np.abs(self._leader_smooth[side].cur[:m] - target[:m]))) > 1e-9:
+                    return False
+                leader = np.asarray(pair.leader.get_joint_pos(), dtype=float)[:m]
+                if float(np.max(np.abs(leader - target[:m]))) > _LEADER_HOME_TOL:
+                    return False
+        return True
+
+    def _complete_return(self) -> None:
+        with self._return_lock:
+            self._returning = False
+            self._return_target.clear()
+        self._intervening = True
+        self._invalidate_policy_action()
+        self._reset_fine_grained()
+        for side, pair in self.pairs.items():
+            self._smooth[side].reset(pair.follower.get_joint_pos())
+            self._leader_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
+        logger.info("DAgger return complete; human intervention enabled")
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":
@@ -961,7 +1174,7 @@ class DaggerController(BaseController):
             logger.error("leader alignment timed out; follower held and leader freed")
 
     def _scan_buttons(self, buttons: Dict[str, list]) -> None:
-        if self._homing:
+        if self._homing or self._returning:
             self._btn_prev = {side: list(btns) for side, btns in buttons.items()}
             return
         for side, btns in buttons.items():
@@ -1011,6 +1224,7 @@ class DaggerController(BaseController):
             valid[side] = is_finite_vector(a, pair.leader.num_dofs())
 
         self._scan_buttons(buttons)
+        self._consume_return_request()
 
         sides_snap: Dict[str, Dict] = {}
         for side, pair in self.pairs.items():
@@ -1025,7 +1239,23 @@ class DaggerController(BaseController):
                     pair, side, held=self._intervening and not self._leader_recentering
                 )
                 desired = None
-                if self._homing:
+                if self._returning:
+                    target = self._return_target.get(side)
+                    if target is not None:
+                        d = float(np.linalg.norm(smoother.cur - target))
+                        p = min(max(1.0 - d / max(self._return_d0[side], 1e-6), 0.0), 1.0)
+                        smoother.max_step = self._leader_smooth[side].max_step = (
+                            self._home_step * self._ease_vel_scale(p)
+                        )
+                        desired = smoother.step(target)
+                        self._bounded_recenter_leader(
+                            pair,
+                            self._leader_smooth[side],
+                            target[: self.home_arm.size],
+                            self.home_kp,
+                            self.cfg.fine_recenter_max_following_error,
+                        )
+                elif self._homing:
                     d = float(np.linalg.norm(smoother.cur - self.home_full))
                     p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
                     smoother.max_step = self._leader_smooth[side].max_step = self._home_step * self._ease_vel_scale(p)
@@ -1072,9 +1302,14 @@ class DaggerController(BaseController):
                         desired = act[:n]
 
                 if desired is not None:
-                    target = desired if self._leader_recentering else smoother.step(desired)
+                    target = desired if self._leader_recentering or self._returning else smoother.step(desired)
                     applied = self._apply(pair.follower, target)
-                    if not self._intervening and self._policy_running and applied is not None:
+                    if (
+                        not self._returning
+                        and not self._intervening
+                        and self._policy_running
+                        and applied is not None
+                    ):
                         # Mirror the command sent after follower smoothing/clamping.
                         # The independent limiter prevents a PD target jump when an
                         # offset human intervention hands control back to the policy.
@@ -1102,6 +1337,9 @@ class DaggerController(BaseController):
 
         self._update_recenter_state(now)
 
+        if self._returning and self._returning_done():
+            self._complete_return()
+
         if self._homing and self._homing_done():
             self._homing = False
 
@@ -1116,6 +1354,9 @@ class DaggerController(BaseController):
                 "recenter_fault": self._recenter_fault,
                 "policy_running": bool(self._policy_running),
                 "homing": bool(self._homing),
+                "returning": bool(self._returning),
+                "dagger_return_configured": self._return_configured,
+                "dagger_return_mode": self._return_mode or None,
                 "dagger_state": dagger_state,
                 "last_dagger_event": dict(self._last_event) if self._last_event is not None else None,
                 "estop": self._estop,
@@ -1125,6 +1366,8 @@ class DaggerController(BaseController):
     def _state_name(self) -> str:
         if self._estop:
             return "estop"
+        if self._returning:
+            return "returning"
         if self._homing:
             return "homing"
         if self._intervening:

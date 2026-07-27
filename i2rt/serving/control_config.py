@@ -33,8 +33,8 @@ RAMP_SPEED: float = 0.8
 # stretched if any joint's implied peak speed would exceed RAMP_SPEED (safety
 # ceiling). 0 = legacy speed-based catch-up at RAMP_SPEED.
 ENGAGE_TIME: float = 0.0
-# Homing return speed (rad/s) — kept slower than the engage approach so the robot
-# and leaders ease back to home gently (e.g. after a leader "end episode" button).
+# Homing/recovery return speed (rad/s) — kept slower than the engage approach so
+# the robot and leaders ease to their destination gently.
 HOME_SPEED: float = 0.4
 
 # --- Engage / release gate ---------------------------------------------------
@@ -106,6 +106,13 @@ def leader_arm_overrides() -> dict:
 # leader mirrors the applied policy command (MIRROR gain).
 DAGGER_MIRROR_KP: float = 0.2  # leader stiffness while the POLICY drives (leader mirrors policy)
 DAGGER_FEEDBACK_KP: float = 0.0  # human intervention stays gravity-compensated/free
+# Optional DAgger recovery pose. Values are ordered left then right, with each
+# follower's full joint vector (six arm joints + gripper for the standard YAM).
+# A zero is a per-joint mask: preserve that joint's position when Return is
+# requested. An empty mode/pose keeps the feature disabled by default.
+DAGGER_RETURN_MODE: str = ""  # "relative" | "absolute" | "" (disabled)
+DAGGER_RETURN_REL_POS: List[float] = []
+DAGGER_RETURN_ABS_POS: List[float] = []
 
 
 # --- Wrist payload for gravity compensation (e.g. a D405 camera) -------------

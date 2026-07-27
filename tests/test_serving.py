@@ -76,6 +76,214 @@ def test_dagger_policy_intervention_and_home_states():
     dc.close()
 
 
+def test_dagger_relative_return_masks_zero_joints_and_hands_off_to_human():
+    relative = [0.0] * 14
+    relative[1] = 0.2
+    relative[8] = -0.15
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            max_joint_speed=100.0,
+            home_speed=1.0,
+            command_timeout=10.0,
+            return_mode="relative",
+            return_rel_pos=relative,
+            return_abs_pos=[0.0] * 14,
+        )
+    )
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.set_policy_action({"left": np.full(7, 0.2), "right": np.full(7, 0.3)})
+        ctrl.step()
+        before_left = np.asarray(ctrl.snapshot()["left"]["pos"], dtype=float)
+        before_right = np.asarray(ctrl.snapshot()["right"]["pos"], dtype=float)
+
+        ctrl.return_to_dagger_pose()
+        assert ctrl.snapshot()["returning"] is False  # RPC only latches the request
+        ctrl.step()
+        assert ctrl.snapshot()["dagger_state"] == "returning"
+
+        for _ in range(40):
+            ctrl.step()
+            if ctrl.snapshot()["intervention"]:
+                break
+        snap = ctrl.snapshot()
+        left = np.asarray(snap["left"]["pos"], dtype=float)
+        right = np.asarray(snap["right"]["pos"], dtype=float)
+        assert snap["returning"] is False
+        assert snap["intervention"] is True
+        assert snap["policy_running"] is True
+        assert snap["dagger_state"] == "intervention"
+        assert left[1] == pytest.approx(before_left[1] + 0.2, abs=1e-6)
+        assert right[1] == pytest.approx(before_right[1] - 0.15, abs=1e-6)
+        assert np.allclose(left[[0, 2, 3, 4, 5, 6]], before_left[[0, 2, 3, 4, 5, 6]])
+        assert np.allclose(right[[0, 2, 3, 4, 5, 6]], before_right[[0, 2, 3, 4, 5, 6]])
+    finally:
+        ctrl.close()
+
+
+def test_dagger_absolute_return_uses_zero_as_hold_mask():
+    absolute = [0.0] * 14
+    absolute[1] = 0.1
+    absolute[8] = 0.15
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            max_joint_speed=100.0,
+            home_speed=2.0,
+            command_timeout=10.0,
+            return_mode="absolute",
+            return_rel_pos=[0.0] * 14,
+            return_abs_pos=absolute,
+        )
+    )
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.set_policy_action({"left": np.full(7, 0.2), "right": np.full(7, 0.3)})
+        ctrl.step()
+        before_left = np.asarray(ctrl.snapshot()["left"]["pos"], dtype=float)
+        before_right = np.asarray(ctrl.snapshot()["right"]["pos"], dtype=float)
+        ctrl.return_to_dagger_pose()
+        for _ in range(40):
+            ctrl.step()
+            if ctrl.snapshot()["intervention"]:
+                break
+
+        snap = ctrl.snapshot()
+        left = np.asarray(snap["left"]["pos"], dtype=float)
+        right = np.asarray(snap["right"]["pos"], dtype=float)
+        assert left[1] == pytest.approx(0.1, abs=1e-6)
+        assert right[1] == pytest.approx(0.15, abs=1e-6)
+        assert left[0] == pytest.approx(before_left[0])
+        assert right[0] == pytest.approx(before_right[0])
+        assert snap["intervention"] is True
+    finally:
+        ctrl.close()
+
+
+def test_dagger_estop_cancels_return_and_invalidates_policy_target():
+    relative = [0.0] * 14
+    relative[1] = 0.5
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            home_speed=0.2,
+            command_timeout=10.0,
+            return_mode="relative",
+            return_rel_pos=relative,
+        )
+    )
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+        ctrl.step()
+        ctrl.return_to_dagger_pose()
+        ctrl.step()
+        assert ctrl.snapshot()["returning"] is True
+
+        ctrl.set_estop(True)
+        ctrl.step()
+        snap = ctrl.snapshot()
+        assert snap["estop"] is True
+        assert snap["returning"] is False
+        assert snap["intervention"] is False
+
+        ctrl.set_estop(False)
+        ctrl.step()
+        snap = ctrl.snapshot()
+        assert snap["returning"] is False
+        assert snap["left"]["applied"] is None
+    finally:
+        ctrl.close()
+
+
+def test_dagger_return_target_is_clamped_to_native_arm_and_gripper_limits(monkeypatch):
+    from i2rt.serving import control_config as cc
+
+    monkeypatch.setattr(cc, "FOLLOWER_JOINT_LIMITS", None)
+    absolute = [0.0] * 14
+    absolute[3] = 99.0
+    absolute[6] = 2.0
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            home_speed=0.2,
+            command_timeout=10.0,
+            return_mode="absolute",
+            return_abs_pos=absolute,
+        )
+    )
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+        ctrl.step()
+        native = np.asarray(ctrl.pairs["left"].follower.get_robot_info()["joint_limits"])
+        ctrl.return_to_dagger_pose()
+        ctrl.step()
+
+        target = ctrl._return_target["left"]
+        assert target[3] == pytest.approx(native[3, 1])
+        assert target[6] == pytest.approx(1.0)
+    finally:
+        ctrl.close()
+
+
+def test_dagger_return_target_uses_narrower_config_limits(monkeypatch):
+    from i2rt.serving import control_config as cc
+
+    configured = [None, None, None, (-1.0, 1.0), None, None, (0.2, 0.8)]
+    monkeypatch.setattr(cc, "FOLLOWER_JOINT_LIMITS", configured)
+    absolute = [0.0] * 14
+    absolute[3] = 99.0
+    absolute[6] = 2.0
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            home_speed=0.2,
+            command_timeout=10.0,
+            return_mode="absolute",
+            return_abs_pos=absolute,
+        )
+    )
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+        ctrl.step()
+        ctrl.return_to_dagger_pose()
+        ctrl.step()
+
+        target = ctrl._return_target["left"]
+        assert target[3] == pytest.approx(1.0)
+        assert target[6] == pytest.approx(0.8)
+    finally:
+        ctrl.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "relative", "absolute", "message"),
+    [
+        ("cartesian", [0.0] * 14, [0.0] * 14, "relative.*absolute"),
+        ("relative", [0.0] * 13, [0.0] * 14, "expects 14 values"),
+        ("absolute", [0.0] * 14, [], "required"),
+    ],
+)
+def test_dagger_return_config_fails_fast(mode, relative, absolute, message):
+    with pytest.raises(ValueError, match=message):
+        DaggerController(
+            DaggerConfig(
+                sim=True,
+                return_mode=mode,
+                return_rel_pos=relative,
+                return_abs_pos=absolute,
+            )
+        )
+
+
 def test_dagger_button_map_toggles_rollout(monkeypatch):
     ctrl = DaggerController(
         DaggerConfig(sim=True, button_map={"left.0": "rollout_toggle", "left.1": "intervention_toggle"})

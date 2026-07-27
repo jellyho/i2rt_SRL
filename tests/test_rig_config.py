@@ -89,6 +89,27 @@ def test_apply_fine_grained_control_overrides(monkeypatch):
     assert "FINE_GRAINED_SCALE" in applied
 
 
+def test_apply_dagger_return_overrides(monkeypatch):
+    monkeypatch.setattr(cc, "DAGGER_RETURN_MODE", "", raising=False)
+    monkeypatch.setattr(cc, "DAGGER_RETURN_REL_POS", [], raising=False)
+    monkeypatch.setattr(cc, "DAGGER_RETURN_ABS_POS", [], raising=False)
+    relative = [0.0] * 14
+    relative[2] = 0.15
+    applied = apply_control_overrides(
+        {
+            "control": {
+                "dagger_return_mode": "relative",
+                "dagger_return_rel_pos": relative,
+                "dagger_return_abs_pos": [0.0] * 14,
+            }
+        }
+    )
+    assert cc.DAGGER_RETURN_MODE == "relative"
+    assert cc.DAGGER_RETURN_REL_POS == relative
+    assert len(cc.DAGGER_RETURN_ABS_POS) == 14
+    assert applied["DAGGER_RETURN_MODE"] == "relative"
+
+
 def test_teleop_button_outcomes_are_shared_and_validated():
     assert teleop_button_outcomes({}) == cc.DEFAULT_TELEOP_BUTTON_OUTCOMES
     assert teleop_button_outcomes({"recorder": {"buttons": {"LEFT.2": "SUCCESS"}}}) == {
