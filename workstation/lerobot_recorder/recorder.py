@@ -78,6 +78,7 @@ class Recorder:
             "returning": False,
             "dagger_return_configured": False,
             "dagger_return_mode": None,
+            "joint_pos": None,
             "estop": False,
         }
         self._last_images: dict = {}
@@ -468,6 +469,7 @@ class Recorder:
             "returning": bool(snap.get("returning")),
             "dagger_return_configured": bool(snap.get("dagger_return_configured")),
             "dagger_return_mode": snap.get("dagger_return_mode"),
+            "joint_pos": snap.get("joint_pos"),
             "estop": bool(snap.get("estop")),
         }
 

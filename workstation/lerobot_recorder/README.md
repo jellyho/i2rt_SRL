@@ -276,6 +276,9 @@ absolute nonzero values replace the corresponding joints. The order per arm is
 six arm joints followed by the gripper. Targets are clamped to the intersection
 of the robot's runtime arm/gripper limits and any narrower
 `control.follower_joint_limits` configured by the operator.
+The deploy UI continuously shows the current follower positions in the same
+left-7-then-right-7 order, with a copy button for pasting into
+`dagger_return_abs_pos`.
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
 normal DAgger collection, use `deploy` so the policy bridge, recorder, live stats,

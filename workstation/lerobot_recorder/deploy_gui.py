@@ -6,6 +6,8 @@ for deployment / DAgger collection.
 
 from __future__ import annotations
 
+import math
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
@@ -56,6 +58,17 @@ class DeployGUI(RecorderGUI):
         self.discard_home_btn.clicked.connect(lambda: self._on_finish("discard"))
         self.runner_status = QtWidgets.QLabel("policy: not connected")
         self.runner_status.setStyleSheet(f"color:{theme.MUTED};")
+        self.joint_pos = QtWidgets.QLineEdit()
+        self.joint_pos.setReadOnly(True)
+        self.joint_pos.setPlaceholderText("waiting for robot joint state…")
+        self.joint_pos.setStyleSheet("font-family:monospace;")
+        self.joint_pos.setToolTip(
+            "Current follower positions: left 7 values, then right 7. "
+            "Paste this array into control.dagger_return_abs_pos."
+        )
+        self.copy_joint_pos_btn = QtWidgets.QPushButton("Copy joint array")
+        self.copy_joint_pos_btn.setEnabled(False)
+        self.copy_joint_pos_btn.clicked.connect(self._copy_joint_positions)
         self.button_legend = QtWidgets.QLabel(
             "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during intervention; "
             "left lower = human intervention on/off, "
@@ -73,8 +86,11 @@ class DeployGUI(RecorderGUI):
         grid.addWidget(self.return_btn, 1, 2)
         grid.addWidget(self.keep_home_btn, 1, 3)
         grid.addWidget(self.discard_home_btn, 1, 4)
-        grid.addWidget(self.button_legend, 2, 0, 1, 5)
-        grid.addWidget(self.runner_status, 3, 0, 1, 5)
+        grid.addWidget(QtWidgets.QLabel("Current follower joints — left 7, then right 7:"), 2, 0, 1, 5)
+        grid.addWidget(self.joint_pos, 3, 0, 1, 4)
+        grid.addWidget(self.copy_joint_pos_btn, 3, 4)
+        grid.addWidget(self.button_legend, 4, 0, 1, 5)
+        grid.addWidget(self.runner_status, 5, 0, 1, 5)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):
@@ -108,6 +124,22 @@ class DeployGUI(RecorderGUI):
     def _on_return_to_pose(self) -> None:
         if self.recorder is not None:
             self.recorder.return_to_dagger_pose()
+
+    @staticmethod
+    def _format_joint_positions(values: object) -> str | None:
+        if values is None:
+            return None
+        try:
+            joints = [float(value) for value in values]
+        except (TypeError, ValueError):
+            return None
+        if len(joints) != 14 or not all(math.isfinite(value) for value in joints):
+            return None
+        return "[" + ", ".join(f"{value:.6f}" for value in joints) + "]"
+
+    def _copy_joint_positions(self) -> None:
+        if self.joint_pos.text():
+            QtWidgets.QApplication.clipboard().setText(self.joint_pos.text())
 
     def _on_return_shortcut(self) -> None:
         focus = QtWidgets.QApplication.focusWidget()
@@ -189,6 +221,9 @@ class DeployGUI(RecorderGUI):
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
         self.return_btn.setText(f"Return ({return_mode}) + Human  [R]")
         self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")
+        joint_text = self._format_joint_positions(st.get("joint_pos"))
+        self.joint_pos.setText(joint_text or "")
+        self.copy_joint_pos_btn.setEnabled(joint_text is not None)
         for btn in (self.policy_btn, self.intervention_btn, self.keep_home_btn, self.discard_home_btn):
             btn.setEnabled(not blocked)
         self.return_btn.setEnabled(not blocked and return_configured and running and not intervention)

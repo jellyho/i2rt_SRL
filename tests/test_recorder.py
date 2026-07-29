@@ -293,6 +293,7 @@ def test_dagger_source_assembly():
     }
     snap = bridge._assemble(intervening)
     assert snap["teleop_state"] == "ENGAGED"
+    assert snap["joint_pos"].shape == (14,)
     assert snap["action"] is not None and snap["action"].shape == (14,)
     assert np.allclose(snap["action"], np.concatenate([human_l, human_r]))
 
@@ -305,7 +306,8 @@ def test_dagger_source_assembly():
 def test_dagger_snapshot_carries_state_and_event():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     bridge = PortalBridge(cfg)
-    pose = {"pos": [0.0] * 7, "vel": [0.0] * 7, "eff": [0.0] * 7}
+    left_pose = {"pos": list(range(7)), "vel": [0.0] * 7, "eff": [0.0] * 7}
+    right_pose = {"pos": list(range(7, 14)), "vel": [0.0] * 7, "eff": [0.0] * 7}
     snap = bridge._assemble(
         {
             "intervention": False,
@@ -319,8 +321,8 @@ def test_dagger_snapshot_carries_state_and_event():
             "fine_grained": True,
             "leader_recentering": True,
             "recenter_fault": False,
-            "left": pose,
-            "right": pose,
+            "left": left_pose,
+            "right": right_pose,
             "t": 2.0,
         }
     )
@@ -333,6 +335,7 @@ def test_dagger_snapshot_carries_state_and_event():
     assert snap["returning"] is True
     assert snap["dagger_return_configured"] is True
     assert snap["dagger_return_mode"] == "absolute"
+    assert snap["joint_pos"].tolist() == list(range(14))
 
 
 def test_dagger_recorder_events_do_not_use_expert_button_map():

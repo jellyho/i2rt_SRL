@@ -29,6 +29,7 @@ _EMPTY = {
     "teleop_state": "IDLE",
     "control_mode": CONTROL_MODE["teleop"],
     "state": None,
+    "joint_pos": None,
     "leader": None,
     "eef": None,
     "action": None,
@@ -232,6 +233,7 @@ class PortalBridge:
     def _assemble(self, obs: Dict) -> dict:
         sides = [obs.get(a) for a in ARMS]
         state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
+        joint_pos = self._fuse(sides, ("pos",), ARM_DOF)
         leader = self._fuse(sides, ("leader_pos",))  # variable per-arm dof; saved when present
         eef = self._fuse(sides, ("eef",))  # follower end-effector pose (FK), when the robot provides it
         intervening = bool(obs.get("intervention"))
@@ -258,6 +260,7 @@ class PortalBridge:
             "teleop_state": teleop_state,
             "control_mode": int(control_mode),
             "state": state,
+            "joint_pos": joint_pos,
             "leader": leader,
             "eef": eef,
             "action": action,
@@ -303,6 +306,7 @@ class PortalBridge:
                     "teleop_state": name,
                     "control_mode": CONTROL_MODE["teleop"],
                     "state": state,
+                    "joint_pos": action.copy(),
                     "leader": leader,
                     "action": action,
                     "policy_running": bool(self._policy_running_req),
