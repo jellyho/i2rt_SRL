@@ -12,7 +12,7 @@ import argparse
 import sys
 from typing import List, Optional
 
-from i2rt.serving.rig_config import Resolver, apply_camera_serials, load_rig
+from i2rt.serving.rig_config import Resolver, apply_camera_serials, load_rig, teleop_button_outcomes
 from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
 
 
@@ -93,9 +93,7 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
         review_before_save=review_before_save,
         auto_arm=auto_arm,
     )
-    buttons = rec_section.get("buttons")  # leader button -> outcome (keeps the built-in default if unset)
-    if buttons:
-        cfg.button_map = {str(k): str(v) for k, v in buttons.items()}
+    cfg.button_map = teleop_button_outcomes(rig)
     # output format: "lerobot" (default) or "abcdl" (abcdl MP4+binary training cache)
     cfg.record_format = str(rec_section.get("format", rec_section.get("record_format", cfg.record_format)))
     cfg.abcdl_size = int(rec_section.get("abcdl_size", cfg.abcdl_size))

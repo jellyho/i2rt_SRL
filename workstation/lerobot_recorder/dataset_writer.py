@@ -159,6 +159,9 @@ class AsyncDatasetWriter:
         self._saving_index: Optional[int] = None  # episode index currently being saved
         self._saving_frames = 0  # frame count of the episode currently being saved
         self._finalized = False
+        self._failed = False
+        self._last_error = ""
+        self._failed_episodes = 0
         self._finalize_lock = threading.Lock()
         self.low_disk = False  # set when an episode was refused for lack of free space
 
@@ -382,8 +385,31 @@ class AsyncDatasetWriter:
             self._worker.start()
             return
         if not self._mock:
-            LeRobotDataset = _import_lerobot_dataset()
-            if self.cfg.resume and os.path.isdir(self._root):
+            resume_local = self.cfg.resume and os.path.isdir(self._root)
+            if resume_local:
+                info_path = os.path.join(self._root, "meta", "info.json")
+                if not os.path.isfile(info_path):
+                    raise RuntimeError(
+                        f"Cannot continue local dataset at {self._root}: "
+                        "meta/info.json is missing. Uncheck 'Continue collecting' "
+                        "and confirm overwrite to create it again."
+                    )
+                try:
+                    with open(info_path) as fh:
+                        local_info = json.load(fh)
+                    empty_local = (
+                        int(local_info.get("total_episodes", 0)) == 0
+                        and int(local_info.get("total_frames", 0)) == 0
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"Cannot read local dataset metadata at {info_path}: {exc}") from exc
+                if empty_local:
+                    logger.warning("recreating empty local dataset at %s", self._root)
+                    shutil.rmtree(self._root)
+                    resume_local = False
+
+            if resume_local:
+                LeRobotDataset = _import_lerobot_dataset()
                 enc = self._dataset_encoding_kwargs()
                 try:
                     self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root, **enc)
@@ -393,12 +419,27 @@ class AsyncDatasetWriter:
                 self._n_episodes = int(
                     getattr(self._ds, "num_episodes", getattr(getattr(self._ds, "meta", None), "total_episodes", 0))
                 )
+                self._cleanup_interrupted_image_dirs(self._n_episodes)
+                writer = getattr(self._ds, "writer", None)
+                if writer is not None and hasattr(writer, "cleanup_interrupted_episode"):
+                    writer.cleanup_interrupted_episode(self._n_episodes)
+                elif hasattr(self._ds, "clear_episode_buffer"):
+                    # LeRobot releases before DatasetWriter stored the in-progress
+                    # buffer directly on LeRobotDataset.  A failed encode can leave
+                    # PNGs for the next episode index behind; remove them before new
+                    # frames reuse that same index.
+                    if getattr(self._ds, "episode_buffer", None) is None and hasattr(
+                        self._ds, "create_episode_buffer"
+                    ):
+                        self._ds.episode_buffer = self._ds.create_episode_buffer()
+                    self._ds.clear_episode_buffer(delete_images=True)
                 self._ensure_outcome_sidecar_complete()
                 logger.info(
                     "dataset resuming at %s (%d existing episodes, vcodec=%s, batch=%s)",
                     self._root, self._n_episodes, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
             else:
+                LeRobotDataset = _import_lerobot_dataset()
                 enc = self._create_encoding_kwargs()
                 try:
                     self._ds = LeRobotDataset.create(
@@ -434,6 +475,32 @@ class AsyncDatasetWriter:
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
+    def _cleanup_interrupted_image_dirs(self, episode_index: int) -> None:
+        """Remove temp PNG directories for the next, not-yet-committed episode.
+
+        Some LeRobot releases report video-backed cameras only in ``video_keys``
+        while their interrupted-episode cleanup iterates ``image_keys``.  Address
+        the on-disk scratch paths directly so stale frames cannot be mixed into a
+        resumed episode with the same index.
+        """
+        removed = 0
+        for image_key in self.image_keys:
+            image_dir = os.path.join(
+                self._root,
+                "images",
+                f"observation.images.{image_key}",
+                f"episode-{int(episode_index):06d}",
+            )
+            if os.path.isdir(image_dir):
+                shutil.rmtree(image_dir)
+                removed += 1
+        if removed:
+            logger.warning(
+                "removed stale scratch images for uncommitted episode #%d (%d camera directories)",
+                episode_index,
+                removed,
+            )
+
     def _read_outcome_totals(self) -> Dict[str, int]:
         """Whole-dataset success/fail counts from the outcome sidecar (best-effort)."""
         totals = {"success": 0, "fail": 0}
@@ -464,6 +531,8 @@ class AsyncDatasetWriter:
     # ------------------------------------------------------------------ submit
     def submit(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
         """Enqueue a complete episode (list of frame dicts) for background saving."""
+        if self._failed:
+            raise RuntimeError(f"dataset writer stopped after a save failure: {self._last_error}")
         if self._finalized:
             raise RuntimeError("dataset writer has already been finalized")
         if frames:
@@ -502,6 +571,9 @@ class AsyncDatasetWriter:
                 "saving_frames": self._saving_frames,
                 "queued": self._queue.qsize(),
                 "finalized": self._finalized,
+                "failed": self._failed,
+                "last_error": self._last_error,
+                "failed_episodes": self._failed_episodes,
             }
 
     @property
@@ -547,12 +619,40 @@ class AsyncDatasetWriter:
                 self._save_episode(frames, outcome, task)
             except Exception as e:
                 logger.error("episode save failed: %s", e)
+                self._recover_failed_episode_buffer()
+                with self._lock:
+                    self._failed = True
+                    self._last_error = f"{type(e).__name__}: {e}"
+                    self._failed_episodes += 1
+                self._discard_queued_after_failure()
+                return
             finally:
                 with self._lock:
                     self._saving = False
                     self._saving_index = None
                     self._saving_frames = 0
                 self._queue.task_done()
+
+    def _recover_failed_episode_buffer(self) -> None:
+        """Reset LeRobot's mutated buffer so finalize cannot raise a secondary error."""
+        if self._mock or self._abcdl or self._ds is None:
+            return
+        try:
+            self._ds.clear_episode_buffer(delete_images=True)
+        except Exception as e:
+            logger.error("could not clean failed episode buffer: %s", e)
+
+    def _discard_queued_after_failure(self) -> None:
+        discarded = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+            self._queue.task_done()
+            discarded += 1
+        if discarded:
+            logger.error("discarded %d queued episode(s) after writer failure", discarded)
 
     def _save_episode(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
         free = self._free_gb()

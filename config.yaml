@@ -23,6 +23,15 @@ policy:
 
 control:                     # overrides i2rt/serving/control_config (robot server)
   bilateral_kp: 0.0
+  dagger_feedback_kp: 0.0    # human teleop/intervention stays gravity-compensated/free
+  fine_grained_scale: 0.4    # left.0 toggle: move leader 2.5x for 1x follower motion
+  fine_grained_button: left.0
+  fine_recenter_speed: 0.15  # rad/s leader target speed while leaving fine mode
+  fine_recenter_kp: 1.0      # fraction of base leader Kp used during alignment
+  fine_recenter_max_following_error: 0.05  # rad; bounds physical leader-to-setpoint error
+  fine_recenter_tolerance: 0.1  # rad max joint error required for completion
+  fine_recenter_dwell: 0.2    # seconds alignment must remain inside tolerance
+  fine_recenter_timeout: 30.0 # seconds before holding follower and freeing leader
   ramp_speed: 0.6            # one-time engage approach speed (rad/s)
   engage_time: 2.0         # fixed engage catch-up (s): follower meets the live leader in
   #                          # exactly this time (auto-stretched if a joint would exceed
@@ -39,18 +48,51 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # intervention (dagger_feedback_kp: 0 -> fully free intervention). Every other
   # phase (homing, idle/before engage, policy mirroring) uses yam.yml originals.
   # leader_grav_comp_kd: [0.05, 0.05, 0.05, 0.15, 0.025, 0.025]
-  leader_grav_comp_kd: [0.000, 0.000, 0.000, 0.000, 0.0000, 0.0000]      # viscous drag; lower = lighter in motion
-  leader_coulomb_friction: [0.55, 0.65, 0.7, 0.08, 0.08, 0.08] # friction feedforward, Nm; higher = less sticky, too high buzzes
+  leader_grav_comp_kd: [0.05, 0, 0.05, 0.15, 0.025, 0.025]
+  leader_coulomb_friction: [0.55, 0.4, 0.9, 0.08, 0.08, 0.08]
   # leader_gravity_comp_factor: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # >1 floats the arm up
   # leader_gravity_comp_factor: [1.0, 1.1, 1.1, 1.2, 1.0, 1.0] # >1 floats the arm up
   # follower_effort_limit: 30.0          # Nm; collision/overload soft-stop (omit = off)
   # follower_joint_limits: [[-3.0, 3.0], [-2.0, 2.0]]   # per-joint clamp [lo, hi]
 
-cameras:                     # RealSense serials by role (run `yam-data cams` to list)
-  agentview: "246322303794"              # D455
-  wrist_left: "352122271652"             # D405
-  wrist_right: "409122274199"           # D405
 
+cameras:                     # RealSense serials by role (run `yam-data cams` to list)
+  # Either `key: "<serial>"`, or a map with `serial:` plus optional `options:`
+  # (rs.option name -> value) applied to the color sensor on open and reconnect.
+  # Exposure is LOCKED on every camera (auto-exposure drifts mid-episode and makes
+  # the same scene look different from frame to frame). Values are tuned so all three
+  # land near luma ~160 with no clipped highlights — retune with `yam-data tune`.
+  #
+  # NOTE: exposure numbers are NOT comparable across models. The D455 has a real RGB
+  # sensor counting in 100us steps (1..10000); the D405 has none, so its color comes
+  # off the Stereo Module counting in 1us steps (1..165000). Hence 120 vs 16000 below
+  # are both ~12-16 ms. Gain ranges differ too: 0..128 (D455 RGB) vs 16..248 (stereo).
+  agentview:  # D455
+    serial: "246322303794"
+    options:
+      enable_auto_exposure: 0
+      exposure: 115
+      gain: 64
+      enable_auto_white_balance: 0
+      white_balance: 4600
+  # Both wrists are D405s, so they share ONE identical block (same units, same ranges).
+  # Keep these two in sync — if you change one, change the other.
+  wrist_left:  # D405
+    serial: "352122271652"
+    options:
+      enable_auto_exposure: 0
+      exposure: 16389
+      gain: 16
+      enable_auto_white_balance: 0
+      white_balance: 4600
+  wrist_right:  # D405
+    serial: "409122274199"
+    options:
+      enable_auto_exposure: 0
+      exposure: 16389
+      gain: 16
+      enable_auto_white_balance: 0
+      white_balance: 4600
 recorder:
   repo_id: jellyho/close_bottle_cap
   root: ~/lerobot_data
@@ -82,11 +124,12 @@ recorder:
                              # LeRobot advises ~4 per camera. 0 = synchronous (slowest)
   image_writer_processes: 0  # >0 = also use subprocesses if threads alone aren't enough
   # use_videos: true         # false = store raw frames (no encode; fastest save, larger on disk)
-  buttons:                   # leader handle button -> episode outcome ("<side>.<index>", upper=0, lower=1)
-    left.1: success          # left lower button  -> success
-    right.1: fail            # right lower button -> fail
-    left.0: discard          # left upper button  -> discard (force-home without saving)
-    right.0: discard         # right upper button -> discard
+  # Single source for teleop end+label behavior. Each mapped button both starts
+  # homing on the robot and assigns this outcome in the recorder.
+  buttons:                   # "<side>.<index>" -> success | fail | discard (upper=0, lower=1)
+    left.1: success          # left lower  -> success + home
+    right.1: fail            # right lower -> fail + home
+    right.0: discard         # right upper -> discard + home
 
 tasks:                       # quick-switch language instructions in the recorder GUI
   - "pick up the cap and close the bottle"
@@ -94,3 +137,4 @@ tasks:                       # quick-switch language instructions in the recorde
   - "assemble lego blocks to make yellow taxi"
   - "assemble lego blocks to make red firetruck"
   - "assemble lego blocks to make green dumptruck"
+  - "Insert the USB-C plug into the USB-C port."

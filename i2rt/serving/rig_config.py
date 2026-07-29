@@ -14,6 +14,8 @@ Example:
     control:  {bilateral_kp: 0.15, home_speed: 0.4, follower_effort_limit: 30.0,
                follower_joint_limits: [[-3.0, 3.0], ...]}
     cameras:  {agentview: "1234", wrist_left: "5678", wrist_right: "9012"}
+              # or, per camera, with sensor options:
+              #   agentview: {serial: "1234", options: {enable_auto_exposure: 0, exposure: 300}}
     recorder: {repo_id: user/yam_pick, root: ~/lerobot_data, fps: 60, min_free_gb: 2.0}
     tasks:    ["pick the cube", "stack the blocks"]
 """
@@ -37,16 +39,25 @@ _CONTROL_MAP = {
     "gate_joints": "GATE_JOINTS",
     "home_kp": "HOME_KP",
     "bilateral_kp": "BILATERAL_KP",
+    "fine_grained_scale": "FINE_GRAINED_SCALE",
+    "fine_grained_button": "FINE_GRAINED_BUTTON",
+    "fine_recenter_speed": "FINE_RECENTER_SPEED",
+    "fine_recenter_kp": "FINE_RECENTER_KP",
+    "fine_recenter_max_following_error": "FINE_RECENTER_MAX_FOLLOWING_ERROR",
+    "fine_recenter_tolerance": "FINE_RECENTER_TOLERANCE",
+    "fine_recenter_dwell": "FINE_RECENTER_DWELL",
+    "fine_recenter_timeout": "FINE_RECENTER_TIMEOUT",
     "leader_gravity_comp_factor": "LEADER_GRAVITY_COMP_FACTOR",
     "leader_grav_comp_kd": "LEADER_GRAV_COMP_KD",
     "leader_coulomb_friction": "LEADER_COULOMB_FRICTION",
     "dagger_mirror_kp": "DAGGER_MIRROR_KP",
     "dagger_feedback_kp": "DAGGER_FEEDBACK_KP",
-    "home_buttons": "HOME_BUTTONS",
     "follower_joint_limits": "FOLLOWER_JOINT_LIMITS",
     "follower_effort_limit": "FOLLOWER_EFFORT_LIMIT",
     "follower_payload_kg": "FOLLOWER_PAYLOAD_KG",
 }
+
+_TELEOP_OUTCOMES = {"success", "fail", "discard"}
 
 
 def _repo_root() -> str:
@@ -95,6 +106,10 @@ def apply_control_overrides(rig: Dict[str, Any]) -> Dict[str, Any]:
     section = (rig or {}).get("control", {}) or {}
     applied: Dict[str, Any] = {}
     for key, value in section.items():
+        if key == "home_buttons":
+            raise ValueError(
+                "control.home_buttons was removed; teleop homing is derived from recorder.buttons"
+            )
         attr = _CONTROL_MAP.get(key)
         if attr is None:
             continue
@@ -106,12 +121,80 @@ def apply_control_overrides(rig: Dict[str, Any]) -> Dict[str, Any]:
     return applied
 
 
+def teleop_button_outcomes(rig: Dict[str, Any]) -> Dict[str, str]:
+    """Resolve the one shared teleop button -> terminal outcome mapping.
+
+    Both the robot controller and recorder call this at startup. Every configured
+    button therefore has one atomic meaning: label the episode and start homing.
+    """
+    from i2rt.serving import control_config as cc
+
+    recorder = (rig or {}).get("recorder", {}) or {}
+    raw = recorder.get("buttons", cc.DEFAULT_TELEOP_BUTTON_OUTCOMES)
+    if not isinstance(raw, dict):
+        raise ValueError("recorder.buttons must be a mapping of '<side>.<index>' to success/fail/discard")
+
+    resolved: Dict[str, str] = {}
+    for raw_key, raw_outcome in raw.items():
+        key = str(raw_key).strip().lower()
+        outcome = str(raw_outcome).strip().lower()
+        try:
+            side, raw_index = key.rsplit(".", 1)
+            index = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid recorder button key {raw_key!r}; expected '<side>.<index>'") from exc
+        if side not in {"left", "right"} or index < 0:
+            raise ValueError(f"invalid recorder button key {raw_key!r}; expected left/right and a non-negative index")
+        if outcome not in _TELEOP_OUTCOMES:
+            raise ValueError(
+                f"invalid outcome {raw_outcome!r} for recorder button {raw_key!r}; "
+                "expected success, fail, or discard"
+            )
+        if key in resolved:
+            raise ValueError(f"duplicate recorder button after normalization: {raw_key!r}")
+        resolved[key] = outcome
+    return resolved
+
+
 def apply_camera_serials(cameras: List[Any], rig: Dict[str, Any]) -> List[Any]:
-    """Set each ``CameraSpec.serial`` from ``rig['cameras']`` (by camera key)."""
+    """Set each ``CameraSpec.serial`` (and optional sensor ``options``) from
+    ``rig['cameras']``, by camera key.
+
+    Two entry shapes per camera, so existing configs keep working:
+
+        agentview: "246322303794"                       # serial only
+        agentview: {serial: "2463...", options: {enable_auto_exposure: 0, exposure: 300}}
+
+    ``options`` are RealSense option names (``rs.option`` members) -> numeric value,
+    applied after the stream starts to whichever sensor owns the color controls (the
+    ``RGB Camera`` on a D455, the ``Stereo Module`` on a D405 — which has no RGB
+    sensor). Booleans map to 1.0/0.0.
+    """
     section = (rig or {}).get("cameras", {}) or {}
     for cam in cameras:
-        if section.get(cam.key):
-            cam.serial = str(section[cam.key])
+        entry = section.get(cam.key)
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            if entry.get("serial"):
+                cam.serial = str(entry["serial"])
+            options = entry.get("options") or {}
+            if not isinstance(options, dict):
+                raise ValueError(f"camera {cam.key!r}: 'options' must be a mapping of option name -> value")
+            resolved = {}
+            for name, value in options.items():
+                if isinstance(value, bool):
+                    value = float(value)
+                elif isinstance(value, (int, float)):
+                    value = float(value)
+                else:
+                    raise ValueError(
+                        f"camera {cam.key!r}: option {name!r} must be a number or boolean, got {value!r}"
+                    )
+                resolved[str(name)] = value
+            cam.options = resolved
+        elif entry:
+            cam.serial = str(entry)
     return cameras
 
 

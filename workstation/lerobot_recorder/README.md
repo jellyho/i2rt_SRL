@@ -122,6 +122,66 @@ To find which serial is which view, plug them in **one at a time** and re-run
 `wrist_left,wrist_right,agentview` at launch (`--serials A,B,C`), or hard-code them
 in [`config.py`](config.py) `default_cameras()`.
 
+## Exposure / brightness matching
+
+Auto-exposure makes brightness drift mid-episode and differ between cameras. Lock it
+per camera in `config.yaml` with an `options:` map (applied on open **and** on every
+reconnect):
+
+```yaml
+cameras:
+  agentview:
+    serial: "246322303794"
+    options:
+      enable_auto_exposure: 0
+      exposure: 300            # D455 RGB: units of 100us -> 30 ms
+      gain: 64                 # D455 RGB gain range 0..128
+```
+
+To pick the values interactively — live feeds, a spinbox + slider per control, and a
+mean-luma readout with the delta between cameras:
+
+```bash
+workstation/yam-data tune        # adjust, then "Write to config.yaml" (keeps a .bak)
+```
+
+Type exact numbers into the spinbox; the slider is for coarse sweeps (its full travel
+is only ~190 px, so one pixel is tens or hundreds of exposure units). **link
+same-model cameras** (on by default) mirrors every change onto other cameras of the
+same model, so the two D405 wrists stay identical.
+
+Cameras of the same model should share one block. A YAML anchor keeps them literally
+identical, so editing one edits both:
+
+```yaml
+  wrist_left:
+    serial: "352122271652"
+    options: &d405_options
+      enable_auto_exposure: 0
+      exposure: 16000
+      gain: 16
+  wrist_right:
+    serial: "409122274199"
+    options: *d405_options     # same values, by reference
+```
+
+Caveat: "Write to config.yaml" writes literal values, so it **expands the anchor**.
+With linking on the two blocks stay identical in value, but the `&`/`*` reference is
+replaced by two copies — re-add the anchor by hand if you want to keep editing one
+place. (A `.bak` of the previous file is always written alongside.)
+
+**Exposure values are NOT portable between D405 and D455.** A D455 has a real `RGB
+Camera` sensor whose exposure counts in **100 us** steps (range `1..10000`). A D405
+has *no* RGB sensor — its color stream comes off the `Stereo Module`, which counts in
+**1 us** steps (range `1..165000`). The same number therefore means a 100x different
+exposure time on the two models, so tune each camera against the luma readout rather
+than copying numbers. (`gain` ranges differ too: 0..128 on D455 RGB, 16..248 on
+stereo.) The tuner shows which sensor it is driving under each feed.
+
+Watch the `clip NN%` badge: it is the share of pixels at/near pure white. Clipped
+highlights are unrecoverable detail, so match cameras **down** to the darkest
+well-exposed one rather than up into saturation.
+
 ---
 
 # Runbook — scenarios (run top to bottom)
@@ -156,6 +216,8 @@ workstation/yam-data record \
 The recorder opens on a **Setup page**:
 
 1. Confirm `repo_id` / `root` / `task` and the **source** (teleop / dagger / eval).
+   Closing the window saves the filled setup fields locally; the next Record or
+   DAgger Deploy session restores its own last-used values without pressing START.
    The dataset is written to **`<root>/<name>`** (name = last segment of `repo_id`,
    e.g. `~/lerobot_data` + `hello/pick_and_place` → `~/lerobot_data/pick_and_place`).
    The status line shows cameras detected and whether that dataset already exists.
@@ -266,9 +328,15 @@ Dry run: `workstation/yam-data replay --mock`.
   [F] keep fail, [D] delete, [space] toggle collection), or the **leader handle
   buttons**. The button→outcome map is **per-(side, index)** and configurable in
   `config.yaml` under `recorder.buttons` (keyed `<side>.<index>`, upper=0/lower=1).
-  Default: **left lower = success, right lower = fail, either upper = discard** — so
-  all three outcomes are reachable with two buttons per arm. A label button also
+  This is also the robot's source for end-of-episode homing, so there is no
+  separate home-button list to keep synchronized.
+  Default: **left upper = fine-grained toggle, left lower = success, right lower =
+  fail, right upper = discard**. A label button also
   starts homing, so one press ends + labels + saves (records through homing).
+- **Safe fine-mode exit**: toggling fine-grained control off freezes the follower
+  arm and gripper, pauses dataset appends without closing the episode, and slowly
+  aligns the leader. Recording and normal 1:1 control resume after a stable
+  alignment; timeout leaves the follower held and the leader gravity-comp free.
 - **Operator UI**: a big color status **banner** (IDLE/ARMED/REC/REVIEW/fault), a
   **health strip** (robot link · cameras · save queue), **live stats** (kept ✓/✗,
   discarded, success rate), **audio cues** (start, keep/fail/delete, fault), and a

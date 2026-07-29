@@ -29,12 +29,13 @@ from i2rt.serving.safety import TargetSmoother, clamp_limits, is_finite_vector, 
 from i2rt.serving.state_utils import full_state, to_full_target
 from i2rt.serving.teleop_common import (
     ArmPair,
-    LatchingToggle,
+    FineGrainedMapper,
     TeleopStateMachine,
     build_bimanual,
     build_follower_target,
     default_bimanual_specs,
     gate_distance,
+    handle_button_pressed,
     read_handle,
 )
 
@@ -174,6 +175,50 @@ class BaseController:
         to use the leader's built-in (original) kd."""
         return self._grav_free["kd"] if self._grav_free is not None else None
 
+    @staticmethod
+    def _bounded_recenter_leader(
+        pair: ArmPair,
+        smoother: TargetSmoother,
+        destination: np.ndarray,
+        kp_scale: float,
+        max_following_error: float,
+    ) -> None:
+        """Advance a leader toward ``destination`` with speed and spring bounds.
+
+        ``smoother`` bounds setpoint velocity. The second clamp keeps that setpoint
+        close to the measured arm, bounding PD error/force if the arm is obstructed
+        or simply lags. Resetting the smoother to the clamped command prevents
+        hidden target windup.
+        """
+        leader = pair.leader
+        if not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
+            return
+        try:
+            m = leader.num_dofs()
+            measured = np.asarray(leader.get_joint_pos(), dtype=float)[:m]
+            destination = np.asarray(destination, dtype=float)[:m]
+            planned = smoother.step(destination)
+            destination_error = destination - measured
+            planned_error = planned - measured
+            # If the physical arm catches or crosses the virtual setpoint, never
+            # command it back away from the destination. Restart that joint's
+            # setpoint directly from the measured pose instead.
+            wrong_direction = planned_error * destination_error <= 0.0
+            planned_error = np.where(
+                wrong_direction,
+                np.clip(destination_error, -smoother.max_step, smoother.max_step),
+                planned_error,
+            )
+            error = np.clip(planned_error, -max_following_error, max_following_error)
+            error = np.sign(destination_error) * np.minimum(np.abs(error), np.abs(destination_error))
+            command = measured + error
+            smoother.reset(command)
+            kd = pair.base_kd[:m] if pair.base_kd is not None else np.full(m, 0.5)
+            leader.update_kp_kd(pair.base_kp[:m] * kp_scale, kd)
+            leader.command_joint_pos(command)
+        except Exception:
+            pass
+
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
@@ -195,6 +240,15 @@ class TeleopConfig:
     dwell: float = cc.DWELL_S
     home_kp: float = cc.HOME_KP
     bilateral_kp: float = cc.BILATERAL_KP
+    fine_grained_scale: float = cc.FINE_GRAINED_SCALE
+    fine_grained_button: str = cc.FINE_GRAINED_BUTTON
+    fine_recenter_speed: float = cc.FINE_RECENTER_SPEED
+    fine_recenter_kp: float = cc.FINE_RECENTER_KP
+    fine_recenter_max_following_error: float = cc.FINE_RECENTER_MAX_FOLLOWING_ERROR
+    fine_recenter_tolerance: float = cc.FINE_RECENTER_TOLERANCE
+    fine_recenter_dwell: float = cc.FINE_RECENTER_DWELL
+    fine_recenter_timeout: float = cc.FINE_RECENTER_TIMEOUT
+    button_outcomes: Dict[str, str] = field(default_factory=lambda: dict(cc.DEFAULT_TELEOP_BUTTON_OUTCOMES))
     rate: float = 120.0
     ramp_speed: float = cc.RAMP_SPEED
     engage_time: float = cc.ENGAGE_TIME  # fixed-time engage catch-up (s); 0 = speed-based
@@ -212,6 +266,18 @@ class TeleopController(BaseController):
         self.cfg = cfg
         self.bilateral_kp = cfg.bilateral_kp
         self.home_kp = cfg.home_kp
+        self.fine_grained_button = str(cfg.fine_grained_button).lower()
+        self._button_outcomes = {str(key).lower(): str(value).lower() for key, value in cfg.button_outcomes.items()}
+        if self.fine_grained_button in self._button_outcomes:
+            raise ValueError(
+                f"fine-grained button {self.fine_grained_button!r} cannot also be an episode outcome button"
+            )
+        self._fine_grained = False
+        self._fine_button_prev = False
+        self._leader_recentering = False
+        self._recenter_fault = False
+        self._recenter_started = 0.0
+        self._recenter_within_since: Optional[float] = None
         self.pairs = build_bimanual(
             default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
                                    leader_gripper=cfg.leader_gripper,
@@ -235,6 +301,18 @@ class TeleopController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
+        self._recenter_target = {
+            s: np.asarray(p.follower.get_joint_pos(), dtype=float).copy() for s, p in self.pairs.items()
+        }
+        self._last_applied = {s: target.copy() for s, target in self._recenter_target.items()}
+        recenter_step = max_step_from_speed(cfg.fine_recenter_speed, cfg.rate)
+        self._recenter_smooth = {
+            s: TargetSmoother(
+                np.asarray(p.leader.get_joint_pos(), dtype=float)[:n_arm], recenter_step
+            )
+            for s, p in self.pairs.items()
+        }
 
         self.sm = TeleopStateMachine(cfg.engage_thr, cfg.release_thr, cfg.dwell)
         self._sim_engage = False
@@ -279,9 +357,97 @@ class TeleopController(BaseController):
     def set_sim_engage(self, flag: bool) -> None:
         self._sim_engage = bool(flag)
 
-    @staticmethod
-    def _home_button_pressed(buttons: Dict[str, list]) -> bool:
-        return any(idx < len(b) and bool(b[idx]) for b in buttons.values() for idx in cc.HOME_BUTTONS)
+    def _home_button_pressed(self, buttons: Dict[str, list]) -> bool:
+        """Return whether a button with a configured terminal outcome is held."""
+        for side, btns in buttons.items():
+            for idx, value in enumerate(btns):
+                if value and f"{side}.{idx}".lower() in self._button_outcomes:
+                    return True
+        return False
+
+    def _reset_fine_grained(self) -> None:
+        self._fine_grained = False
+        self._leader_recentering = False
+        self._recenter_fault = False
+        self._recenter_started = 0.0
+        self._recenter_within_since = None
+        for mapper in self._fine_mapper.values():
+            mapper.reset()
+
+    def _start_recentering(self, now: float) -> None:
+        self._fine_grained = False
+        self._leader_recentering = True
+        self._recenter_fault = False
+        self._recenter_started = now
+        self._recenter_within_since = None
+        for side, pair in self.pairs.items():
+            self._recenter_target[side] = self._last_applied[side].copy()
+            self._fsmooth[side].reset(self._recenter_target[side])
+            self._recenter_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
+        logger.info("fine-grained teleop OFF; aligning leader while follower holds")
+
+    def _cancel_recentering_to_fine(self) -> None:
+        self._leader_recentering = False
+        self._recenter_fault = False
+        self._recenter_within_since = None
+        self._fine_grained = True
+        for mapper in self._fine_mapper.values():
+            mapper.reset()
+        logger.info("leader alignment cancelled; fine-grained teleop ON")
+
+    def _update_recenter_state(self, now: float) -> None:
+        if not self._leader_recentering or self._recenter_fault:
+            return
+        aligned = True
+        for side, pair in self.pairs.items():
+            target = self._recenter_target[side][: self.home_arm.size]
+            leader = np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            follower = np.asarray(pair.follower.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            if max(float(np.max(np.abs(leader - target))), float(np.max(np.abs(follower - target)))) > self.cfg.fine_recenter_tolerance:
+                aligned = False
+                break
+        if aligned:
+            if self._recenter_within_since is None:
+                self._recenter_within_since = now
+            if now - self._recenter_within_since >= self.cfg.fine_recenter_dwell:
+                self._leader_recentering = False
+                self._recenter_within_since = None
+                for side, mapper in self._fine_mapper.items():
+                    mapper.reset()
+                    mapper.map(
+                        np.asarray(self.pairs[side].leader.get_joint_pos(), dtype=float)[
+                            : self.home_arm.size
+                        ],
+                        self._recenter_target[side][: self.home_arm.size],
+                        enabled=False,
+                    )
+                logger.info("leader alignment complete; normal teleop resumed")
+                return
+        else:
+            self._recenter_within_since = None
+        if now - self._recenter_started >= self.cfg.fine_recenter_timeout:
+            self._recenter_fault = True
+            logger.error("leader alignment timed out; follower held and leader freed")
+
+    def _update_fine_grained(self, buttons: Dict[str, list], state: str, now: float) -> None:
+        pressed = handle_button_pressed(buttons, self.fine_grained_button)
+        rising = pressed and not self._fine_button_prev
+        self._fine_button_prev = pressed
+        # Mapping starts only after every follower has synchronized with its leader.
+        if state == TeleopStateMachine.ENGAGED and all(self._caught_up.values()) and rising:
+            if self._leader_recentering:
+                self._cancel_recentering_to_fine()
+            elif self._fine_grained:
+                self._start_recentering(now)
+            else:
+                self._fine_grained = True
+            logger.info(
+                "fine-grained teleop %s (scale=%s)",
+                "ON" if self._fine_grained else "OFF",
+                self.cfg.fine_grained_scale,
+            )
 
     def _homing_done(self) -> bool:
         for side, pair in self.pairs.items():
@@ -328,9 +494,13 @@ class TeleopController(BaseController):
         if state == TeleopStateMachine.ENGAGED and self._home_button_pressed(buttons):
             self.sm.state = state = TeleopStateMachine.HOMING
         if state == TeleopStateMachine.ENGAGED and self._prev_state != TeleopStateMachine.ENGAGED:
+            self._reset_fine_grained()
             for s in self.pairs:
                 self._caught_up[s] = False
                 self._fsmooth[s].reset(self.pairs[s].follower.get_joint_pos())
+        elif state != TeleopStateMachine.ENGAGED and self._prev_state == TeleopStateMachine.ENGAGED:
+            self._reset_fine_grained()
+        self._update_fine_grained(buttons, state, now)
 
         sides_snap: Dict[str, Dict] = {}
         for side, pair in self.pairs.items():
@@ -340,15 +510,42 @@ class TeleopController(BaseController):
             try:
                 self._effort_guard(pair.follower)
                 # override feel only while the human actually holds the leader
-                self._sync_leader_feel(pair, side, held=state == TeleopStateMachine.ENGAGED)
+                self._sync_leader_feel(
+                    pair,
+                    side,
+                    held=state == TeleopStateMachine.ENGAGED and not self._leader_recentering,
+                )
                 if state == TeleopStateMachine.ENGAGED:
-                    desired = build_follower_target(pair.follower, arm_q[side], grip[side])
-                    if not is_finite_vector(desired, n):
+                    if self._leader_recentering:
+                        # Freeze follower arm and gripper at the last command. Human
+                        # leader motion is deliberately ignored until alignment ends.
+                        applied = self._recenter_target[side].copy()
+                        fsm.reset(applied)
+                        if self._recenter_fault or self._estop:
+                            self._free_leader(pair)
+                        else:
+                            self._bounded_recenter_leader(
+                                pair,
+                                self._recenter_smooth[side],
+                                applied[: self.home_arm.size],
+                                self.cfg.fine_recenter_kp,
+                                self.cfg.fine_recenter_max_following_error,
+                            )
+                        lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
+                    else:
+                        desired = build_follower_target(pair.follower, arm_q[side], grip[side])
+                    if not self._leader_recentering and self._caught_up[side]:
+                        desired[: self.home_arm.size] = self._fine_mapper[side].map(
+                            arm_q[side][: self.home_arm.size],
+                            fsm.cur[: self.home_arm.size],
+                            self._fine_grained,
+                        )
+                    if not self._leader_recentering and not is_finite_vector(desired, n):
                         desired = fsm.cur
-                    if self._caught_up[side]:
+                    if not self._leader_recentering and self._caught_up[side]:
                         applied = desired
                         fsm.reset(applied)
-                    elif self.cfg.engage_time > 0.0:
+                    elif not self._leader_recentering and self.cfg.engage_time > 0.0:
                         # Fixed-TIME catch-up: cosine blend from the engage pose to the
                         # LIVE leader over engage_time seconds. s'(1)=0, so at handoff
                         # the command's velocity equals the leader's own — direct
@@ -366,11 +563,16 @@ class TeleopController(BaseController):
                         if tau >= 1.0:
                             self._caught_up[side] = True
                             applied = desired
+                            self._fine_mapper[side].map(
+                                arm_q[side][: self.home_arm.size],
+                                desired[: self.home_arm.size],
+                                enabled=False,
+                            )
                         else:
                             s_blend = 0.5 * (1.0 - np.cos(np.pi * tau))
                             applied = self._engage_start[side] + s_blend * (desired - self._engage_start[side])
                         fsm.reset(applied)
-                    else:
+                    elif not self._leader_recentering:
                         # Cosine ease for the catch-up from home to the (live) leader:
                         # gentle off home, quicker through the middle, gentle on arrival.
                         d = float(np.linalg.norm(fsm.cur - desired))
@@ -381,10 +583,17 @@ class TeleopController(BaseController):
                         applied = fsm.step(desired)
                         if float(np.max(np.abs(fsm.cur - desired))) < _HOME_TOL:
                             self._caught_up[side] = True
+                            self._fine_mapper[side].map(
+                                arm_q[side][: self.home_arm.size],
+                                applied[: self.home_arm.size],
+                                enabled=False,
+                            )
                     # Only back-drive the leader once the follower has CAUGHT UP. Before
                     # that the follower is still near home while the leader is lifted, so
                     # back-driving would yank the leader toward home — keep it free instead.
-                    if self.bilateral_kp > 0.0 and self._caught_up[side]:
+                    if self._leader_recentering:
+                        pass
+                    elif self.bilateral_kp > 0.0 and self._caught_up[side]:
                         self._drive_leader(pair, np.asarray(pair.follower.get_joint_pos())[: pair.leader.num_dofs()])
                     else:
                         self._free_leader(pair, kd=self._free_kd())
@@ -407,6 +616,8 @@ class TeleopController(BaseController):
                     lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
 
                 applied_list = self._apply(pair.follower, applied)
+                if applied_list is not None:
+                    self._last_applied[side] = np.asarray(applied_list, dtype=float)
                 snap = _side_state(pair.follower, self._kin.get(side))
                 snap["leader_pos"] = np.asarray(pair.leader.get_joint_pos(), dtype=float).tolist()
                 snap["buttons"] = list(buttons[side])
@@ -416,12 +627,17 @@ class TeleopController(BaseController):
             except Exception as e:
                 logger.warning("[%s] teleop step failed: %s", side, e)
 
+        self._update_recenter_state(now)
+
         with self._lock:
             self._snap = {
                 "mode": self.mode,
                 "t": now,
                 "teleop_state": state,
                 "active": state == TeleopStateMachine.ENGAGED,
+                "fine_grained": self._fine_grained,
+                "leader_recentering": self._leader_recentering,
+                "recenter_fault": self._recenter_fault,
                 "estop": self._estop,
                 **sides_snap,
             }
@@ -482,6 +698,14 @@ class DaggerConfig:
     home: str = ""
     mirror_kp: float = cc.DAGGER_MIRROR_KP
     feedback_kp: float = cc.DAGGER_FEEDBACK_KP
+    fine_grained_scale: float = cc.FINE_GRAINED_SCALE
+    fine_grained_button: str = cc.FINE_GRAINED_BUTTON
+    fine_recenter_speed: float = cc.FINE_RECENTER_SPEED
+    fine_recenter_kp: float = cc.FINE_RECENTER_KP
+    fine_recenter_max_following_error: float = cc.FINE_RECENTER_MAX_FOLLOWING_ERROR
+    fine_recenter_tolerance: float = cc.FINE_RECENTER_TOLERANCE
+    fine_recenter_dwell: float = cc.FINE_RECENTER_DWELL
+    fine_recenter_timeout: float = cc.FINE_RECENTER_TIMEOUT
     home_kp: float = cc.HOME_KP
     home_speed: float = cc.HOME_SPEED
     rate: float = 120.0
@@ -509,6 +733,12 @@ class DaggerController(BaseController):
         self.mirror_kp = cfg.mirror_kp
         self.feedback_kp = cfg.feedback_kp
         self.home_kp = cfg.home_kp
+        self.fine_grained_button = str(cfg.fine_grained_button).lower()
+        self._fine_grained = False
+        self._leader_recentering = False
+        self._recenter_fault = False
+        self._recenter_started = 0.0
+        self._recenter_within_since: Optional[float] = None
         self.pairs = build_bimanual(
             default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
                                    leader_gripper=cfg.leader_gripper,
@@ -539,6 +769,18 @@ class DaggerController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
+        self._recenter_target = {
+            s: np.asarray(p.follower.get_joint_pos(), dtype=float).copy() for s, p in self.pairs.items()
+        }
+        self._last_applied = {s: target.copy() for s, target in self._recenter_target.items()}
+        recenter_step = max_step_from_speed(cfg.fine_recenter_speed, cfg.rate)
+        self._recenter_smooth = {
+            s: TargetSmoother(
+                np.asarray(p.leader.get_joint_pos(), dtype=float)[:n_arm], recenter_step
+            )
+            for s, p in self.pairs.items()
+        }
         self._leader_smooth = {
             s: TargetSmoother(np.asarray(p.leader.get_joint_pos())[: self.home_arm.size], self._home_step)
             for s, p in self.pairs.items()
@@ -550,6 +792,9 @@ class DaggerController(BaseController):
             "mode": self.mode,
             "t": 0.0,
             "intervention": False,
+            "fine_grained": False,
+            "leader_recentering": False,
+            "recenter_fault": False,
             "policy_running": False,
             "homing": False,
             "dagger_state": "stopped",
@@ -596,14 +841,30 @@ class DaggerController(BaseController):
     def set_intervention(self, flag: bool) -> None:
         if self._homing:
             return
-        self._intervening = bool(flag)
+        flag = bool(flag)
+        if flag == self._intervening:
+            return
+        self._intervening = flag
+        self._reset_fine_grained()
+        # Handoff to policy mirroring starts from the physical leader pose, never
+        # from a potentially distant target left by an offset intervention.
+        for side, pair in self.pairs.items():
+            self._leader_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
 
     def set_policy_running(self, flag: bool) -> None:
         if self._homing:
             return
-        self._policy_running = bool(flag)
+        flag = bool(flag)
+        if flag and not self._policy_running and not self._intervening:
+            for side, pair in self.pairs.items():
+                self._leader_smooth[side].reset(
+                    np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+                )
+        self._policy_running = flag
         if not self._policy_running:
-            self._intervening = False
+            self.set_intervention(False)
 
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
@@ -614,6 +875,7 @@ class DaggerController(BaseController):
         self._last_event = {"seq": self._event_seq, "action": action}
         self._policy_running = False
         self._intervening = False
+        self._reset_fine_grained()
         self._homing = True
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
@@ -632,6 +894,72 @@ class DaggerController(BaseController):
         else:
             logger.warning("unknown dagger button action: %s", action)
 
+    def _reset_fine_grained(self) -> None:
+        self._fine_grained = False
+        self._leader_recentering = False
+        self._recenter_fault = False
+        self._recenter_started = 0.0
+        self._recenter_within_since = None
+        for mapper in self._fine_mapper.values():
+            mapper.reset()
+
+    def _start_recentering(self, now: float) -> None:
+        self._fine_grained = False
+        self._leader_recentering = True
+        self._recenter_fault = False
+        self._recenter_started = now
+        self._recenter_within_since = None
+        for side, pair in self.pairs.items():
+            self._recenter_target[side] = self._last_applied[side].copy()
+            self._smooth[side].reset(self._recenter_target[side])
+            self._recenter_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
+        logger.info("fine-grained intervention OFF; aligning leader while follower holds")
+
+    def _cancel_recentering_to_fine(self) -> None:
+        self._leader_recentering = False
+        self._recenter_fault = False
+        self._recenter_within_since = None
+        self._fine_grained = True
+        for mapper in self._fine_mapper.values():
+            mapper.reset()
+        logger.info("leader alignment cancelled; fine-grained intervention ON")
+
+    def _update_recenter_state(self, now: float) -> None:
+        if not self._leader_recentering or self._recenter_fault:
+            return
+        aligned = True
+        for side, pair in self.pairs.items():
+            target = self._recenter_target[side][: self.home_arm.size]
+            leader = np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            follower = np.asarray(pair.follower.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            if max(float(np.max(np.abs(leader - target))), float(np.max(np.abs(follower - target)))) > self.cfg.fine_recenter_tolerance:
+                aligned = False
+                break
+        if aligned:
+            if self._recenter_within_since is None:
+                self._recenter_within_since = now
+            if now - self._recenter_within_since >= self.cfg.fine_recenter_dwell:
+                self._leader_recentering = False
+                self._recenter_within_since = None
+                for side, mapper in self._fine_mapper.items():
+                    mapper.reset()
+                    mapper.map(
+                        np.asarray(self.pairs[side].leader.get_joint_pos(), dtype=float)[
+                            : self.home_arm.size
+                        ],
+                        self._recenter_target[side][: self.home_arm.size],
+                        enabled=False,
+                    )
+                logger.info("leader alignment complete; normal intervention resumed")
+                return
+        else:
+            self._recenter_within_since = None
+        if now - self._recenter_started >= self.cfg.fine_recenter_timeout:
+            self._recenter_fault = True
+            logger.error("leader alignment timed out; follower held and leader freed")
+
     def _scan_buttons(self, buttons: Dict[str, list]) -> None:
         if self._homing:
             self._btn_prev = {side: list(btns) for side, btns in buttons.items()}
@@ -642,9 +970,23 @@ class DaggerController(BaseController):
                 pressed = bool(btns[idx])
                 was = idx < len(prev) and bool(prev[idx])
                 if pressed and not was:
-                    action = self._button_map.get(f"{side}.{idx}")
-                    if action:
-                        self._toggle_button_action(action)
+                    key = f"{side}.{idx}".lower()
+                    if key == self.fine_grained_button and self._intervening:
+                        if self._leader_recentering:
+                            self._cancel_recentering_to_fine()
+                        elif self._fine_grained:
+                            self._start_recentering(time.monotonic())
+                        else:
+                            self._fine_grained = True
+                        logger.info(
+                            "fine-grained intervention %s (scale=%s)",
+                            "ON" if self._fine_grained else "OFF",
+                            self.cfg.fine_grained_scale,
+                        )
+                    else:
+                        action = self._button_map.get(key)
+                        if action:
+                            self._toggle_button_action(action)
             self._btn_prev[side] = list(btns)
 
     def _homing_done(self) -> bool:
@@ -679,7 +1021,9 @@ class DaggerController(BaseController):
             try:
                 self._effort_guard(pair.follower)
                 # override feel only while the human actually holds the leader
-                self._sync_leader_feel(pair, side, held=self._intervening)
+                self._sync_leader_feel(
+                    pair, side, held=self._intervening and not self._leader_recentering
+                )
                 desired = None
                 if self._homing:
                     d = float(np.linalg.norm(smoother.cur - self.home_full))
@@ -689,8 +1033,26 @@ class DaggerController(BaseController):
                     self._home_leader(pair, self._leader_smooth[side].step(self.home_arm))
                 elif self._intervening:
                     smoother.max_step = self._run_step
-                    if valid[side]:
+                    if self._leader_recentering:
+                        desired = self._recenter_target[side].copy()
+                        smoother.reset(desired)
+                        if self._recenter_fault or self._estop:
+                            self._free_leader(pair)
+                        else:
+                            self._bounded_recenter_leader(
+                                pair,
+                                self._recenter_smooth[side],
+                                desired[: self.home_arm.size],
+                                self.cfg.fine_recenter_kp,
+                                self.cfg.fine_recenter_max_following_error,
+                            )
+                    elif valid[side]:
                         human = build_follower_target(pair.follower, arm_q[side], grip_cmd[side])
+                        human[: self.home_arm.size] = self._fine_mapper[side].map(
+                            arm_q[side][: self.home_arm.size],
+                            smoother.cur[: self.home_arm.size],
+                            self._fine_grained,
+                        )
                         desired = human
                         if self.feedback_kp > 0.0:
                             self._drive_leader(
@@ -708,15 +1070,25 @@ class DaggerController(BaseController):
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
                         desired = act[:n]
-                        # grav_comp_kd doubles as mirror damping (grav_comp_kd "on")
-                        self._drive_leader(pair, act[: pair.leader.num_dofs()], self.mirror_kp,
-                                           kd=self._mirror_kd)
 
                 if desired is not None:
-                    target = smoother.step(desired)
+                    target = desired if self._leader_recentering else smoother.step(desired)
                     applied = self._apply(pair.follower, target)
+                    if not self._intervening and self._policy_running and applied is not None:
+                        # Mirror the command sent after follower smoothing/clamping.
+                        # The independent limiter prevents a PD target jump when an
+                        # offset human intervention hands control back to the policy.
+                        leader_smoother = self._leader_smooth[side]
+                        leader_smoother.max_step = self._run_step
+                        mirror_target = leader_smoother.step(
+                            np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
+                        )
+                        self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
                 else:
                     smoother.reset(pair.follower.get_joint_pos())
+
+                if applied is not None:
+                    self._last_applied[side] = np.asarray(applied, dtype=float)
 
                 snap = _side_state(pair.follower, self._kin.get(side))
                 snap["leader_pos"] = np.asarray(pair.leader.get_joint_pos(), dtype=float).tolist()
@@ -728,6 +1100,8 @@ class DaggerController(BaseController):
             except Exception as e:
                 logger.warning("[%s] dagger step failed: %s", side, e)
 
+        self._update_recenter_state(now)
+
         if self._homing and self._homing_done():
             self._homing = False
 
@@ -737,6 +1111,9 @@ class DaggerController(BaseController):
                 "mode": self.mode,
                 "t": now,
                 "intervention": bool(self._intervening),
+                "fine_grained": self._fine_grained,
+                "leader_recentering": self._leader_recentering,
+                "recenter_fault": self._recenter_fault,
                 "policy_running": bool(self._policy_running),
                 "homing": bool(self._homing),
                 "dagger_state": dagger_state,

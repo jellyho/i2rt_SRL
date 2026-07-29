@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 import i2rt.serving.rig_config as rc
 from i2rt.serving import control_config as cc
-from i2rt.serving.rig_config import Resolver, apply_camera_serials, apply_control_overrides, find_rig, load_rig
-from workstation.lerobot_recorder.config import default_cameras
+from i2rt.serving.rig_config import (
+    Resolver,
+    apply_camera_serials,
+    apply_control_overrides,
+    find_rig,
+    load_rig,
+    teleop_button_outcomes,
+)
 from workstation.lerobot_recorder.__main__ import build_config
+from workstation.lerobot_recorder.config import default_cameras
 
 
 def _no_repo_rig(monkeypatch, tmp_path):
@@ -55,6 +64,56 @@ def test_apply_control_overrides(monkeypatch):
     assert apply_control_overrides({}) == {}
 
 
+def test_apply_fine_grained_control_overrides(monkeypatch):
+    monkeypatch.setattr(cc, "FINE_GRAINED_SCALE", 0.2, raising=False)
+    monkeypatch.setattr(cc, "FINE_GRAINED_BUTTON", "left.0", raising=False)
+    monkeypatch.setattr(cc, "FINE_RECENTER_SPEED", 0.15, raising=False)
+    monkeypatch.setattr(cc, "FINE_RECENTER_MAX_FOLLOWING_ERROR", 0.05, raising=False)
+    monkeypatch.setattr(cc, "FINE_RECENTER_TOLERANCE", 0.03, raising=False)
+    applied = apply_control_overrides(
+        {
+            "control": {
+                "fine_grained_scale": 0.1,
+                "fine_grained_button": "left.0",
+                "fine_recenter_speed": 0.12,
+                "fine_recenter_max_following_error": 0.04,
+                "fine_recenter_tolerance": 0.02,
+            }
+        }
+    )
+    assert cc.FINE_GRAINED_SCALE == 0.1
+    assert cc.FINE_GRAINED_BUTTON == "left.0"
+    assert cc.FINE_RECENTER_SPEED == 0.12
+    assert cc.FINE_RECENTER_MAX_FOLLOWING_ERROR == 0.04
+    assert cc.FINE_RECENTER_TOLERANCE == 0.02
+    assert "FINE_GRAINED_SCALE" in applied
+
+
+def test_teleop_button_outcomes_are_shared_and_validated():
+    assert teleop_button_outcomes({}) == cc.DEFAULT_TELEOP_BUTTON_OUTCOMES
+    assert teleop_button_outcomes({"recorder": {"buttons": {"LEFT.2": "SUCCESS"}}}) == {
+        "left.2": "success"
+    }
+    assert teleop_button_outcomes({"recorder": {"buttons": {}}}) == {}
+
+    for buttons in (["left.1"], {"middle.0": "success"}, {"left.0": "stop"}):
+        try:
+            teleop_button_outcomes({"recorder": {"buttons": buttons}})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid button mapping was accepted: {buttons!r}")
+
+
+def test_deprecated_home_buttons_fail_fast():
+    try:
+        apply_control_overrides({"control": {"home_buttons": ["left.1"]}})
+    except ValueError as exc:
+        assert "recorder.buttons" in str(exc)
+    else:
+        raise AssertionError("deprecated control.home_buttons was accepted")
+
+
 def test_apply_control_overrides_leader_keys(monkeypatch):
     for attr in ("LEADER_GRAVITY_COMP_FACTOR", "LEADER_GRAV_COMP_KD", "LEADER_COULOMB_FRICTION"):
         monkeypatch.setattr(cc, attr, None, raising=False)
@@ -78,6 +137,39 @@ def test_apply_camera_serials():
     by = {c.key: c.serial for c in cams}
     assert by["agentview"] == "AAA" and by["wrist_left"] == "BBB"
     assert by["wrist_right"] == ""  # untouched
+
+
+def test_apply_camera_options():
+    cams = apply_camera_serials(
+        default_cameras(),
+        {
+            "cameras": {
+                "agentview": {"serial": "AAA", "options": {"enable_auto_exposure": 0, "exposure": 300}},
+                "wrist_left": "BBB",  # plain-string form still supported alongside
+            }
+        },
+    )
+    by = {c.key: c for c in cams}
+    assert by["agentview"].serial == "AAA"
+    assert by["agentview"].options == {"enable_auto_exposure": 0.0, "exposure": 300.0}
+    assert by["wrist_left"].serial == "BBB" and by["wrist_left"].options == {}
+
+
+def test_apply_camera_options_bool_and_serial_only_map():
+    cams = apply_camera_serials(
+        default_cameras(),
+        {"cameras": {"agentview": {"options": {"enable_auto_exposure": False}}}},
+    )
+    by = {c.key: c for c in cams}
+    assert by["agentview"].serial == ""  # no serial in the map -> left unpinned
+    assert by["agentview"].options == {"enable_auto_exposure": 0.0}
+
+
+def test_apply_camera_options_rejects_bad_shapes():
+    with pytest.raises(ValueError):
+        apply_camera_serials(default_cameras(), {"cameras": {"agentview": {"options": ["exposure"]}}})
+    with pytest.raises(ValueError):
+        apply_camera_serials(default_cameras(), {"cameras": {"agentview": {"options": {"exposure": "dark"}}}})
 
 
 def test_resolver_precedence():
@@ -126,3 +218,12 @@ def test_recorder_config_task_precedence(tmp_path):
 
     cfg = build_config(["--config", str(cfg_path), "--task", "close the drawer"])
     assert cfg.task == "close the drawer"
+
+
+def test_recorder_config_uses_shared_button_outcomes(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("recorder:\n  buttons:\n    left.2: success\n")
+
+    cfg = build_config(["--config", str(cfg_path)])
+
+    assert cfg.button_map == {"left.2": "success"}

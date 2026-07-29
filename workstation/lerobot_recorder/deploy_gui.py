@@ -6,7 +6,7 @@ for deployment / DAgger collection.
 
 from __future__ import annotations
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -16,6 +16,8 @@ from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
 
 
 class DeployGUI(RecorderGUI):
+    SETTINGS_SCOPE = "deploy"
+
     def __init__(self, cfg: RecorderConfig, bridge_cfg: BridgeConfig) -> None:
         self.bridge_cfg = bridge_cfg
         self.runner: DeploymentPolicyRunner | None = None
@@ -45,7 +47,8 @@ class DeployGUI(RecorderGUI):
         self.runner_status = QtWidgets.QLabel("policy: not connected")
         self.runner_status.setStyleSheet(f"color:{theme.MUTED};")
         self.button_legend = QtWidgets.QLabel(
-            "Handle buttons: left upper = start/stop policy rollout, left lower = human intervention on/off, "
+            "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during intervention; "
+            "left lower = human intervention on/off, "
             "right upper = discard + home, right lower = keep + home."
         )
         self.button_legend.setWordWrap(True)
@@ -101,12 +104,19 @@ class DeployGUI(RecorderGUI):
             text, color = "■ E-STOP ENGAGED", theme.STATE_COLORS["ERROR"]
         elif not st.get("disk_ok", True):
             text, color = "LOW DISK — not saving", theme.STATE_COLORS["ERROR"]
+        elif not st.get("writer_ok", True):
+            text, color = "DATASET SAVE FAILED — RESTART REQUIRED", theme.STATE_COLORS["ERROR"]
         elif not (st["cam_ok"] and st.get("robot_ok", True)):
             text, color = "DEVICE FAULT", theme.STATE_COLORS["ERROR"]
         elif st.get("homing"):
             text, color = "HOMING", theme.STATE_COLORS["REVIEW"]
+        elif st.get("recenter_fault"):
+            text, color = "LEADER ALIGNMENT TIMED OUT — FOLLOWER HELD", theme.STATE_COLORS["ERROR"]
+        elif st.get("leader_recentering"):
+            text, color = "HUMAN INTERVENTION — ALIGNING LEADER (RECORDING PAUSED)", theme.STATE_COLORS["REVIEW"]
         elif st.get("intervention"):
-            text, color = "HUMAN INTERVENTION", theme.STATE_COLORS["REC"]
+            text = "HUMAN INTERVENTION (FINE-GRAINED)" if st.get("fine_grained") else "HUMAN INTERVENTION"
+            color = theme.STATE_COLORS["REC"]
         elif st.get("policy_running"):
             text, color = "POLICY RUNNING", theme.STATE_COLORS["ARMED"]
         elif st["armed"]:

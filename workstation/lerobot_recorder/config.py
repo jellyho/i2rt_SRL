@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List
 
+from i2rt.serving.control_config import DEFAULT_TELEOP_BUTTON_OUTCOMES
+
 # ----------------------------------------------------------------------------
 # Robot / dataset dimensions
 # ----------------------------------------------------------------------------
@@ -62,6 +64,11 @@ class CameraSpec:
     width: int = 640
     height: int = 480
     fps: int = 60  # native stream fps (>= record fps so frames don't repeat)
+    # RealSense color-sensor options applied after the stream starts (and on every
+    # reconnect), e.g. {"enable_auto_exposure": 0, "exposure": 300, "gain": 64} to
+    # lock exposure so brightness doesn't drift across an episode. Names are
+    # `rs.option` members; set from config.yaml's per-camera `options:` map.
+    options: dict = field(default_factory=dict)
 
 
 def default_cameras() -> List[CameraSpec]:
@@ -126,14 +133,6 @@ class RecorderConfig:
     auto_arm: bool = False  # arm collection automatically on Start (record on the next teleop engage)
     review_cam: str = "agentview"  # which camera to buffer (downsampled) for review playback
     # Leader-handle button -> episode outcome, keyed "<side>.<button_index>" (upper=0,
-    # lower=1). Default: left lower=success, right lower=fail, both uppers=discard — so
-    # all three outcomes are reachable with two buttons per arm.
-    button_map: dict = field(
-        default_factory=lambda: {
-            "left.0": "discard",
-            "left.1": "success",
-            "right.0": "discard",
-            "right.1": "fail",
-        }
-    )
+    # lower=1). Left upper is reserved for fine-grained control; right upper discards.
+    button_map: dict = field(default_factory=lambda: dict(DEFAULT_TELEOP_BUTTON_OUTCOMES))
     review_downscale: int = 4  # spatial stride for the review preview (640x480 -> 160x120)

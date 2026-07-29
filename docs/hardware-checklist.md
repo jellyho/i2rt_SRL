@@ -70,11 +70,14 @@ python -c "from i2rt.serving.robot_client import RobotClient; c=RobotClient(host
 ```
 - [ ] Homing return is smooth/slow (raise/lower `--home-speed` to taste; engage approach uses `--ramp-speed 0.8`).
 
-## 6. Leader-button end+label+home
+## 6. Fine-grained control + leader-button end/label/home
 
-- [ ] While ENGAGED, press leader **button 1** → robot starts homing (gently), records through homing, and on IDLE the episode is saved **success**.
-- [ ] **button 2** → saved **fail**.  **button 0** → **discarded** (not saved).
-  (If your handle's button indices differ, adjust `HOME_BUTTONS` in `i2rt/serving/control_config.py` and `SUCCESS/FAIL/DISCARD_BUTTON` in `workstation/lerobot_recorder/recorder.py`.)
+- [ ] While ENGAGED, press **left upper (`left.0`)** → fine-grained mode toggles; with the checked-in `fine_grained_scale: 0.4`, moving the leader 2.5× moves the follower 1×. Toggle off and confirm the follower/gripper hold, recording pauses, and the leader slowly aligns before normal 1:1 control resumes.
+- [ ] During leader alignment, move the leader by hand and confirm the follower does not respond. Confirm the GUI reads **ALIGNING LEADER — RECORDING PAUSED**.
+- [ ] Temporarily use a short `fine_recenter_timeout` and confirm timeout frees the leader, holds the follower, shows an alignment fault, and pressing `left.0` returns to fine mode.
+- [ ] **Left lower (`left.1`)** → success + home; **right lower (`right.1`)** → fail + home; **right upper (`right.0`)** → discard + home.
+- [ ] Confirm every home transition turns fine-grained/alignment mode off.
+  (If button indices differ, update `control.fine_grained_button` and `recorder.buttons` in `config.yaml`; the robot derives homing from the recorder mapping.)
 
 ---
 
