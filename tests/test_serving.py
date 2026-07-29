@@ -380,6 +380,44 @@ def test_dagger_button_map_toggles_rollout(monkeypatch):
     ctrl.close()
 
 
+@pytest.mark.parametrize("policy_running", [False, True])
+def test_dagger_intervention_off_relocks_leader_to_held_follower(policy_running):
+    ctrl = DaggerController(
+        DaggerConfig(sim=True, rate=20.0, home_speed=1.0, command_timeout=0.01)
+    )
+    try:
+        pair = ctrl.pairs["left"]
+        n = pair.leader.num_dofs()
+        pair.base_kp = np.ones(n)
+        pair.base_kd = np.ones(n)
+        pair.leader.update_kp_kd = lambda kp, kd: None
+
+        if policy_running:
+            ctrl.set_policy_running(True)  # deliberately no policy action/server
+        ctrl.set_intervention(True)
+        aligned = np.zeros(pair.follower.num_dofs())
+        aligned[:n] = 0.2
+        pair.follower.command_joint_pos(aligned)
+        pair.leader.command_joint_pos(aligned[:n])
+        ctrl._smooth["left"].reset(aligned)
+
+        ctrl.set_intervention(False)
+        drifted = aligned[:n].copy()
+        drifted[1] += 0.2
+        pair.leader.command_joint_pos(drifted)
+        ctrl.step()
+
+        assert np.asarray(pair.follower.get_joint_pos())[1] == pytest.approx(0.2)
+        assert np.asarray(pair.leader.get_joint_pos())[1] == pytest.approx(0.2)
+
+        # Re-entering intervention from the re-locked pose has no follower jump.
+        ctrl.set_intervention(True)
+        ctrl.step()
+        assert np.asarray(pair.follower.get_joint_pos())[1] == pytest.approx(0.2)
+    finally:
+        ctrl.close()
+
+
 def test_teleop_bilateral_engage_steps():
     """Engage with bilateral_kp>0 runs through the (fixed) free-until-caught-up path."""
     tc = TeleopController(TeleopConfig(sim=True, bilateral_kp=0.2))

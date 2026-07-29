@@ -954,8 +954,8 @@ class DaggerController(BaseController):
             return
         self._intervening = flag
         self._reset_fine_grained()
-        # Handoff to policy mirroring starts from the physical leader pose, never
-        # from a potentially distant target left by an offset intervention.
+        # Handoff to policy mirroring/idle holding starts from the physical leader
+        # pose, never from a potentially distant target left by intervention.
         for side, pair in self.pairs.items():
             self._leader_smooth[side].reset(
                 np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
@@ -1350,7 +1350,24 @@ class DaggerController(BaseController):
                         )
                         self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
                 else:
-                    smoother.reset(pair.follower.get_joint_pos())
+                    follower_hold = np.asarray(pair.follower.get_joint_pos(), dtype=float)
+                    smoother.reset(follower_hold)
+                    if (
+                        not self._intervening
+                        and not self._returning
+                        and not self._homing
+                        and not self._estop
+                    ):
+                        # A stopped policy (or a running policy with no fresh
+                        # action) still owns the leader. Re-lock it to the held
+                        # follower pose after intervention so it cannot drift and
+                        # create an offset before the next human handoff.
+                        leader_smoother = self._leader_smooth[side]
+                        leader_smoother.max_step = self._return_step
+                        hold_target = leader_smoother.step(
+                            follower_hold[: pair.leader.num_dofs()]
+                        )
+                        self._home_leader(pair, hold_target)
 
                 if applied is not None:
                     self._last_applied[side] = np.asarray(applied, dtype=float)
