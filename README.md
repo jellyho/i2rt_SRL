@@ -59,12 +59,12 @@ robot/yam teleop --bilateral-kp 0.15
 ```bash
 # 🤖 robot — teleop server (serves state / action / engage-gate over portal)
 robot/yam canup
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 ```
 
 ```bash
 # 💻 workstation — recorder GUI (host + serials come from config.yaml)
-workstation/yam-data record --repo-id user/yam_pick
+workstation/yam-data record
 ```
 
 The recorder opens on a **Setup page**:
@@ -106,6 +106,28 @@ workstation/yam-data replay --repo-id user/yam_pick
 ```
 
 > Full hardware bring-up checklist: [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
+
+### E · View & edit a recorded dataset (no robot)
+
+```bash
+# 💻 workstation — browse datasets, scrub every episode across all camera views, and edit
+workstation/yam-data edit
+```
+
+Pick a dataset, then per episode you can **scrub / play** the frames (all cameras
+side-by-side), **relabel** the outcome (success / fail / discard), **set the task**
+(language instruction), or **delete** the selected episode(s). Structural edits
+(delete / set-task) re-index the LeRobot dataset via its official `dataset_tools`
+and back the folder up first (`<name>.backup-…`); relabelling only touches the
+`outcomes.jsonl` sidecar. Reads the dataset off disk — no robot or cameras needed
+(`--mock` for a synthetic dataset).
+
+> If a GPU/streaming video encode dropped an episode's trailing frame (a camera's
+> video ends up 1 frame shorter than the recorded length), LeRobot would otherwise
+> refuse to delete a shared-file episode. The editor detects this and **auto-repairs
+> the metadata** before retrying, and the recorder now runs the same check at
+> `finalize()` so freshly collected datasets stay consistent (with a warning if it
+> recurs — consider `recorder.streaming_encoding: false` or `vcodec: h264`).
 
 ---
 

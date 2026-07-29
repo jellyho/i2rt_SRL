@@ -10,11 +10,21 @@ few version-sensitive accessors are isolated here (like ``dataset_writer.py``).
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from workstation.lerobot_recorder.config import ACTION_DIM
+
+
+def _to_uint8_hwc(t: Any) -> Optional[np.ndarray]:
+    """Coerce a torch/np image (CHW or HWC, float [0,1] or uint8) to a contiguous HxWx3 uint8."""
+    arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):  # CHW -> HWC
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
 
 
 class DatasetReader:
@@ -68,25 +78,45 @@ class DatasetReader:
         act = self._ds.hf_dataset[gi]["action"]  # avoids video decode
         return np.asarray(act, dtype=np.float32).reshape(-1)
 
+    def camera_keys(self) -> List[str]:
+        """Camera names available in the dataset (the ``observation.images.<name>`` suffixes)."""
+        if self.mock:
+            return ["agentview"]
+        feats = getattr(self._ds, "features", None) or getattr(getattr(self._ds, "meta", None), "features", {}) or {}
+        return sorted(k.split("observation.images.", 1)[1] for k in feats if k.startswith("observation.images."))
+
     def get_image(self, episode: int, frame: int) -> Optional[np.ndarray]:
-        """Return an HxWx3 uint8 image for display (or None)."""
+        """Return an HxWx3 uint8 image (the configured display camera) for display, or None."""
+        return self.get_images(episode, frame).get(self.display_cam)
+
+    def get_images(self, episode: int, frame: int) -> Dict[str, np.ndarray]:
+        """Return ``{camera_name: HxWx3 uint8}`` for every camera at this frame (one video decode)."""
         if self.mock:
             img = np.zeros((120, 160, 3), dtype=np.uint8)
             x = (frame * 3) % 160
             img[:, max(0, x - 6) : x + 6, :] = 200
-            return img
+            return {"agentview": img}
         gi = self._ep_index[episode][frame]
-        key = f"observation.images.{self.display_cam}"
+        out: Dict[str, np.ndarray] = {}
         try:
             row = self._ds[gi]  # decodes video frames
-            if key not in row:
-                return None
-            t = row[key]  # torch CHW float [0,1]
-            arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
-            if arr.ndim == 3 and arr.shape[0] in (1, 3):  # CHW -> HWC
-                arr = np.transpose(arr, (1, 2, 0))
-            if arr.dtype != np.uint8:
-                arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
-            return np.ascontiguousarray(arr)
+        except Exception:
+            return out
+        for key, val in row.items():
+            if not key.startswith("observation.images."):
+                continue
+            img = _to_uint8_hwc(val)
+            if img is not None and img.ndim == 3:
+                out[key.split("observation.images.", 1)[1]] = img
+        return out
+
+    def get_state(self, episode: int, frame: int) -> Optional[np.ndarray]:
+        """Return the frame's ``observation.state`` vector (no video decode), or None."""
+        if self.mock:
+            return None
+        gi = self._ep_index[episode][frame]
+        try:
+            st = self._ds.hf_dataset[gi].get("observation.state")
         except Exception:
             return None
+        return None if st is None else np.asarray(st, dtype=np.float32).reshape(-1)
