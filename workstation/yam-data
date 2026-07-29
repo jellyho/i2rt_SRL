@@ -8,6 +8,7 @@
 #
 #   workstation/yam-data record [args]   # GUI recorder (teleop-gated LeRobot capture)
 #   workstation/yam-data replay [args]   # GUI replay (drive the robot from a dataset)
+#   workstation/yam-data edit [args]     # GUI viewer/editor (browse + relabel/retask/delete episodes)
 #   workstation/yam-data bridge [args]   # policy bridge (portal robot <-> websocket policy)
 #   workstation/yam-data deploy [args]   # GUI DAgger deployment + policy bridge
 #   workstation/yam-data cams            # list connected RealSense serials
@@ -36,12 +37,13 @@ shift || true
 case "$cmd" in
     record) exec python -m workstation.lerobot_recorder "$@" ;;
     replay) exec python -m workstation.lerobot_recorder.replay_main "$@" ;;
+    edit)   exec python -m workstation.lerobot_recorder.editor_main "$@" ;;
     bridge) exec python -m workstation.policy_bridge "$@" ;;
     deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|bridge|deploy|cams|doctor} [args]" >&2
+        echo "usage: yam-data {record|replay|edit|bridge|deploy|cams|doctor} [args]" >&2
         exit 2
         ;;
 esac
