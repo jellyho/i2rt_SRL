@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 _HOME_TOL = 0.05  # rad; homing considered done when the ramp is within this of home
 _LEADER_HOME_TOL = 0.1  # rad; the PHYSICAL leader must also be this close (weak home_kp lags)
+_DAGGER_RETURN_SPEED_SCALE = 0.5  # recovery moves at half the configured homing speed
+_DAGGER_RETURN_TIMEOUT_MARGIN = 2.0  # s beyond the conservative planned move time
 
 
 def _side_state(robot: Any, kin: Optional[ArmKinematics] = None) -> Dict[str, list]:
@@ -795,6 +797,8 @@ class DaggerController(BaseController):
             sim=cfg.sim)
         self._run_step = max_step_from_speed(cfg.max_joint_speed, cfg.rate)
         self._home_step = max_step_from_speed(cfg.home_speed, cfg.rate)
+        self._return_speed = cfg.home_speed * _DAGGER_RETURN_SPEED_SCALE
+        self._return_step = max_step_from_speed(self._return_speed, cfg.rate)
 
         self._intervening = False
         self._policy_running = False
@@ -806,6 +810,7 @@ class DaggerController(BaseController):
         self._return_lock = threading.RLock()
         self._return_requested = False
         self._return_target: Dict[str, np.ndarray] = {}
+        self._return_deadline = 0.0
         self._btn_prev: Dict[str, list] = {}
         self._button_map: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in cfg.button_map.items()}
         self._event_seq = 0
@@ -1008,6 +1013,7 @@ class DaggerController(BaseController):
             self._return_requested = False
             self._returning = False
             self._return_target.clear()
+            self._return_deadline = 0.0
 
     def _invalidate_policy_action(self) -> None:
         for side in self._policy_action:
@@ -1035,6 +1041,7 @@ class DaggerController(BaseController):
             assert self._return_values is not None
             offset = 0
             targets: Dict[str, np.ndarray] = {}
+            max_distance = 0.0
             for side, pair in self.pairs.items():
                 current = np.asarray(pair.follower.get_joint_pos(), dtype=float).reshape(-1)
                 configured = self._return_values[offset : offset + current.size]
@@ -1051,8 +1058,20 @@ class DaggerController(BaseController):
                     np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
                 )
                 self._return_d0[side] = max(float(np.linalg.norm(current - target)), 1e-6)
+                leader = np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+                max_distance = max(
+                    max_distance,
+                    float(np.max(np.abs(current - target))),
+                    float(np.max(np.abs(leader - target[: self.home_arm.size]))),
+                )
 
             self._return_target = targets
+            # The ramp averages approximately the configured return speed. Allow
+            # three times that planned duration for physical leader lag, plus a
+            # fixed margin. If only the leader fails to arrive, handoff is still
+            # continuous because intervention re-anchors leader and follower.
+            planned = max_distance / max(self._return_speed, 1e-6)
+            self._return_deadline = time.monotonic() + 3.0 * planned + _DAGGER_RETURN_TIMEOUT_MARGIN
             self._returning = True
 
         self._intervening = False
@@ -1060,7 +1079,7 @@ class DaggerController(BaseController):
         self._reset_fine_grained()
         logger.info("DAgger returning to configured %s pose", self._return_mode)
 
-    def _returning_done(self) -> bool:
+    def _followers_returned(self) -> bool:
         for side, pair in self.pairs.items():
             target = self._return_target.get(side)
             if target is None:
@@ -1072,6 +1091,13 @@ class DaggerController(BaseController):
             follower = np.asarray(pair.follower.get_joint_pos(), dtype=float).reshape(-1)
             if follower.size != target.size or float(np.max(np.abs(follower - target))) > _HOME_TOL:
                 return False
+        return True
+
+    def _leaders_returned(self) -> bool:
+        for side, pair in self.pairs.items():
+            target = self._return_target.get(side)
+            if target is None:
+                return False
             if hasattr(pair.leader, "update_kp_kd") and pair.base_kp is not None:
                 m = min(int(pair.leader.num_dofs()), target.size)
                 if float(np.max(np.abs(self._leader_smooth[side].cur[:m] - target[:m]))) > 1e-9:
@@ -1081,10 +1107,11 @@ class DaggerController(BaseController):
                     return False
         return True
 
-    def _complete_return(self) -> None:
+    def _complete_return(self, *, leader_timed_out: bool = False) -> None:
         with self._return_lock:
             self._returning = False
             self._return_target.clear()
+            self._return_deadline = 0.0
         self._intervening = True
         self._invalidate_policy_action()
         self._reset_fine_grained()
@@ -1093,7 +1120,13 @@ class DaggerController(BaseController):
             self._leader_smooth[side].reset(
                 np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
             )
-        logger.info("DAgger return complete; human intervention enabled")
+        if leader_timed_out:
+            logger.warning(
+                "DAgger follower return complete but leader alignment timed out; "
+                "human intervention enabled with continuous re-anchoring"
+            )
+        else:
+            logger.info("DAgger return complete; human intervention enabled")
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":
@@ -1245,15 +1278,12 @@ class DaggerController(BaseController):
                         d = float(np.linalg.norm(smoother.cur - target))
                         p = min(max(1.0 - d / max(self._return_d0[side], 1e-6), 0.0), 1.0)
                         smoother.max_step = self._leader_smooth[side].max_step = (
-                            self._home_step * self._ease_vel_scale(p)
+                            self._return_step * self._ease_vel_scale(p)
                         )
                         desired = smoother.step(target)
-                        self._bounded_recenter_leader(
+                        self._home_leader(
                             pair,
-                            self._leader_smooth[side],
-                            target[: self.home_arm.size],
-                            self.home_kp,
-                            self.cfg.fine_recenter_max_following_error,
+                            self._leader_smooth[side].step(target[: self.home_arm.size]),
                         )
                 elif self._homing:
                     d = float(np.linalg.norm(smoother.cur - self.home_full))
@@ -1337,8 +1367,11 @@ class DaggerController(BaseController):
 
         self._update_recenter_state(now)
 
-        if self._returning and self._returning_done():
-            self._complete_return()
+        if self._returning and self._followers_returned():
+            leaders_done = self._leaders_returned()
+            leader_timed_out = not leaders_done and now >= self._return_deadline
+            if leaders_done or leader_timed_out:
+                self._complete_return(leader_timed_out=leader_timed_out)
 
         if self._homing and self._homing_done():
             self._homing = False

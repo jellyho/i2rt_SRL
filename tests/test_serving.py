@@ -123,6 +123,80 @@ def test_dagger_relative_return_masks_zero_joints_and_hands_off_to_human():
         ctrl.close()
 
 
+def test_dagger_return_moves_follower_and_leader_at_half_home_speed_without_policy_actions():
+    relative = [0.0] * 14
+    relative[1] = 0.2
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            home_speed=1.0,
+            return_mode="relative",
+            return_rel_pos=relative,
+        )
+    )
+    try:
+        pair = ctrl.pairs["left"]
+        n = pair.leader.num_dofs()
+        pair.base_kp = np.ones(n)
+        pair.base_kd = np.ones(n)
+        pair.leader.update_kp_kd = lambda kp, kd: None
+        follower_before = np.asarray(pair.follower.get_joint_pos(), dtype=float)
+        leader_before = np.asarray(pair.leader.get_joint_pos(), dtype=float)
+
+        # Rollout state is sufficient; a connected policy server/fresh action is
+        # intentionally not required for a recovery return.
+        ctrl.set_policy_running(True)
+        ctrl.return_to_dagger_pose()
+        ctrl.step()
+
+        follower_step = np.asarray(pair.follower.get_joint_pos(), dtype=float)[1] - follower_before[1]
+        leader_step = np.asarray(pair.leader.get_joint_pos(), dtype=float)[1] - leader_before[1]
+        first_tick_limit = 1.0 * 0.5 / 20.0 * ctrl._ease_vel_scale(0.0)
+        assert 0.0 < follower_step <= first_tick_limit + 1e-9
+        assert leader_step == pytest.approx(follower_step)
+        assert ctrl.snapshot()["returning"] is True
+    finally:
+        ctrl.close()
+
+
+def test_dagger_return_hands_off_after_leader_alignment_timeout():
+    relative = [0.0] * 14
+    relative[1] = 0.2
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            home_speed=1.0,
+            return_mode="relative",
+            return_rel_pos=relative,
+        )
+    )
+    try:
+        for pair in ctrl.pairs.values():
+            n = pair.leader.num_dofs()
+            pair.base_kp = np.ones(n)
+            pair.base_kd = np.ones(n)
+            pair.leader.update_kp_kd = lambda kp, kd: None
+            pair.leader.command_joint_pos = lambda target: None
+
+        ctrl.set_policy_running(True)
+        ctrl.return_to_dagger_pose()
+        ctrl.step()
+        ctrl._return_deadline = 0.0
+        for _ in range(40):
+            ctrl.step()
+            if ctrl.snapshot()["intervention"]:
+                break
+
+        snap = ctrl.snapshot()
+        assert snap["returning"] is False
+        assert snap["intervention"] is True
+        assert snap["dagger_state"] == "intervention"
+    finally:
+        ctrl.close()
+
+
 def test_dagger_absolute_return_uses_zero_as_hold_mask():
     absolute = [0.0] * 14
     absolute[1] = 0.1

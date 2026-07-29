@@ -42,7 +42,7 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   engage_time: 2.0         # fixed engage catch-up (s): follower meets the live leader in
   #                          # exactly this time (auto-stretched if a joint would exceed
   #                          # ramp_speed). Omit/0 = legacy speed-based catch-up.
-  home_speed: 0.6            # gentle homing + DAgger recovery return speed (rad/s)
+  home_speed: 0.6            # gentle homing speed; DAgger recovery uses half this speed
   # --- engage / release gate (drives teleop_state IDLE↔ENGAGED↔HOMING, i.e. episode start/stop) ---
   engage_thr: 0.4           # gate-joint displacement (rad) to ENGAGE (lift to start)
   release_thr: 0.3          # gate-joint displacement (rad) to RELEASE → HOMING → IDLE (lower to end)

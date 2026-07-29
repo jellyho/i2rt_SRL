@@ -260,7 +260,7 @@ workstation/yam-data deploy \
 
 For repeatable retry/recovery demonstrations, press **Return + Human** or `R`
 while the policy is running. The robot pauses policy execution, smoothly moves
-both followers and leaders using `control.home_speed`, and enables human
+both followers and leaders at half of `control.home_speed`, and enables human
 intervention only after the configured joint target is reached:
 
 ```yaml
