@@ -57,6 +57,34 @@ class _EditWorker(QtCore.QThread):
         self.done.emit(True, f"{self._label} done")
 
 
+class _LoadWorker(QtCore.QThread):
+    """Open the dataset off the GUI thread (LeRobotDataset construction can be slow).
+
+    Emits ``stage`` messages so the progress dialog can narrate, and opens the dataset
+    once — the editor reuses the reader's handle instead of opening it a second time.
+    """
+
+    stage = QtCore.pyqtSignal(str)
+    done = QtCore.pyqtSignal(bool, str)  # (ok, error)
+
+    def __init__(self, reader: DatasetReader, editor: DatasetEditor) -> None:
+        super().__init__()
+        self.reader = reader
+        self.editor = editor
+
+    def run(self) -> None:
+        try:
+            self.stage.emit("Opening dataset (indexing frames)…")
+            self.reader.load()
+            self.stage.emit("Reading episode metadata…")
+            self.editor.attach(self.reader._ds)  # share the open handle; no second full open
+            _ = self.editor.tasks_by_episode()  # warms meta.episodes here, off the GUI thread
+        except Exception as e:
+            self.done.emit(False, str(e))
+            return
+        self.done.emit(True, "")
+
+
 class EditorGUI(QtWidgets.QWidget):
     def __init__(self, cfg: RecorderConfig) -> None:
         super().__init__()
@@ -67,6 +95,8 @@ class EditorGUI(QtWidgets.QWidget):
         self._n_frames = 0
         self._playing = False
         self._worker: Optional[_EditWorker] = None
+        self._loader: Optional[_LoadWorker] = None
+        self._load_dlg: Optional[QtWidgets.QProgressDialog] = None
         self.setWindowTitle("YAM · LeRobot Dataset Editor")
         self._build()
 
@@ -219,36 +249,63 @@ class EditorGUI(QtWidgets.QWidget):
         if not name:
             QtWidgets.QMessageBox.information(self, "No dataset", "Pick a dataset folder first.")
             return
+        if self._busy():
+            return
         self.play_btn.setChecked(False)
+        self._begin_load(name, root)
+
+    def _begin_load(self, name: str, root: str) -> None:
+        """Open <root>/<name> on a worker thread behind a progress dialog."""
+        self.reader = DatasetReader(name, root, display_cam=self.cfg.review_cam, mock=self.cfg.mock)
+        self.editor = DatasetEditor(name, root)
+
+        # Busy progress dialog while the (potentially slow) dataset open runs on a thread.
+        dlg = QtWidgets.QProgressDialog(f"Loading {name}…", None, 0, 0, self)
+        dlg.setWindowTitle("Loading dataset")
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        self._load_dlg = dlg
+        self._loader = _LoadWorker(self.reader, self.editor)
+        self._loader.stage.connect(dlg.setLabelText)
+        self._loader.done.connect(self._on_loaded)
         self.setEnabled(False)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        QtWidgets.QApplication.processEvents()
-        try:
-            self.reader = DatasetReader(name, root, display_cam=self.cfg.review_cam, mock=self.cfg.mock)
-            self.reader.load()
-            self.editor = DatasetEditor(name, root)
-            self.editor.load()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Load failed", str(e))
+        dlg.show()
+        self._loader.start()
+
+    def _on_loaded(self, ok: bool, err: str) -> None:
+        self.setEnabled(True)
+        self._loader = None
+        if not ok:
+            self._load_dlg.close()
+            QtWidgets.QMessageBox.critical(self, "Load failed", err)
             self.reader = self.editor = None
             return
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            self.setEnabled(True)
-        self._populate_episodes()
-        self.banner.setText(f"{name} · {self.reader.num_episodes} episodes @ {self.reader.fps} fps")
+        name = self.reader.repo_id
+        # Determinate bar for the part we drive ourselves: building the episode list.
+        n = self.reader.num_episodes
+        self._load_dlg.setLabelText(f"Reading {n} episodes…")
+        self._load_dlg.setRange(0, max(n, 1))
+        self._populate_episodes(progress=self._load_dlg)
+        self._load_dlg.close()
+        self.banner.setText(f"{name} · {n} episodes @ {self.reader.fps} fps")
         self.banner.setStyleSheet(theme.banner_style(theme.ACCENT))
         for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
                   self.task_btn, self.delete_btn):
             w.setEnabled(True)
 
-    def _populate_episodes(self) -> None:
+    def _populate_episodes(self, progress: "QtWidgets.QProgressDialog | None" = None) -> None:
         assert self.reader is not None and self.editor is not None
         by_ep = self.editor.outcomes_by_episode()
         tasks = self.editor.tasks_by_episode()
         self.ep_list.blockSignals(True)
         self.ep_list.clear()
         for e in range(self.reader.num_episodes):
+            if progress is not None and e % 25 == 0:
+                progress.setValue(e)
+                QtWidgets.QApplication.processEvents()
             mark = _MARKS.get(by_ep.get(e), "")
             task = tasks.get(e, "")
             label = f"ep {e:>3}  ({self.reader.episode_length(e)} fr) {mark}"
@@ -379,7 +436,9 @@ class EditorGUI(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ worker plumbing
     def _busy(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
+        return (self._worker is not None and self._worker.isRunning()) or (
+            self._loader is not None and self._loader.isRunning()
+        )
 
     def _run_edit(self, fn: Callable[[], object], label: str, reload_after: bool = False) -> None:
         self.banner.setText(f"⟳ {label} …")
@@ -404,23 +463,18 @@ class EditorGUI(QtWidgets.QWidget):
             return
         self.status.setText(message)
         if getattr(self, "_reload_after", False):
-            # Structural change (delete): reopen the dataset from disk and repopulate.
-            try:
-                self.reader.load()
-                self.editor.load()
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Reload failed", str(e))
-                return
-            self._populate_episodes()
-            self.banner.setText(f"{self.reader.repo_id} · {self.reader.num_episodes} episodes @ {self.reader.fps} fps")
+            # Structural change (delete): reopen the dataset from disk (threaded, with the
+            # progress dialog) and repopulate — this can be slow for large datasets.
+            self._begin_load(self.reader.repo_id, self.reader.root)
         else:
             self.editor.load()  # task change altered metadata; reload for fresh reads
             self._refresh_episode_labels()
             self.banner.setText(f"{self.reader.repo_id} · {self.reader.num_episodes} episodes @ {self.reader.fps} fps")
-        self.banner.setStyleSheet(theme.banner_style(theme.ACCENT))
+            self.banner.setStyleSheet(theme.banner_style(theme.ACCENT))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self._play_timer.stop()
-        if self._busy():
-            self._worker.wait(2000)
+        for t in (self._worker, self._loader):
+            if t is not None and t.isRunning():
+                t.wait(2000)
         super().closeEvent(event)

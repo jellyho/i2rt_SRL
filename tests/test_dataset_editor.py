@@ -9,7 +9,14 @@ from __future__ import annotations
 
 import json
 
-from workstation.lerobot_recorder.dataset_editor import DatasetEditor, remap_outcome_entries
+import pytest
+
+from workstation.lerobot_recorder.dataset_editor import (
+    DatasetEditor,
+    remap_outcome_entries,
+    repair_length_consistency,
+    video_length_mismatches,
+)
 
 
 def _entries(*eps):
@@ -75,3 +82,66 @@ def test_outcomes_by_episode_reads_back(tmp_path):
     ed.relabel(0, "success")
     ed.relabel(1, "fail")
     assert ed.outcomes_by_episode() == {0: "success", 1: "fail"}
+
+
+# --------------------------------------------------------------- video-length consistency
+def _write_meta(ds_dir, fps, rows, cams=("agentview", "wrist_left")):
+    """Write a minimal meta/{info.json,episodes/...} with one episode per row.
+
+    Each row: (episode_index, length, {cam: (from_frame, to_frame)}) — timestamps are
+    frame/fps. Mirrors LeRobot v3.0's episode metadata closely enough for the checks.
+    """
+    import pandas as pd
+
+    (ds_dir / "meta").mkdir(parents=True, exist_ok=True)
+    (ds_dir / "meta" / "info.json").write_text(json.dumps({"fps": fps}))
+    ep_dir = ds_dir / "meta" / "episodes" / "chunk-000"
+    ep_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    for ep, length, windows in rows:
+        rec = {"episode_index": ep, "length": length}
+        for cam in cams:
+            ff, tf = windows[cam]
+            rec[f"videos/observation.images.{cam}/from_timestamp"] = ff / fps
+            rec[f"videos/observation.images.{cam}/to_timestamp"] = tf / fps
+        records.append(rec)
+    pd.DataFrame(records).to_parquet(ep_dir / "file-000.parquet", index=False)
+
+
+def test_video_length_mismatch_detected(tmp_path):
+    pytest.importorskip("pandas")
+    ds = tmp_path / "ds"
+    # ep0 consistent (100 frames); ep1 agentview dropped a trailing frame (99 vs 100).
+    _write_meta(ds, 30, [
+        (0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)}),
+        (1, 100, {"agentview": (100, 199), "wrist_left": (100, 200)}),
+    ])
+    bad = video_length_mismatches(str(ds))
+    assert len(bad) == 1
+    assert bad[0]["episode"] == 1 and bad[0]["camera"].endswith("agentview")
+    assert bad[0]["length"] == 100 and bad[0]["derived"] == 99
+
+
+def test_repair_snaps_timestamp_to_length(tmp_path):
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    ds = tmp_path / "ds"
+    _write_meta(ds, 30, [
+        (0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)}),
+        (1, 100, {"agentview": (100, 199), "wrist_left": (100, 200)}),
+    ])
+    n = repair_length_consistency(str(ds))
+    assert n == 1
+    assert video_length_mismatches(str(ds)) == []
+    df = pd.read_parquet(ds / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
+    to_frame = round(float(df.iloc[1]["videos/observation.images.agentview/to_timestamp"]) * 30)
+    assert to_frame == 200  # snapped up so the window spans exactly length (100) frames
+
+
+def test_repair_is_noop_on_consistent_dataset(tmp_path):
+    pytest.importorskip("pandas")
+    ds = tmp_path / "ds"
+    _write_meta(ds, 30, [(0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)})])
+    assert repair_length_consistency(str(ds)) == 0
+    assert video_length_mismatches(str(ds)) == []

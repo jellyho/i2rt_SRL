@@ -63,6 +63,76 @@ def remap_outcome_entries(entries: List[dict], deleted: List[int], total_episode
     return out
 
 
+def video_length_mismatches(ds_dir: str) -> List[dict]:
+    """Find episodes whose stored video window disagrees with the frame ``length``.
+
+    A GPU/streaming encoder can drop an episode's trailing frame, so a camera's video
+    ends up 1 frame shorter than the recorded ``length`` (data + other cameras stay
+    full). Returns one dict per offending ``(episode, camera)``:
+    ``{"episode", "camera", "length", "derived", "file"}``. Empty when consistent.
+    Metadata-only (no video decode) — cheap enough to run after every recording.
+    """
+    import glob as _glob
+
+    import pandas as pd
+
+    info_path = os.path.join(ds_dir, "meta", "info.json")
+    if not os.path.exists(info_path):
+        return []
+    fps = int(json.load(open(info_path))["fps"])
+    files = sorted(_glob.glob(os.path.join(ds_dir, "meta", "episodes", "**", "*.parquet"), recursive=True))
+    out: List[dict] = []
+    for f in files:
+        df = pd.read_parquet(f)
+        vkeys = [c.split("/", 2)[1] for c in df.columns if c.endswith("/from_timestamp")]
+        for i in range(len(df)):
+            length = int(df.iloc[i]["length"])
+            ep = int(df.iloc[i]["episode_index"])
+            for vk in vkeys:
+                derived = round(float(df.iloc[i][f"videos/{vk}/to_timestamp"]) * fps) - round(
+                    float(df.iloc[i][f"videos/{vk}/from_timestamp"]) * fps
+                )
+                if derived != length:
+                    out.append({"episode": ep, "camera": vk, "length": length, "derived": derived, "file": f})
+    return out
+
+
+def repair_length_consistency(ds_dir: str) -> int:
+    """Make ``meta/episodes`` self-consistent so lerobot's editors accept the dataset.
+
+    For every ``(episode, camera)`` whose stored ``to_timestamp - from_timestamp`` disagrees
+    with ``length`` (see :func:`video_length_mismatches`), snaps ``to_timestamp`` so the window
+    spans exactly ``length`` frames. Repairs *metadata only* — data and video bytes are
+    untouched. Returns the number of fields repaired.
+    """
+    import glob as _glob
+
+    import pandas as pd
+
+    info_path = os.path.join(ds_dir, "meta", "info.json")
+    if not os.path.exists(info_path):
+        return 0
+    fps = int(json.load(open(info_path))["fps"])
+    files = sorted(_glob.glob(os.path.join(ds_dir, "meta", "episodes", "**", "*.parquet"), recursive=True))
+    repaired = 0
+    for f in files:
+        df = pd.read_parquet(f)
+        vkeys = [c.split("/", 2)[1] for c in df.columns if c.endswith("/from_timestamp")]
+        changed = False
+        for i in range(len(df)):
+            length = int(df.iloc[i]["length"])
+            for vk in vkeys:
+                fcol, tcol = f"videos/{vk}/from_timestamp", f"videos/{vk}/to_timestamp"
+                from_frame = round(float(df.iloc[i][fcol]) * fps)
+                if round(float(df.iloc[i][tcol]) * fps) - from_frame != length:
+                    df.iat[i, df.columns.get_loc(tcol)] = (from_frame + length) / fps
+                    repaired += 1
+                    changed = True
+        if changed:
+            df.to_parquet(f, index=False)
+    return repaired
+
+
 def _read_jsonl(path: str) -> List[dict]:
     entries: List[dict] = []
     if not os.path.exists(path):
@@ -110,6 +180,11 @@ class DatasetEditor:
         except ImportError:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
         self._ds = LeRobotDataset(self.repo_id, root=self.ds_dir)
+
+    def attach(self, ds: object) -> None:
+        """Reuse an already-open ``LeRobotDataset`` (e.g. the reader's) to avoid a second
+        full open — both point at the same ``<root>/<name>`` folder."""
+        self._ds = ds
 
     @property
     def total_episodes(self) -> int:
@@ -215,21 +290,32 @@ class DatasetEditor:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
 
-        # Re-indexed dataset written to a temp dir (same repo_id so meta is identical).
-        _delete_episodes(self._ds, episode_indices=indices, output_dir=tmp_dir, repo_id=self.repo_id)
-
-        # Remap our sidecars into the new dataset before the swap.
-        new_outcomes = remap_outcome_entries(_read_jsonl(self.outcomes_path), indices, total)
-        if new_outcomes:
-            _write_jsonl(os.path.join(tmp_dir, "outcomes.jsonl"), new_outcomes)
-        rl_cfg = os.path.join(self.ds_dir, "rl_config.json")
-        if os.path.exists(rl_cfg):
-            shutil.copy2(rl_cfg, os.path.join(tmp_dir, "rl_config.json"))
-
-        # The new dataset already lives in tmp_dir, so we move the original *aside*
-        # (instant, no extra disk) rather than copytree-ing it — then swap tmp in.
         backup_path = ""
         try:
+            # Re-indexed dataset written to a temp dir (same repo_id so meta is identical).
+            # If lerobot rejects a length/timestamp inconsistency (GPU-encoder dropped a
+            # trailing frame), repair the metadata once and retry — see repair_length_consistency.
+            try:
+                _delete_episodes(self._ds, episode_indices=indices, output_dir=tmp_dir, repo_id=self.repo_id)
+            except AssertionError as e:
+                if "length mismatch" not in str(e).lower():
+                    raise
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                n = self.repair_length_consistency()
+                logger.warning("repaired %d length/timestamp inconsistency(ies); retrying delete", n)
+                self.load()  # reopen against the repaired metadata
+                _delete_episodes(self._ds, episode_indices=indices, output_dir=tmp_dir, repo_id=self.repo_id)
+
+            # Remap our sidecars into the new dataset before the swap.
+            new_outcomes = remap_outcome_entries(_read_jsonl(self.outcomes_path), indices, total)
+            if new_outcomes:
+                _write_jsonl(os.path.join(tmp_dir, "outcomes.jsonl"), new_outcomes)
+            rl_cfg = os.path.join(self.ds_dir, "rl_config.json")
+            if os.path.exists(rl_cfg):
+                shutil.copy2(rl_cfg, os.path.join(tmp_dir, "rl_config.json"))
+
+            # The new dataset already lives in tmp_dir, so we move the original *aside*
+            # (instant, no extra disk) rather than copytree-ing it — then swap tmp in.
             if backup:
                 backup_path = f"{self.ds_dir}.backup-delete-{len(indices)}ep.{stamp}"
                 os.replace(self.ds_dir, backup_path)
@@ -237,12 +323,20 @@ class DatasetEditor:
             else:
                 shutil.rmtree(self.ds_dir)
             os.replace(tmp_dir, self.ds_dir)
-        except Exception:
+        except BaseException:
+            # Any failure (including the repair path) must not leak the temp dir; the
+            # original dataset is only ever moved in the final swap above, so it is safe.
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
         self._ds = None  # force a reload against the new on-disk layout
         logger.info("deleted %d episode(s) %s; dataset now has %d", len(indices), indices, self.total_episodes)
         return backup_path
+
+    def repair_length_consistency(self) -> int:
+        """Snap ``meta/episodes`` timestamps to match ``length`` so lerobot's editors
+        accept the dataset. Delegates to the module-level
+        :func:`repair_length_consistency`; returns the number of fields repaired."""
+        return repair_length_consistency(self.ds_dir)
 
     def set_task(self, episodes: List[int], task: str, backup: bool = True) -> str:
         """Set the language instruction (task) for the given episodes, in place.

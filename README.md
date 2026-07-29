@@ -122,6 +122,13 @@ and back the folder up first (`<name>.backup-…`); relabelling only touches the
 `outcomes.jsonl` sidecar. Reads the dataset off disk — no robot or cameras needed
 (`--mock` for a synthetic dataset).
 
+> If a GPU/streaming video encode dropped an episode's trailing frame (a camera's
+> video ends up 1 frame shorter than the recorded length), LeRobot would otherwise
+> refuse to delete a shared-file episode. The editor detects this and **auto-repairs
+> the metadata** before retrying, and the recorder now runs the same check at
+> `finalize()` so freshly collected datasets stay consistent (with a warning if it
+> recurs — consider `recorder.streaming_encoding: false` or `vcodec: h264`).
+
 ---
 
 # 📚 Library & API Reference

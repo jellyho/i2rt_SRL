@@ -745,7 +745,39 @@ class AsyncDatasetWriter:
                     logger.info("dataset finalized (parquet/metadata closed)")
                 except Exception as e:
                     logger.error("dataset finalize failed: %s", e)
+                self._verify_video_lengths()
             self._finalized = True
+
+    def _verify_video_lengths(self) -> None:
+        """Guard against the GPU/streaming encoder silently dropping an episode's trailing
+        frame, which leaves a camera's video 1 frame shorter than the recorded ``length``.
+
+        Such a dataset trains fine but later blocks ``delete_episodes`` (LeRobot asserts
+        length == video-frame count before re-encoding a shared file). We detect it cheaply
+        from metadata after finalize, WARN loudly (so the operator can switch encoder if it
+        recurs), and snap the episode metadata back to consistency so the dataset stays
+        editable. Best-effort: never let a check failure break a completed recording."""
+        try:
+            from workstation.lerobot_recorder.dataset_editor import (
+                repair_length_consistency,
+                video_length_mismatches,
+            )
+
+            bad = video_length_mismatches(self._root)
+            if not bad:
+                return
+            cams = sorted({b["camera"].split(".")[-1] for b in bad})
+            eps = sorted({b["episode"] for b in bad})
+            logger.warning(
+                "video/length mismatch on %d episode(s) %s (cameras: %s) — the video encoder "
+                "dropped a trailing frame. Repairing metadata so the dataset stays editable; "
+                "if this recurs often, set recorder.streaming_encoding: false or vcodec: h264.",
+                len(eps), eps, ", ".join(cams),
+            )
+            n = repair_length_consistency(self._root)
+            logger.warning("repaired %d episode-video length field(s) to match frame length", n)
+        except Exception as e:
+            logger.error("video-length verification skipped: %s", e)
 
     def _flush_pending_batch(self) -> None:
         """With batch_encoding_size > 1, LeRobot defers video encoding and its finalize()
