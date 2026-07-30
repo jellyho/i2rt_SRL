@@ -116,11 +116,25 @@ workstation/yam-data edit
 
 Pick a dataset, then per episode you can **scrub / play** the frames (all cameras
 side-by-side), **relabel** the outcome (success / fail / discard), **set the task**
-(language instruction), or **delete** the selected episode(s). Structural edits
-(delete / set-task) re-index the LeRobot dataset via its official `dataset_tools`
-and back the folder up first (`<name>.backup-…`); relabelling only touches the
-`outcomes.jsonl` sidecar. Reads the dataset off disk — no robot or cameras needed
-(`--mock` for a synthetic dataset).
+(language instruction), or **delete** the selected episode(s). A **control-mode
+timeline** under the scrubber shows the whole episode at a glance — where it's teleop
+vs the **homing** tail (click it to seek). Structural edits (delete / set-task)
+re-index the LeRobot dataset via its official `dataset_tools` and back the folder up
+first (`<name>.backup-…`); relabelling only touches the `outcomes.jsonl` sidecar.
+Reads the dataset off disk — no robot or cameras needed (`--mock` for a synthetic dataset).
+
+**Homing annotation** — every episode ends with the arms returning home and the
+gripper closing; that tail isn't useful for training. New recordings are tagged live
+(`observation.control_mode = homing`). For datasets collected earlier, auto-annotate
+it from the gripper:
+
+```bash
+workstation/yam-data mark-homing --dataset user/yam_pick --dry-run   # preview
+workstation/yam-data mark-homing --dataset user/yam_pick             # apply (or --all)
+```
+
+It's non-destructive (only relabels the `control_mode` column — no frames removed, no
+re-encode). At train time, drop the tail by filtering `control_mode == homing`.
 
 > If a GPU/streaming video encode dropped an episode's trailing frame (a camera's
 > video ends up 1 frame shorter than the recorded length), LeRobot would otherwise

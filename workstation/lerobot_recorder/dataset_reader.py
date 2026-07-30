@@ -141,3 +141,21 @@ class DatasetReader:
             return False
         feats = getattr(self._ds, "features", None) or getattr(getattr(self._ds, "meta", None), "features", {}) or {}
         return key in feats
+
+    def get_control_mode_series(self, episode: int) -> Optional[np.ndarray]:
+        """Return the per-frame ``observation.control_mode`` for a whole episode (1-D int-ish
+        float array), or None if absent. One in-memory column read — no video decode."""
+        if self.mock:
+            return None
+        gis = self._ep_index.get(episode, [])
+        if not gis:
+            return None
+        try:
+            col = self._ds.hf_dataset["observation.control_mode"]
+        except Exception:
+            return None
+        out = np.empty(len(gis), dtype=np.float32)
+        for k, gi in enumerate(gis):
+            v = np.asarray(col[gi], dtype=np.float32).reshape(-1)
+            out[k] = v[0] if v.size else 0.0
+        return out
