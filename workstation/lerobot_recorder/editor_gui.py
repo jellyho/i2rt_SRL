@@ -35,7 +35,7 @@ _MARKS = {"success": "✓", "fail": "✗", "discard": "·"}
 # record_source → how it reads in the viewer (what the operator called it).
 _SOURCE_LABEL = {"teleop": "teleop", "dagger": "intervention", "eval": "policy rollout"}
 # observation.control_mode scalar → label (mirrors config.CONTROL_MODE).
-_CONTROL_MODE = {0: "teleop", 1: "policy", 2: "intervention", 3: "replay"}
+_CONTROL_MODE = {0: "teleop", 1: "policy", 2: "intervention", 3: "replay", 4: "homing"}
 
 
 def _np_to_pixmap(img: np.ndarray) -> QtGui.QPixmap:
@@ -112,6 +112,15 @@ class _LoadWorker(QtCore.QThread):
 class EditorGUI(QtWidgets.QWidget):
     def __init__(self, cfg: RecorderConfig) -> None:
         super().__init__()
+        # After an in-place edit (e.g. marking homing) we reopen the dataset to refresh the
+        # view. HuggingFace `datasets` caches parquet per-process, so a same-second reopen
+        # can return the pre-edit rows; disable that cache so reloads always reflect disk.
+        try:
+            import datasets
+
+            datasets.disable_caching()
+        except Exception:
+            pass
         self.cfg = cfg
         self.reader: Optional[DatasetReader] = None
         self.editor: Optional[DatasetEditor] = None
@@ -126,6 +135,7 @@ class EditorGUI(QtWidgets.QWidget):
         self._by_ep: dict = {}
         self._tasks: dict = {}
         self._sources: dict = {}
+        self._restore_view: Optional[tuple] = None  # (episode, frame) to reselect after a reload
         self.setWindowTitle("YAM · LeRobot Dataset Editor")
         self._build()
 
@@ -226,6 +236,24 @@ class EditorGUI(QtWidgets.QWidget):
         task_row.addWidget(self.task_btn)
         editl.addLayout(task_row)
 
+        # Non-destructive homing trim: mark the current frame → end as homing (writes
+        # observation.control_mode=homing) so training can drop the homing tail. No frames
+        # are removed and no video is re-encoded — it just relabels the control-mode column.
+        self.homing_btn = QtWidgets.QPushButton("⌂ Mark homing: here → end")
+        self.homing_btn.setToolTip(
+            "Mark this episode's frames from the current one to the end as homing "
+            "(observation.control_mode = homing), so they're filtered out at train time. "
+            "Non-destructive — scrub to the failure/finish point first."
+        )
+        self.homing_clear_btn = QtWidgets.QPushButton("Clear homing")
+        self.homing_btn.clicked.connect(self._on_mark_homing)
+        self.homing_clear_btn.clicked.connect(self._on_clear_homing)
+        homing_row = QtWidgets.QHBoxLayout()
+        homing_row.addWidget(QtWidgets.QLabel("homing:"))
+        homing_row.addWidget(self.homing_btn, 1)
+        homing_row.addWidget(self.homing_clear_btn)
+        editl.addLayout(homing_row)
+
         self.delete_btn = QtWidgets.QPushButton("🗑 Delete selected episode(s)")
         self.delete_btn.setStyleSheet(f"color:{theme.BAD};font-weight:600;")
         self.delete_btn.clicked.connect(self._on_delete)
@@ -235,7 +263,7 @@ class EditorGUI(QtWidgets.QWidget):
         editl.addWidget(self.backup_cb)
 
         for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
-                  self.task_btn, self.delete_btn):
+                  self.task_btn, self.homing_btn, self.homing_clear_btn, self.delete_btn):
             w.setEnabled(False)
 
         right = QtWidgets.QVBoxLayout()
@@ -340,8 +368,15 @@ class EditorGUI(QtWidgets.QWidget):
         self.banner.setText(f"{name} · {n} episodes @ {self.reader.fps} fps")
         self.banner.setStyleSheet(theme.banner_style(theme.ACCENT))
         for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
-                  self.task_btn, self.delete_btn):
+                  self.task_btn, self.homing_btn, self.homing_clear_btn, self.delete_btn):
             w.setEnabled(True)
+        # Restore the episode/frame the user was on before a homing edit reloaded the dataset.
+        if self._restore_view is not None:
+            ep, frame = self._restore_view
+            self._restore_view = None
+            if 0 <= ep < n:
+                self.ep_list.setCurrentRow(ep)
+                self.slider.setValue(min(frame, max(self.reader.episode_length(ep) - 1, 0)))
 
     def _refresh_meta_cache(self) -> None:
         """Cache the per-episode sidecar/metadata dicts used to label the list + info line."""
@@ -416,15 +451,13 @@ class EditorGUI(QtWidgets.QWidget):
         composite = compose_camera_strip(images, agent_key=self.cfg.review_cam)
         if isinstance(composite, np.ndarray) and composite.ndim == 3:
             self.view.setPixmap(_np_to_pixmap(composite).scaled(self.view.size(), QtCore.Qt.KeepAspectRatio))
-        # per-frame control mode (teleop/policy/intervention) + homing flag, when present.
+        # per-frame control mode (teleop / policy / intervention / homing), when present.
         tags = ""
         cm = self.reader.get_scalar(self._episode, frame, "observation.control_mode")
         if cm is not None:
             mode = round(cm)
-            tags += f"  ·  {_CONTROL_MODE.get(mode, f'mode {mode}')}"
-        hz = self.reader.get_scalar(self._episode, frame, "observation.homing")
-        if hz is not None and hz >= 0.5:
-            tags += "  ·  ⌂ homing"
+            label = _CONTROL_MODE.get(mode, f"mode {mode}")
+            tags = f"  ·  ⌂ {label}" if label == "homing" else f"  ·  {label}"
         self.frame_lbl.setText(f"ep {self._episode} · frame {frame + 1}/{self._n_frames}{tags}")
 
     def _on_scrub(self, value: int) -> None:
@@ -479,6 +512,62 @@ class EditorGUI(QtWidgets.QWidget):
         row = self.ep_list.currentRow()
         if row >= 0:
             self._update_info_line(row)
+
+    def _on_mark_homing(self) -> None:
+        if self.editor is None or self._busy() or self._n_frames == 0:
+            return
+        ep, frame = self._episode, self.slider.value()
+        if frame >= self._n_frames - 1:
+            QtWidgets.QMessageBox.information(
+                self, "Nothing to mark", "Scrub to the frame where the task ends first — "
+                "everything from there to the end is marked as homing.")
+            return
+        self._apply_homing(lambda: self.editor.set_homing_tail(ep, frame), ep, frame,
+                           f"marked homing: ep {ep} frames {frame}-end")
+
+    def _on_clear_homing(self) -> None:
+        if self.editor is None or self._busy():
+            return
+        ep = self._episode
+        self._apply_homing(lambda: self.editor.clear_homing(ep), ep, self.slider.value(),
+                           f"cleared homing on ep {ep}")
+
+    def _apply_homing(self, fn: Callable[[], int], ep: int, frame: int, done_msg: str) -> None:
+        """Apply a fast, non-destructive control-mode edit, then reopen the dataset in place.
+
+        Runs synchronously: the shared dataset handle is released first (so the in-place
+        parquet rewrite + reopen never race a live memory-map — that path is flaky on a
+        worker thread), the edit runs off the closed files, then the dataset is reopened
+        and the previous episode/frame restored.
+        """
+        name, root = self.reader.repo_id, self.reader.root
+        self.setEnabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            # Release the shared open dataset (close its memory-maps) before rewriting the
+            # files, so the reopen below reads a clean, fully-written parquet.
+            self.reader = None
+            if self.editor is not None:
+                self.editor._ds = None
+            gc.collect()
+            n = fn()  # edits the control_mode column by path; needs no open handle
+            self.reader = DatasetReader(name, root, display_cam=self.cfg.review_cam, mock=self.cfg.mock)
+            self.reader.load()
+            self.editor = DatasetEditor(name, root)
+            self.editor.attach(self.reader._ds)
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "Homing edit failed", str(e))
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.setEnabled(True)
+        self._populate_episodes()
+        if 0 <= ep < self.reader.num_episodes:
+            self.ep_list.setCurrentRow(ep)
+            self.slider.setValue(min(frame, max(self.reader.episode_length(ep) - 1, 0)))
+        self.status.setText(f"{done_msg} ({n} frames)")
 
     def _on_set_task(self) -> None:
         if self.editor is None or self._busy():

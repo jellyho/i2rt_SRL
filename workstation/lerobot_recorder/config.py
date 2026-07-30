@@ -28,8 +28,10 @@ EEF_DIM = len(ARMS) * EEF_POSE_DIM  # 14 (zeros when the robot can't provide FK)
 
 # Per-frame control-mode label (always written as observation.control_mode), so a
 # dataset records whether each frame came from teleop, a policy, an intervention,
-# or replay — useful for HG-DAgger filtering and provenance.
-CONTROL_MODE = {"teleop": 0, "policy": 1, "intervention": 2, "replay": 3}
+# replay, or the automatic HOMING return — useful for HG-DAgger filtering and for
+# dropping the homing tail at train time (filter control_mode == homing). The editor
+# can also set frames to `homing` to trim the tail of already-collected episodes.
+CONTROL_MODE = {"teleop": 0, "policy": 1, "intervention": 2, "replay": 3, "homing": 4}
 
 
 def state_names() -> List[str]:
@@ -132,11 +134,6 @@ class RecorderConfig:
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)
     review_before_save: bool = True  # hold each episode for Keep/Delete instead of auto-saving
     auto_arm: bool = False  # arm collection automatically on Start (record on the next teleop engage)
-    # Write a per-frame `observation.homing` flag (1.0 while the arms make the automatic
-    # HOMING return at the end of an episode) so the homing tail can be trimmed in post —
-    # e.g. treat a failed episode as ending at the failure, not after the return. Disable
-    # only to resume a pre-existing dataset that lacks the feature (schema must match).
-    record_homing: bool = True
     review_cam: str = "agentview"  # which camera to buffer (downsampled) for review playback
     # Leader-handle button -> episode outcome, keyed "<side>.<button_index>" (upper=0,
     # lower=1). Left upper is reserved for fine-grained control; right upper discards.

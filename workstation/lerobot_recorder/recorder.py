@@ -28,7 +28,14 @@ import numpy as np
 
 from workstation.lerobot_recorder import episode_gate as eg
 from workstation.lerobot_recorder.cameras import CameraManager
-from workstation.lerobot_recorder.config import ACTION_DIM, EEF_DIM, LEADER_DIM, STATE_DIM, RecorderConfig
+from workstation.lerobot_recorder.config import (
+    ACTION_DIM,
+    CONTROL_MODE,
+    EEF_DIM,
+    LEADER_DIM,
+    STATE_DIM,
+    RecorderConfig,
+)
 from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
 from workstation.lerobot_recorder.episode_gate import EpisodeGate
 from workstation.lerobot_recorder.portal_bridge import PortalBridge
@@ -359,20 +366,20 @@ class Recorder:
             time.sleep(max(0.0, next_t - time.perf_counter()))
 
     def _frame(self, images: dict, snap: dict) -> dict:
-        frame = {
+        # The automatic HOMING return at the episode's tail is recorded but marked as
+        # `homing` in observation.control_mode, so it can be filtered out at train time
+        # (e.g. treat a failed episode as ending at the failure, not after the return).
+        control_mode = snap.get("control_mode", 0)
+        if snap.get("teleop_state") == "HOMING" or snap.get("homing"):
+            control_mode = CONTROL_MODE["homing"]
+        return {
             "images": {k: np.ascontiguousarray(v) for k, v in images.items()},
             "observation.state": self._fit(snap.get("state"), STATE_DIM),
             "observation.leader": self._fit(snap.get("leader"), LEADER_DIM),
             "observation.eef": self._fit(snap.get("eef"), EEF_DIM),
-            "observation.control_mode": np.array([snap.get("control_mode", 0)], dtype=np.float32),
+            "observation.control_mode": np.array([control_mode], dtype=np.float32),
             "action": self._fit(snap.get("action"), ACTION_DIM),
         }
-        if getattr(self.cfg, "record_homing", True):
-            # 1.0 during the automatic HOMING return (recorded as the episode's tail); lets
-            # post-processing trim the homing motion, e.g. end a failed episode at the failure.
-            homing = snap.get("teleop_state") == "HOMING" or bool(snap.get("homing"))
-            frame["observation.homing"] = np.array([1.0 if homing else 0.0], dtype=np.float32)
-        return frame
 
     def _step(self, images: dict, snap: dict) -> None:
         self._scan_buttons(snap)
