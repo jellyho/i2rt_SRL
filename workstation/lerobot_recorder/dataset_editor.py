@@ -209,6 +209,29 @@ class DatasetEditor:
                 continue
         return out
 
+    def sources_by_episode(self) -> Dict[int, str]:
+        """Per-episode record source from the sidecar: ``teleop`` / ``dagger`` / ``eval``."""
+        out: Dict[int, str] = {}
+        for e in _read_jsonl(self.outcomes_path):
+            src = e.get("source")
+            if e.get("episode") is not None and src is not None:
+                try:
+                    out[int(e["episode"])] = str(src)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def frames_by_episode(self) -> Dict[int, int]:
+        """Per-episode recorded frame count from the sidecar (best-effort)."""
+        out: Dict[int, int] = {}
+        for e in _read_jsonl(self.outcomes_path):
+            if e.get("episode") is not None and e.get("frames") is not None:
+                try:
+                    out[int(e["episode"])] = int(e["frames"])
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     def tasks_by_episode(self) -> Dict[int, str]:
         """Per-episode task string, read from the LeRobot metadata (best-effort)."""
         out: Dict[int, str] = {}

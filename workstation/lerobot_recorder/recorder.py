@@ -359,7 +359,7 @@ class Recorder:
             time.sleep(max(0.0, next_t - time.perf_counter()))
 
     def _frame(self, images: dict, snap: dict) -> dict:
-        return {
+        frame = {
             "images": {k: np.ascontiguousarray(v) for k, v in images.items()},
             "observation.state": self._fit(snap.get("state"), STATE_DIM),
             "observation.leader": self._fit(snap.get("leader"), LEADER_DIM),
@@ -367,6 +367,12 @@ class Recorder:
             "observation.control_mode": np.array([snap.get("control_mode", 0)], dtype=np.float32),
             "action": self._fit(snap.get("action"), ACTION_DIM),
         }
+        if getattr(self.cfg, "record_homing", True):
+            # 1.0 during the automatic HOMING return (recorded as the episode's tail); lets
+            # post-processing trim the homing motion, e.g. end a failed episode at the failure.
+            homing = snap.get("teleop_state") == "HOMING" or bool(snap.get("homing"))
+            frame["observation.homing"] = np.array([1.0 if homing else 0.0], dtype=np.float32)
+        return frame
 
     def _step(self, images: dict, snap: dict) -> None:
         self._scan_buttons(snap)

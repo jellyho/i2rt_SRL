@@ -132,6 +132,11 @@ class RecorderConfig:
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)
     review_before_save: bool = True  # hold each episode for Keep/Delete instead of auto-saving
     auto_arm: bool = False  # arm collection automatically on Start (record on the next teleop engage)
+    # Write a per-frame `observation.homing` flag (1.0 while the arms make the automatic
+    # HOMING return at the end of an episode) so the homing tail can be trimmed in post —
+    # e.g. treat a failed episode as ending at the failure, not after the return. Disable
+    # only to resume a pre-existing dataset that lacks the feature (schema must match).
+    record_homing: bool = True
     review_cam: str = "agentview"  # which camera to buffer (downsampled) for review playback
     # Leader-handle button -> episode outcome, keyed "<side>.<button_index>" (upper=0,
     # lower=1). Left upper is reserved for fine-grained control; right upper discards.

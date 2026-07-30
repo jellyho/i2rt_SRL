@@ -98,6 +98,8 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
     # output format: "lerobot" (default) or "abcdl" (abcdl MP4+binary training cache)
     cfg.record_format = str(rec_section.get("format", rec_section.get("record_format", cfg.record_format)))
     cfg.abcdl_size = int(rec_section.get("abcdl_size", cfg.abcdl_size))
+    # per-frame homing flag (observation.homing) so homing tails can be trimmed in post
+    cfg.record_homing = bool(rec_section.get("record_homing", cfg.record_homing))
     # per-frame RL signals (success / reward / mc_return)
     cfg.rl_features = bool(rec_section.get("rl_features", cfg.rl_features))
     cfg.reward_mode = str(rec_section.get("reward_mode", cfg.reward_mode))
