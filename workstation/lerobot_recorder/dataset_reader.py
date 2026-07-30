@@ -120,3 +120,24 @@ class DatasetReader:
         except Exception:
             return None
         return None if st is None else np.asarray(st, dtype=np.float32).reshape(-1)
+
+    def get_scalar(self, episode: int, frame: int, key: str) -> Optional[float]:
+        """Return a per-frame scalar feature (e.g. ``observation.control_mode``, ``homing``),
+        or None if the feature is absent. No video decode."""
+        if self.mock:
+            return None
+        gi = self._ep_index[episode][frame]
+        try:
+            val = self._ds.hf_dataset[gi].get(key)
+        except Exception:
+            return None
+        if val is None:
+            return None
+        arr = np.asarray(val, dtype=np.float32).reshape(-1)
+        return float(arr[0]) if arr.size else None
+
+    def has_feature(self, key: str) -> bool:
+        if self.mock:
+            return False
+        feats = getattr(self._ds, "features", None) or getattr(getattr(self._ds, "meta", None), "features", {}) or {}
+        return key in feats

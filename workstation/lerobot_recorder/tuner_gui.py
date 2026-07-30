@@ -92,7 +92,16 @@ class CameraColumn(QtWidgets.QGroupBox):
         sensor_name = self.sensor.get_info(rs.camera_info.name)
         # the sensor matters: exposure units differ between RGB (100us) and stereo (1us)
         self.model_lbl.setText(f"{self.model} — via {sensor_name}")
+        # Seed each row from config.yaml (the source of truth) when it specifies the
+        # option, not from the live sensor read. Otherwise "Write to config.yaml" would
+        # round-trip whatever the sensor happens to report (e.g. white_balance drifting
+        # back to a driver default), silently clobbering a hand-tuned value the operator
+        # never touched. Config-seeded controls also get re-asserted onto the sensor.
+        cfg_opts = self.spec.options or {}
         for opt, (lo, hi, cur) in self.controls.items():
+            if opt in cfg_opts:
+                cur = min(hi, max(lo, float(cfg_opts[opt])))
+                set_control(self.sensor, opt, cur)
             self._add_row(opt, lo, hi, cur)
 
     def _add_row(self, opt: str, lo: float, hi: float, cur: float) -> None:

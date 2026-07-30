@@ -93,6 +93,14 @@ def main() -> None:
     pt.add_argument("--fine-recenter-timeout", type=float, default=cc.FINE_RECENTER_TIMEOUT)
     pt.add_argument("--rate", type=float, default=120.0)
     pt.add_argument("--ramp-speed", type=float, default=cc.RAMP_SPEED)
+    pt.add_argument(
+        "--engage-time",
+        type=float,
+        default=cc.ENGAGE_TIME,
+        help="fixed engage catch-up (s): the follower cosine-blends to the LIVE leader over this "
+        "time, then hands off to direct teleop — so you never have to hold the leader still waiting. "
+        "0 = legacy speed-based catch-up (can chase a moving leader forever).",
+    )
     pt.add_argument("--home-speed", type=float, default=cc.HOME_SPEED, help="rad/s for the (gentle) homing return")
     pt.add_argument("--gate-joints", default=",".join(str(j) for j in cc.GATE_JOINTS))
     pt.add_argument("--arm-type", default=default_arm)
@@ -168,6 +176,7 @@ def main() -> None:
                 button_outcomes=teleop_button_outcomes(rig),
                 rate=args.rate,
                 ramp_speed=args.ramp_speed,
+                engage_time=args.engage_time,
                 home_speed=args.home_speed,
                 gate_joints=args.gate_joints,
                 arm_type=args.arm_type,
