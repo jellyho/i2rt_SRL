@@ -23,7 +23,7 @@ import logging
 import os
 import shutil
 from datetime import datetime
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 from workstation.lerobot_recorder.dataset_writer import dataset_dir
 
@@ -209,6 +209,29 @@ class DatasetEditor:
                 continue
         return out
 
+    def sources_by_episode(self) -> Dict[int, str]:
+        """Per-episode record source from the sidecar: ``teleop`` / ``dagger`` / ``eval``."""
+        out: Dict[int, str] = {}
+        for e in _read_jsonl(self.outcomes_path):
+            src = e.get("source")
+            if e.get("episode") is not None and src is not None:
+                try:
+                    out[int(e["episode"])] = str(src)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def frames_by_episode(self) -> Dict[int, int]:
+        """Per-episode recorded frame count from the sidecar (best-effort)."""
+        out: Dict[int, int] = {}
+        for e in _read_jsonl(self.outcomes_path):
+            if e.get("episode") is not None and e.get("frames") is not None:
+                try:
+                    out[int(e["episode"])] = int(e["frames"])
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     def tasks_by_episode(self) -> Dict[int, str]:
         """Per-episode task string, read from the LeRobot metadata (best-effort)."""
         out: Dict[int, str] = {}
@@ -233,6 +256,89 @@ class DatasetEditor:
         return out
 
     # ------------------------------------------------------------------ lightweight edit
+    # ---------------------------------------------------- non-destructive homing trim
+    def set_homing_tail(self, episode: int, from_frame: int) -> int:
+        """Mark this episode's frames ``>= from_frame`` as homing (``observation.control_mode
+        = homing``), so training can drop the homing tail — e.g. treat a failed episode as
+        ending at the failure. Non-destructive: no frames removed, no video re-encode; it
+        only rewrites the scalar ``control_mode`` column (present in every recorded dataset).
+        Returns the number of frames marked."""
+        from workstation.lerobot_recorder.config import CONTROL_MODE
+
+        return self._set_control_mode(
+            lambda df: (df["episode_index"] == episode) & (df["frame_index"] >= int(from_frame)),
+            float(CONTROL_MODE["homing"]),
+        )
+
+    def clear_homing(self, episode: int) -> int:
+        """Reset this episode's homing-marked frames back to teleop. Returns frames cleared."""
+        from workstation.lerobot_recorder.config import CONTROL_MODE
+
+        homing, teleop = float(CONTROL_MODE["homing"]), float(CONTROL_MODE["teleop"])
+        return self._set_control_mode(
+            lambda df: (df["episode_index"] == episode) & (df["observation.control_mode"] == homing),
+            teleop,
+        )
+
+    def _set_control_mode(self, predicate: "Callable", value: float) -> int:
+        """Set ``observation.control_mode = value`` for rows matching ``predicate(df)`` across
+        the data parquet files, then refresh that feature's stats. Metadata-only edit."""
+        import glob as _glob
+
+        import pandas as pd
+
+        col = "observation.control_mode"
+        files = sorted(_glob.glob(os.path.join(self.ds_dir, "data", "**", "*.parquet"), recursive=True))
+        n = 0
+        for f in files:
+            df = pd.read_parquet(f)
+            if col not in df.columns:
+                continue
+            mask = predicate(df)
+            count = int(mask.sum())
+            if count:
+                df.loc[mask, col] = value
+                df[col] = df[col].astype("float32")
+                # Atomic replace (write new inode, then rename) — never overwrite the parquet
+                # in place: a reader may still have the old file memory-mapped, and truncating
+                # it under them corrupts their view. os.replace leaves the old inode intact.
+                tmp = f"{f}.tmp"
+                df.to_parquet(tmp, index=False)
+                os.replace(tmp, f)
+                n += count
+        if n:
+            self._refresh_control_mode_stats(files)
+            self._ds = None  # data changed on disk; reopen on next use
+        return n
+
+    def _refresh_control_mode_stats(self, files: List[str]) -> None:
+        """Recompute meta/stats.json for observation.control_mode from the edited column."""
+        import numpy as np
+        import pandas as pd
+
+        stats_path = os.path.join(self.ds_dir, "meta", "stats.json")
+        if not os.path.exists(stats_path):
+            return
+        try:
+            vals = np.concatenate([
+                pd.read_parquet(f, columns=["observation.control_mode"])["observation.control_mode"]
+                .to_numpy(dtype=np.float64)
+                for f in files
+            ])
+            stats = json.load(open(stats_path))
+            stats["observation.control_mode"] = {
+                "min": [float(vals.min())], "max": [float(vals.max())],
+                "mean": [float(vals.mean())], "std": [float(vals.std())],
+                "count": [int(vals.size)],
+                **{f"q{q:02d}": [float(np.percentile(vals, q))] for q in (1, 10, 50, 90, 99)},
+            }
+            tmp = f"{stats_path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(stats, fh)
+            os.replace(tmp, stats_path)
+        except Exception as e:
+            logger.warning("could not refresh control_mode stats: %s", e)
+
     def relabel(self, episode: int, outcome: str) -> None:
         """Set an episode's outcome in the sidecar (no LeRobot rewrite; cheap & instant).
 

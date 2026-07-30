@@ -145,3 +145,49 @@ def test_repair_is_noop_on_consistent_dataset(tmp_path):
     _write_meta(ds, 30, [(0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)})])
     assert repair_length_consistency(str(ds)) == 0
     assert video_length_mismatches(str(ds)) == []
+
+
+# ------------------------------------------------------------- homing (control_mode) trim
+def _write_data(ds_dir, episodes):
+    """Write data/chunk-000/file-000.parquet with control_mode=0 for the given episode lengths."""
+    import numpy as np
+    import pandas as pd
+
+    (ds_dir / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
+    (ds_dir / "meta").mkdir(parents=True, exist_ok=True)
+    (ds_dir / "meta" / "stats.json").write_text(json.dumps({"observation.control_mode": {"min": [0.0]}}))
+    rows = []
+    for ep, length in episodes:
+        for fi in range(length):
+            rows.append({"episode_index": ep, "frame_index": fi, "observation.control_mode": np.float32(0.0)})
+    pd.DataFrame(rows).to_parquet(ds_dir / "data" / "chunk-000" / "file-000.parquet", index=False)
+
+
+def test_set_homing_tail_marks_only_the_tail(tmp_path):
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    ds = tmp_path / "ds"
+    _write_data(ds, [(0, 100), (1, 50)])
+    ed = DatasetEditor("me/ds", str(tmp_path))
+    n = ed.set_homing_tail(0, 80)  # frames 80..99 of ep0
+    assert n == 20
+    df = pd.read_parquet(ds / "data" / "chunk-000" / "file-000.parquet")
+    ep0 = df[df.episode_index == 0].sort_values("frame_index")["observation.control_mode"].to_numpy()
+    assert (ep0[:80] == 0.0).all() and (ep0[80:] == 4.0).all()  # 4.0 == homing
+    # other episode untouched
+    assert (df[df.episode_index == 1]["observation.control_mode"] == 0.0).all()
+
+
+def test_clear_homing_resets_to_teleop(tmp_path):
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    ds = tmp_path / "ds"
+    _write_data(ds, [(0, 100)])
+    ed = DatasetEditor("me/ds", str(tmp_path))
+    ed.set_homing_tail(0, 90)
+    cleared = ed.clear_homing(0)
+    assert cleared == 10
+    df = pd.read_parquet(ds / "data" / "chunk-000" / "file-000.parquet")
+    assert (df["observation.control_mode"] == 0.0).all()

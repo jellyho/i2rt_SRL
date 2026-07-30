@@ -17,6 +17,8 @@ goes through :mod:`workstation.lerobot_recorder.dataset_editor` (LeRobot's offic
 
 from __future__ import annotations
 
+import gc
+import logging
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -30,12 +32,34 @@ from workstation.lerobot_recorder.dataset_writer import list_datasets
 from workstation.lerobot_recorder.views import compose_camera_strip
 
 _MARKS = {"success": "✓", "fail": "✗", "discard": "·"}
+# record_source → how it reads in the viewer (what the operator called it).
+_SOURCE_LABEL = {"teleop": "teleop", "dagger": "intervention", "eval": "policy rollout"}
+# observation.control_mode scalar → label (mirrors config.CONTROL_MODE).
+_CONTROL_MODE = {0: "teleop", 1: "policy", 2: "intervention", 3: "replay", 4: "homing"}
 
 
 def _np_to_pixmap(img: np.ndarray) -> QtGui.QPixmap:
     img = np.ascontiguousarray(img)
     h, w, _ = img.shape
     return QtGui.QPixmap.fromImage(QtGui.QImage(img.tobytes(), w, h, 3 * w, QtGui.QImage.Format_RGB888))
+
+
+class _LogRelay(QtCore.QObject, logging.Handler):
+    """A logging handler that re-emits records as a Qt signal, so a long editor op
+    running on a worker thread can narrate its progress (LeRobot logs each video file
+    it re-encodes) into a progress dialog on the GUI thread."""
+
+    message = QtCore.pyqtSignal(str)
+
+    def __init__(self) -> None:
+        QtCore.QObject.__init__(self)
+        logging.Handler.__init__(self)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.message.emit(record.getMessage())
+        except Exception:
+            pass
 
 
 class _EditWorker(QtCore.QThread):
@@ -74,9 +98,9 @@ class _LoadWorker(QtCore.QThread):
 
     def run(self) -> None:
         try:
-            self.stage.emit("Opening dataset (indexing frames)…")
+            self.stage.emit(f"Opening “{self.reader.repo_id}” — decoding metadata & indexing frames…")
             self.reader.load()
-            self.stage.emit("Reading episode metadata…")
+            self.stage.emit(f"Grouping {self.reader.num_episodes} episodes…")
             self.editor.attach(self.reader._ds)  # share the open handle; no second full open
             _ = self.editor.tasks_by_episode()  # warms meta.episodes here, off the GUI thread
         except Exception as e:
@@ -88,6 +112,15 @@ class _LoadWorker(QtCore.QThread):
 class EditorGUI(QtWidgets.QWidget):
     def __init__(self, cfg: RecorderConfig) -> None:
         super().__init__()
+        # After an in-place edit (e.g. marking homing) we reopen the dataset to refresh the
+        # view. HuggingFace `datasets` caches parquet per-process, so a same-second reopen
+        # can return the pre-edit rows; disable that cache so reloads always reflect disk.
+        try:
+            import datasets
+
+            datasets.disable_caching()
+        except Exception:
+            pass
         self.cfg = cfg
         self.reader: Optional[DatasetReader] = None
         self.editor: Optional[DatasetEditor] = None
@@ -97,6 +130,12 @@ class EditorGUI(QtWidgets.QWidget):
         self._worker: Optional[_EditWorker] = None
         self._loader: Optional[_LoadWorker] = None
         self._load_dlg: Optional[QtWidgets.QProgressDialog] = None
+        self._edit_dlg: Optional[QtWidgets.QProgressDialog] = None
+        self._log_relay: Optional[_LogRelay] = None
+        self._by_ep: dict = {}
+        self._tasks: dict = {}
+        self._sources: dict = {}
+        self._restore_view: Optional[tuple] = None  # (episode, frame) to reselect after a reload
         self.setWindowTitle("YAM · LeRobot Dataset Editor")
         self._build()
 
@@ -145,6 +184,11 @@ class EditorGUI(QtWidgets.QWidget):
         self.view.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
         self.view.setStyleSheet(f"background:#000;border:1px solid #30363d;border-radius:8px;color:{theme.MUTED};")
 
+        # per-episode info line: source (teleop / policy rollout / intervention), outcome, task.
+        self.info_lbl = QtWidgets.QLabel("—")
+        self.info_lbl.setTextFormat(QtCore.Qt.RichText)
+        self.info_lbl.setStyleSheet("font-size:24px;")
+
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_scrub)
@@ -192,6 +236,24 @@ class EditorGUI(QtWidgets.QWidget):
         task_row.addWidget(self.task_btn)
         editl.addLayout(task_row)
 
+        # Non-destructive homing trim: mark the current frame → end as homing (writes
+        # observation.control_mode=homing) so training can drop the homing tail. No frames
+        # are removed and no video is re-encoded — it just relabels the control-mode column.
+        self.homing_btn = QtWidgets.QPushButton("⌂ Mark homing: here → end")
+        self.homing_btn.setToolTip(
+            "Mark this episode's frames from the current one to the end as homing "
+            "(observation.control_mode = homing), so they're filtered out at train time. "
+            "Non-destructive — scrub to the failure/finish point first."
+        )
+        self.homing_clear_btn = QtWidgets.QPushButton("Clear homing")
+        self.homing_btn.clicked.connect(self._on_mark_homing)
+        self.homing_clear_btn.clicked.connect(self._on_clear_homing)
+        homing_row = QtWidgets.QHBoxLayout()
+        homing_row.addWidget(QtWidgets.QLabel("homing:"))
+        homing_row.addWidget(self.homing_btn, 1)
+        homing_row.addWidget(self.homing_clear_btn)
+        editl.addLayout(homing_row)
+
         self.delete_btn = QtWidgets.QPushButton("🗑 Delete selected episode(s)")
         self.delete_btn.setStyleSheet(f"color:{theme.BAD};font-weight:600;")
         self.delete_btn.clicked.connect(self._on_delete)
@@ -201,11 +263,12 @@ class EditorGUI(QtWidgets.QWidget):
         editl.addWidget(self.backup_cb)
 
         for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
-                  self.task_btn, self.delete_btn):
+                  self.task_btn, self.homing_btn, self.homing_clear_btn, self.delete_btn):
             w.setEnabled(False)
 
         right = QtWidgets.QVBoxLayout()
         right.addWidget(self.view, 1)
+        right.addWidget(self.info_lbl)
         right.addWidget(self.slider)
         right.addLayout(transport)
         right.addWidget(edit_box)
@@ -256,11 +319,18 @@ class EditorGUI(QtWidgets.QWidget):
 
     def _begin_load(self, name: str, root: str) -> None:
         """Open <root>/<name> on a worker thread behind a progress dialog."""
+        # Release any previously-open dataset on the GUI thread *before* opening the new
+        # one — its video decoders / memory-mapped parquet must be torn down here, not
+        # concurrently with the new open on the worker thread (that races → segfault).
+        self.reader = None
+        self.editor = None
+        gc.collect()
+
         self.reader = DatasetReader(name, root, display_cam=self.cfg.review_cam, mock=self.cfg.mock)
         self.editor = DatasetEditor(name, root)
 
-        # Busy progress dialog while the (potentially slow) dataset open runs on a thread.
-        dlg = QtWidgets.QProgressDialog(f"Loading {name}…", None, 0, 0, self)
+        # Busy (indeterminate) progress dialog; the worker narrates each stage into it.
+        dlg = QtWidgets.QProgressDialog(f"Loading “{name}”…", None, 0, 0, self)
         dlg.setWindowTitle("Loading dataset")
         dlg.setWindowModality(QtCore.Qt.WindowModal)
         dlg.setCancelButton(None)
@@ -276,8 +346,13 @@ class EditorGUI(QtWidgets.QWidget):
         self._loader.start()
 
     def _on_loaded(self, ok: bool, err: str) -> None:
-        self.setEnabled(True)
+        # Ensure the worker QThread has fully terminated before we drop its reference —
+        # dropping a still-running QThread aborts the process ("Destroyed while running").
+        loader = self._loader
+        if loader is not None:
+            loader.wait()
         self._loader = None
+        self.setEnabled(True)
         if not ok:
             self._load_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Load failed", err)
@@ -286,32 +361,49 @@ class EditorGUI(QtWidgets.QWidget):
         name = self.reader.repo_id
         # Determinate bar for the part we drive ourselves: building the episode list.
         n = self.reader.num_episodes
-        self._load_dlg.setLabelText(f"Reading {n} episodes…")
+        self._load_dlg.setLabelText(f"Building the episode list ({n} episodes)…")
         self._load_dlg.setRange(0, max(n, 1))
         self._populate_episodes(progress=self._load_dlg)
         self._load_dlg.close()
         self.banner.setText(f"{name} · {n} episodes @ {self.reader.fps} fps")
         self.banner.setStyleSheet(theme.banner_style(theme.ACCENT))
         for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
-                  self.task_btn, self.delete_btn):
+                  self.task_btn, self.homing_btn, self.homing_clear_btn, self.delete_btn):
             w.setEnabled(True)
+        # Restore the episode/frame the user was on before a homing edit reloaded the dataset.
+        if self._restore_view is not None:
+            ep, frame = self._restore_view
+            self._restore_view = None
+            if 0 <= ep < n:
+                self.ep_list.setCurrentRow(ep)
+                self.slider.setValue(min(frame, max(self.reader.episode_length(ep) - 1, 0)))
+
+    def _refresh_meta_cache(self) -> None:
+        """Cache the per-episode sidecar/metadata dicts used to label the list + info line."""
+        self._by_ep = self.editor.outcomes_by_episode()
+        self._tasks = self.editor.tasks_by_episode()
+        self._sources = self.editor.sources_by_episode()
+
+    def _episode_label(self, e: int) -> str:
+        mark = _MARKS.get(self._by_ep.get(e), "")
+        src = self._sources.get(e)
+        src_tag = f" [{_SOURCE_LABEL.get(src, src)}]" if src else ""
+        label = f"ep {e:>3}  ({self.reader.episode_length(e)} fr) {mark}{src_tag}"
+        task = self._tasks.get(e, "")
+        if task:
+            label += f"  — {task[:32]}"
+        return label
 
     def _populate_episodes(self, progress: "QtWidgets.QProgressDialog | None" = None) -> None:
         assert self.reader is not None and self.editor is not None
-        by_ep = self.editor.outcomes_by_episode()
-        tasks = self.editor.tasks_by_episode()
+        self._refresh_meta_cache()
         self.ep_list.blockSignals(True)
         self.ep_list.clear()
         for e in range(self.reader.num_episodes):
             if progress is not None and e % 25 == 0:
                 progress.setValue(e)
                 QtWidgets.QApplication.processEvents()
-            mark = _MARKS.get(by_ep.get(e), "")
-            task = tasks.get(e, "")
-            label = f"ep {e:>3}  ({self.reader.episode_length(e)} fr) {mark}"
-            if task:
-                label += f"  — {task[:36]}"
-            self.ep_list.addItem(label)
+            self.ep_list.addItem(self._episode_label(e))
         self.ep_list.blockSignals(False)
         self.count_lbl.setText(f"{self.reader.num_episodes} episodes")
         if self.reader.num_episodes:
@@ -329,10 +421,27 @@ class EditorGUI(QtWidgets.QWidget):
         self.slider.setValue(0)
         self.slider.blockSignals(False)
         # prime the task field from this episode's current task
-        tasks = self.editor.tasks_by_episode() if self.editor else {}
-        if row in tasks:
-            self.task_edit.setText(tasks[row])
+        if row in getattr(self, "_tasks", {}):
+            self.task_edit.setText(self._tasks[row])
+        self._update_info_line(row)
         self._show_frame(0)
+
+    def _update_info_line(self, e: int) -> None:
+        """Episode-level info: source (teleop / policy rollout / intervention) + outcome + task."""
+        src = self._sources.get(e)
+        src_txt = _SOURCE_LABEL.get(src, src) if src else "—"
+        outcome = self._by_ep.get(e)
+        colors = {"success": theme.OK, "fail": theme.BAD, "discard": theme.MUTED}
+        oc = (
+            f'<span style="color:{colors.get(outcome, theme.MUTED)};">{outcome}</span>'
+            if outcome else '<span style="color:%s;">unlabelled</span>' % theme.MUTED
+        )
+        task = self._tasks.get(e, "")
+        task_txt = f" &nbsp;·&nbsp; “{task}”" if task else ""
+        self.info_lbl.setText(
+            f'<b>ep {e}</b> &nbsp;·&nbsp; source: <b style="color:{theme.ACCENT};">{src_txt}</b>'
+            f' &nbsp;·&nbsp; outcome: {oc} &nbsp;·&nbsp; {self._n_frames} frames{task_txt}'
+        )
 
     def _show_frame(self, frame: int) -> None:
         if self.reader is None or self._n_frames == 0:
@@ -342,7 +451,14 @@ class EditorGUI(QtWidgets.QWidget):
         composite = compose_camera_strip(images, agent_key=self.cfg.review_cam)
         if isinstance(composite, np.ndarray) and composite.ndim == 3:
             self.view.setPixmap(_np_to_pixmap(composite).scaled(self.view.size(), QtCore.Qt.KeepAspectRatio))
-        self.frame_lbl.setText(f"ep {self._episode} · frame {frame + 1}/{self._n_frames}")
+        # per-frame control mode (teleop / policy / intervention / homing), when present.
+        tags = ""
+        cm = self.reader.get_scalar(self._episode, frame, "observation.control_mode")
+        if cm is not None:
+            mode = round(cm)
+            label = _CONTROL_MODE.get(mode, f"mode {mode}")
+            tags = f"  ·  ⌂ {label}" if label == "homing" else f"  ·  {label}"
+        self.frame_lbl.setText(f"ep {self._episode} · frame {frame + 1}/{self._n_frames}{tags}")
 
     def _on_scrub(self, value: int) -> None:
         self._show_frame(value)
@@ -387,18 +503,71 @@ class EditorGUI(QtWidgets.QWidget):
         self.status.setText(f"relabelled ep {eps} → {outcome}")
 
     def _refresh_episode_labels(self) -> None:
-        """Cheap in-place refresh of the list marks/tasks (no reader reload)."""
+        """Cheap in-place refresh of the list marks/tasks/source (no reader reload)."""
         if self.reader is None or self.editor is None:
             return
-        by_ep = self.editor.outcomes_by_episode()
-        tasks = self.editor.tasks_by_episode()
+        self._refresh_meta_cache()
         for e in range(self.ep_list.count()):
-            mark = _MARKS.get(by_ep.get(e), "")
-            task = tasks.get(e, "")
-            label = f"ep {e:>3}  ({self.reader.episode_length(e)} fr) {mark}"
-            if task:
-                label += f"  — {task[:36]}"
-            self.ep_list.item(e).setText(label)
+            self.ep_list.item(e).setText(self._episode_label(e))
+        row = self.ep_list.currentRow()
+        if row >= 0:
+            self._update_info_line(row)
+
+    def _on_mark_homing(self) -> None:
+        if self.editor is None or self._busy() or self._n_frames == 0:
+            return
+        ep, frame = self._episode, self.slider.value()
+        if frame >= self._n_frames - 1:
+            QtWidgets.QMessageBox.information(
+                self, "Nothing to mark", "Scrub to the frame where the task ends first — "
+                "everything from there to the end is marked as homing.")
+            return
+        self._apply_homing(lambda: self.editor.set_homing_tail(ep, frame), ep, frame,
+                           f"marked homing: ep {ep} frames {frame}-end")
+
+    def _on_clear_homing(self) -> None:
+        if self.editor is None or self._busy():
+            return
+        ep = self._episode
+        self._apply_homing(lambda: self.editor.clear_homing(ep), ep, self.slider.value(),
+                           f"cleared homing on ep {ep}")
+
+    def _apply_homing(self, fn: Callable[[], int], ep: int, frame: int, done_msg: str) -> None:
+        """Apply a fast, non-destructive control-mode edit, then reopen the dataset in place.
+
+        Runs synchronously: the shared dataset handle is released first (so the in-place
+        parquet rewrite + reopen never race a live memory-map — that path is flaky on a
+        worker thread), the edit runs off the closed files, then the dataset is reopened
+        and the previous episode/frame restored.
+        """
+        name, root = self.reader.repo_id, self.reader.root
+        self.setEnabled(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        QtWidgets.QApplication.processEvents()
+        try:
+            # Release the shared open dataset (close its memory-maps) before rewriting the
+            # files, so the reopen below reads a clean, fully-written parquet.
+            self.reader = None
+            if self.editor is not None:
+                self.editor._ds = None
+            gc.collect()
+            n = fn()  # edits the control_mode column by path; needs no open handle
+            self.reader = DatasetReader(name, root, display_cam=self.cfg.review_cam, mock=self.cfg.mock)
+            self.reader.load()
+            self.editor = DatasetEditor(name, root)
+            self.editor.attach(self.reader._ds)
+        except Exception as e:
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.setEnabled(True)
+            QtWidgets.QMessageBox.critical(self, "Homing edit failed", str(e))
+            return
+        QtWidgets.QApplication.restoreOverrideCursor()
+        self.setEnabled(True)
+        self._populate_episodes()
+        if 0 <= ep < self.reader.num_episodes:
+            self.ep_list.setCurrentRow(ep)
+            self.slider.setValue(min(frame, max(self.reader.episode_length(ep) - 1, 0)))
+        self.status.setText(f"{done_msg} ({n} frames)")
 
     def _on_set_task(self) -> None:
         if self.editor is None or self._busy():
@@ -443,18 +612,54 @@ class EditorGUI(QtWidgets.QWidget):
     def _run_edit(self, fn: Callable[[], object], label: str, reload_after: bool = False) -> None:
         self.banner.setText(f"⟳ {label} …")
         self.banner.setStyleSheet(theme.banner_style(theme.WARN))
-        self.status.setText(f"{label} … (this can take a while for videos)")
-        self.setEnabled(False)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        self.status.setText(f"{label} …")
         self._reload_after = reload_after
+
+        # Busy dialog that narrates the op. Re-encoding videos dominates delete time and
+        # LeRobot logs each file it processes — forward those lines so the bar isn't silent.
+        dlg = QtWidgets.QProgressDialog(f"{label} …\n(re-encoding videos can take a while)", None, 0, 0, self)
+        dlg.setWindowTitle("Working")
+        dlg.setWindowModality(QtCore.Qt.WindowModal)
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumWidth(560)
+        self._edit_dlg = dlg
+        self._log_relay = _LogRelay()
+        self._log_relay.message.connect(lambda m: dlg.setLabelText(f"{label}\n{m}"))
+        self._edit_log_target = logging.getLogger("lerobot")
+        self._prev_lerobot_level = self._edit_log_target.level
+        self._edit_log_target.setLevel(logging.INFO)
+        self._edit_log_target.addHandler(self._log_relay)
+        logging.getLogger("workstation.lerobot_recorder.dataset_editor").addHandler(self._log_relay)
+
+        self.setEnabled(False)
+        dlg.show()
         self._worker = _EditWorker(fn, label)
         self._worker.done.connect(self._on_edit_done)
         self._worker.start()
 
+    def _teardown_edit_log(self) -> None:
+        relay = getattr(self, "_log_relay", None)
+        if relay is None:
+            return
+        self._edit_log_target.removeHandler(relay)
+        self._edit_log_target.setLevel(self._prev_lerobot_level)
+        logging.getLogger("workstation.lerobot_recorder.dataset_editor").removeHandler(relay)
+        self._log_relay = None
+
     def _on_edit_done(self, ok: bool, message: str) -> None:
-        QtWidgets.QApplication.restoreOverrideCursor()
-        self.setEnabled(True)
+        # Ensure the worker QThread finished before dropping it (else the process aborts).
+        worker = self._worker
+        if worker is not None:
+            worker.wait()
         self._worker = None
+        self._teardown_edit_log()
+        if getattr(self, "_edit_dlg", None) is not None:
+            self._edit_dlg.close()
+            self._edit_dlg = None
+        self.setEnabled(True)
         if not ok:
             self.banner.setText("edit failed")
             self.banner.setStyleSheet(theme.banner_style(theme.BAD))
