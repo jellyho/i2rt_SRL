@@ -115,3 +115,31 @@ def test_engage_time_stretched_by_speed_ceiling(monkeypatch):
     t["now"] = 1.0  # the requested duration — must NOT have arrived yet
     tc.step()
     assert follower.cmds[-1][1] < 0.8
+
+
+def test_config_engage_time_reaches_teleop_config():
+    """Regression: config.yaml `control.engage_time` must actually reach the controller.
+
+    TeleopConfig binds its default `engage_time=cc.ENGAGE_TIME` at import time (0.0), so
+    run_robot_server must read the value AFTER apply_control_overrides (argparse default)
+    and pass it into TeleopConfig — otherwise the fixed-time engage is silently off and the
+    follower falls back to speed-based catch-up that can chase a moving leader forever.
+    """
+    import argparse
+
+    from i2rt.serving import control_config as cc
+    from i2rt.serving.controllers import TeleopConfig
+    from i2rt.serving.rig_config import apply_control_overrides
+
+    prev = cc.ENGAGE_TIME
+    try:
+        assert TeleopConfig().engage_time == prev  # dataclass default is the import-time value
+        apply_control_overrides({"control": {"engage_time": 2.0}})
+        assert cc.ENGAGE_TIME == 2.0
+        # run_robot_server builds this arg AFTER the override, then passes it through.
+        p = argparse.ArgumentParser()
+        p.add_argument("--engage-time", type=float, default=cc.ENGAGE_TIME)
+        args = p.parse_args([])
+        assert TeleopConfig(engage_time=args.engage_time).engage_time == 2.0
+    finally:
+        cc.ENGAGE_TIME = prev
