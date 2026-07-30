@@ -74,7 +74,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       exposure: 115
       gain: 64
       enable_auto_white_balance: 0
-      white_balance: 4600
+      white_balance: 4300
   # Both wrists are D405s, so they share ONE identical block (same units, same ranges).
   # Keep these two in sync — if you change one, change the other.
   wrist_left:  # D405
