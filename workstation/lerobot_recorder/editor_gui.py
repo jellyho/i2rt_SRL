@@ -44,6 +44,65 @@ def _np_to_pixmap(img: np.ndarray) -> QtGui.QPixmap:
     return QtGui.QPixmap.fromImage(QtGui.QImage(img.tobytes(), w, h, 3 * w, QtGui.QImage.Format_RGB888))
 
 
+# control_mode value → timeline color (mirrors config.CONTROL_MODE).
+_CM_COLORS = {0: theme.ACCENT, 1: theme.OK, 2: theme.WARN, 3: theme.MUTED, 4: theme.BAD}
+
+
+class _ControlModeBar(QtWidgets.QWidget):
+    """A horizontal timeline of an episode's ``observation.control_mode``: one colored run
+    per mode (teleop / policy / intervention / replay / homing) across the whole episode,
+    with a playhead at the current frame. Click to seek. Shows at a glance where teleop
+    ends and the homing tail begins."""
+
+    seek = QtCore.pyqtSignal(int)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._series: Optional[np.ndarray] = None
+        self._pos = 0
+        self.setFixedHeight(20)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setToolTip("Per-frame control mode over the whole episode — click to seek")
+
+    def set_series(self, series: Optional[np.ndarray]) -> None:
+        self._series = series
+        self.update()
+
+    def set_pos(self, frame: int) -> None:
+        self._pos = frame
+        self.update()
+
+    def paintEvent(self, _event: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QtGui.QColor("#0d1117"))
+        s = self._series
+        if s is None or len(s) == 0 or w <= 0:
+            p.setPen(QtGui.QColor(theme.MUTED))
+            p.drawText(6, h - 6, "(no control_mode)")
+            return
+        n = len(s)
+        # draw contiguous runs of the same mode as colored blocks
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and s[j + 1] == s[i]:
+                j += 1
+            x0 = round(i / n * w)
+            x1 = round((j + 1) / n * w)
+            p.fillRect(x0, 0, max(1, x1 - x0), h, QtGui.QColor(_CM_COLORS.get(round(float(s[i])), "#30363d")))
+            i = j + 1
+        # playhead
+        px = round(min(max(self._pos, 0), n - 1) / n * w)
+        p.setPen(QtGui.QPen(QtGui.QColor("white"), 2))
+        p.drawLine(px, 0, px, h)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        s = self._series
+        if s is not None and len(s) and self.width() > 0:
+            self.seek.emit(int(event.x() / self.width() * len(s)))
+
+
 class _LogRelay(QtCore.QObject, logging.Handler):
     """A logging handler that re-emits records as a Qt signal, so a long editor op
     running on a worker thread can narrate its progress (LeRobot logs each video file
@@ -135,7 +194,6 @@ class EditorGUI(QtWidgets.QWidget):
         self._by_ep: dict = {}
         self._tasks: dict = {}
         self._sources: dict = {}
-        self._restore_view: Optional[tuple] = None  # (episode, frame) to reselect after a reload
         self.setWindowTitle("YAM · LeRobot Dataset Editor")
         self._build()
 
@@ -193,6 +251,19 @@ class EditorGUI(QtWidgets.QWidget):
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self._on_scrub)
 
+        # control-mode timeline (whole episode at a glance) + legend, aligned under the slider.
+        self.cm_bar = _ControlModeBar()
+        self.cm_bar.seek.connect(self.slider.setValue)
+        legend = QtWidgets.QLabel(
+            f'<span style="color:{theme.ACCENT};">▉</span> teleop &nbsp;'
+            f'<span style="color:{theme.OK};">▉</span> policy &nbsp;'
+            f'<span style="color:{theme.WARN};">▉</span> intervention &nbsp;'
+            f'<span style="color:{theme.BAD};">▉</span> homing'
+        )
+        legend.setTextFormat(QtCore.Qt.RichText)
+        legend.setStyleSheet("font-size:18px;")
+        self.cm_legend = legend
+
         self.play_btn = QtWidgets.QPushButton("▶ Play")
         self.play_btn.setCheckable(True)
         self.play_btn.toggled.connect(self._on_play_toggled)
@@ -236,23 +307,9 @@ class EditorGUI(QtWidgets.QWidget):
         task_row.addWidget(self.task_btn)
         editl.addLayout(task_row)
 
-        # Non-destructive homing trim: mark the current frame → end as homing (writes
-        # observation.control_mode=homing) so training can drop the homing tail. No frames
-        # are removed and no video is re-encoded — it just relabels the control-mode column.
-        self.homing_btn = QtWidgets.QPushButton("⌂ Mark homing: here → end")
-        self.homing_btn.setToolTip(
-            "Mark this episode's frames from the current one to the end as homing "
-            "(observation.control_mode = homing), so they're filtered out at train time. "
-            "Non-destructive — scrub to the failure/finish point first."
-        )
-        self.homing_clear_btn = QtWidgets.QPushButton("Clear homing")
-        self.homing_btn.clicked.connect(self._on_mark_homing)
-        self.homing_clear_btn.clicked.connect(self._on_clear_homing)
-        homing_row = QtWidgets.QHBoxLayout()
-        homing_row.addWidget(QtWidgets.QLabel("homing:"))
-        homing_row.addWidget(self.homing_btn, 1)
-        homing_row.addWidget(self.homing_clear_btn)
-        editl.addLayout(homing_row)
+        # Homing is annotated outside the GUI (auto-detected from the gripper by
+        # `yam-data mark-homing`, and tagged live by the recorder). The control-mode timeline
+        # above shows the result — teleop vs the homing tail — at a glance.
 
         self.delete_btn = QtWidgets.QPushButton("🗑 Delete selected episode(s)")
         self.delete_btn.setStyleSheet(f"color:{theme.BAD};font-weight:600;")
@@ -262,14 +319,16 @@ class EditorGUI(QtWidgets.QWidget):
         editl.addWidget(self.delete_btn)
         editl.addWidget(self.backup_cb)
 
-        for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
-                  self.task_btn, self.homing_btn, self.homing_clear_btn, self.delete_btn):
+        for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit, self.task_btn,
+                  self.delete_btn):
             w.setEnabled(False)
 
         right = QtWidgets.QVBoxLayout()
         right.addWidget(self.view, 1)
         right.addWidget(self.info_lbl)
         right.addWidget(self.slider)
+        right.addWidget(self.cm_bar)
+        right.addWidget(self.cm_legend)
         right.addLayout(transport)
         right.addWidget(edit_box)
 
@@ -368,15 +427,8 @@ class EditorGUI(QtWidgets.QWidget):
         self.banner.setText(f"{name} · {n} episodes @ {self.reader.fps} fps")
         self.banner.setStyleSheet(theme.banner_style(theme.ACCENT))
         for w in (self.keep_btn, self.fail_btn, self.discard_btn, self.task_edit,
-                  self.task_btn, self.homing_btn, self.homing_clear_btn, self.delete_btn):
+                  self.task_btn, self.delete_btn):
             w.setEnabled(True)
-        # Restore the episode/frame the user was on before a homing edit reloaded the dataset.
-        if self._restore_view is not None:
-            ep, frame = self._restore_view
-            self._restore_view = None
-            if 0 <= ep < n:
-                self.ep_list.setCurrentRow(ep)
-                self.slider.setValue(min(frame, max(self.reader.episode_length(ep) - 1, 0)))
 
     def _refresh_meta_cache(self) -> None:
         """Cache the per-episode sidecar/metadata dicts used to label the list + info line."""
@@ -424,6 +476,7 @@ class EditorGUI(QtWidgets.QWidget):
         if row in getattr(self, "_tasks", {}):
             self.task_edit.setText(self._tasks[row])
         self._update_info_line(row)
+        self.cm_bar.set_series(self.reader.get_control_mode_series(row))  # whole-episode timeline
         self._show_frame(0)
 
     def _update_info_line(self, e: int) -> None:
@@ -447,6 +500,7 @@ class EditorGUI(QtWidgets.QWidget):
         if self.reader is None or self._n_frames == 0:
             return
         frame = max(0, min(frame, self._n_frames - 1))
+        self.cm_bar.set_pos(frame)
         images = self.reader.get_images(self._episode, frame)
         composite = compose_camera_strip(images, agent_key=self.cfg.review_cam)
         if isinstance(composite, np.ndarray) and composite.ndim == 3:
@@ -512,62 +566,6 @@ class EditorGUI(QtWidgets.QWidget):
         row = self.ep_list.currentRow()
         if row >= 0:
             self._update_info_line(row)
-
-    def _on_mark_homing(self) -> None:
-        if self.editor is None or self._busy() or self._n_frames == 0:
-            return
-        ep, frame = self._episode, self.slider.value()
-        if frame >= self._n_frames - 1:
-            QtWidgets.QMessageBox.information(
-                self, "Nothing to mark", "Scrub to the frame where the task ends first — "
-                "everything from there to the end is marked as homing.")
-            return
-        self._apply_homing(lambda: self.editor.set_homing_tail(ep, frame), ep, frame,
-                           f"marked homing: ep {ep} frames {frame}-end")
-
-    def _on_clear_homing(self) -> None:
-        if self.editor is None or self._busy():
-            return
-        ep = self._episode
-        self._apply_homing(lambda: self.editor.clear_homing(ep), ep, self.slider.value(),
-                           f"cleared homing on ep {ep}")
-
-    def _apply_homing(self, fn: Callable[[], int], ep: int, frame: int, done_msg: str) -> None:
-        """Apply a fast, non-destructive control-mode edit, then reopen the dataset in place.
-
-        Runs synchronously: the shared dataset handle is released first (so the in-place
-        parquet rewrite + reopen never race a live memory-map — that path is flaky on a
-        worker thread), the edit runs off the closed files, then the dataset is reopened
-        and the previous episode/frame restored.
-        """
-        name, root = self.reader.repo_id, self.reader.root
-        self.setEnabled(False)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        QtWidgets.QApplication.processEvents()
-        try:
-            # Release the shared open dataset (close its memory-maps) before rewriting the
-            # files, so the reopen below reads a clean, fully-written parquet.
-            self.reader = None
-            if self.editor is not None:
-                self.editor._ds = None
-            gc.collect()
-            n = fn()  # edits the control_mode column by path; needs no open handle
-            self.reader = DatasetReader(name, root, display_cam=self.cfg.review_cam, mock=self.cfg.mock)
-            self.reader.load()
-            self.editor = DatasetEditor(name, root)
-            self.editor.attach(self.reader._ds)
-        except Exception as e:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            self.setEnabled(True)
-            QtWidgets.QMessageBox.critical(self, "Homing edit failed", str(e))
-            return
-        QtWidgets.QApplication.restoreOverrideCursor()
-        self.setEnabled(True)
-        self._populate_episodes()
-        if 0 <= ep < self.reader.num_episodes:
-            self.ep_list.setCurrentRow(ep)
-            self.slider.setValue(min(frame, max(self.reader.episode_length(ep) - 1, 0)))
-        self.status.setText(f"{done_msg} ({n} frames)")
 
     def _on_set_task(self) -> None:
         if self.editor is None or self._busy():

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 
 from workstation.lerobot_recorder.dataset_editor import (
     DatasetEditor,
+    detect_homing_start,
     remap_outcome_entries,
     repair_length_consistency,
     video_length_mismatches,
@@ -191,3 +193,32 @@ def test_clear_homing_resets_to_teleop(tmp_path):
     assert cleared == 10
     df = pd.read_parquet(ds / "data" / "chunk-000" / "file-000.parquet")
     assert (df["observation.control_mode"] == 0.0).all()
+
+
+# ------------------------------------------------------------- auto homing detection
+def _gripper_close_signal(task_len, close_len, open_val=0.99, floor=0.003):
+    """An episode that stays open through the task then ramps to a closed floor and holds."""
+    task = np.full(task_len, open_val)
+    ramp = np.linspace(open_val, floor, close_len // 2)
+    hold = np.full(close_len - ramp.size, floor)
+    return np.concatenate([task, ramp, hold])
+
+
+def test_detect_homing_start_finds_final_close():
+    g = _gripper_close_signal(task_len=200, close_len=80)
+    start = detect_homing_start(g)
+    assert start is not None
+    # homing starts where the final descent begins (~end of the open task segment)
+    assert 195 <= start <= 205
+
+
+def test_detect_homing_returns_none_when_not_ending_closed():
+    # ends open (never closes) → no homing to guess
+    g = np.concatenate([np.full(150, 0.99), np.linspace(0.99, 0.6, 50)])
+    assert detect_homing_start(g) is None
+
+
+def test_detect_homing_ignores_midtask_close_that_reopens():
+    # closes mid-task (a grasp) but reopens and ends open → not a homing tail
+    g = np.concatenate([np.full(80, 0.9), np.full(40, 0.05), np.full(120, 0.9)])
+    assert detect_homing_start(g) is None

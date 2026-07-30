@@ -23,11 +23,59 @@ import logging
 import os
 import shutil
 from datetime import datetime
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
+import numpy as np
+
+from workstation.lerobot_recorder.config import ARM_DOF
 from workstation.lerobot_recorder.dataset_writer import dataset_dir
 
 logger = logging.getLogger(__name__)
+
+# Gripper joint positions inside observation.state = [L.pos(7), L.vel, L.eff, R.pos(7), ...];
+# the gripper is the last DOF of each arm's pos block.
+_L_GRIP = ARM_DOF - 1
+_R_GRIP = 3 * ARM_DOF + (ARM_DOF - 1)
+
+
+def detect_homing_start(
+    gripper: "np.ndarray", *, closed_ceiling: float = 0.15, close_margin: float = 0.06, min_drop: float = 0.15
+) -> Optional[int]:
+    """Find where the automatic HOMING return begins, from the gripper signal.
+
+    Every episode ends with the gripper closing to a floor and holding there while the
+    arms return home. This returns the frame index where that **final close** begins (the
+    top of the last descent into the sustained closed hold), or ``None`` if the episode
+    doesn't end with the gripper actually closed (so nothing is guessed). Gripper is
+    normalized ~1 open / ~0 closed. Pure + smoothed → robust to sensor noise; unit-tested.
+    """
+    g = np.asarray(gripper, dtype=np.float64).reshape(-1)
+    n = g.size
+    if n < 20:
+        return None
+    # light moving-average smoothing
+    w = 5
+    g = np.convolve(g, np.ones(w) / w, mode="same")
+    floor = float(np.median(g[-10:]))
+    if floor > closed_ceiling:
+        return None  # the episode doesn't END with the gripper actually closed → don't guess
+    close_thr = floor + close_margin
+    if g[-1] > close_thr:
+        return None  # didn't settle at the floor → don't guess
+    # sustained closed hold at the very end
+    i = n - 1
+    while i > 0 and g[i] <= close_thr:
+        i -= 1
+    hold_start = i + 1
+    if hold_start >= n or (n - hold_start) < 3:
+        return None
+    # walk back through the final descent (closing forward ⇒ rising as we step back)
+    j = hold_start
+    while j - 1 >= 0 and g[j - 1] > g[j] + 1e-4:
+        j -= 1
+    if g[j] - floor < min_drop:
+        return None  # not a real close (too small a drop) → skip
+    return int(j)
 
 
 # --------------------------------------------------------------------------- pure helpers
@@ -279,6 +327,60 @@ class DatasetEditor:
             lambda df: (df["episode_index"] == episode) & (df["observation.control_mode"] == homing),
             teleop,
         )
+
+    def episode_homing_starts(self, episodes: Optional[List[int]] = None) -> Dict[int, int]:
+        """Auto-detect the homing-return start (within-episode frame index) for each episode
+        from the gripper signal — see :func:`detect_homing_start`. Read-only: returns
+        ``{episode: from_frame}`` only for episodes that clearly end with the gripper closing
+        (others are omitted, never guessed). ``episodes`` limits the scan."""
+        import glob as _glob
+
+        import pandas as pd
+
+        files = sorted(_glob.glob(os.path.join(self.ds_dir, "data", "**", "*.parquet"), recursive=True))
+        if not files:
+            return {}
+        df = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "observation.state"])
+                        for f in files])
+        want = set(episodes) if episodes is not None else None
+        starts: Dict[int, int] = {}
+        for ep, e in df.groupby("episode_index"):
+            ep = int(ep)
+            if want is not None and ep not in want:
+                continue
+            e = e.sort_values("frame_index")
+            state = np.stack(e["observation.state"].to_numpy())
+            if state.shape[1] <= _R_GRIP:
+                continue
+            gripper = 0.5 * (state[:, _L_GRIP] + state[:, _R_GRIP])
+            hs = detect_homing_start(gripper)
+            if hs is not None:
+                starts[ep] = int(e["frame_index"].to_numpy()[hs])
+        return starts
+
+    def auto_mark_homing(self, episodes: Optional[List[int]] = None) -> Dict[int, int]:
+        """Detect and mark the homing tail of every episode in one pass (non-destructive).
+
+        Sets ``observation.control_mode = homing`` from each detected start to the episode
+        end, in a single batched parquet rewrite. Returns ``{episode: frames_marked}``.
+        """
+        from workstation.lerobot_recorder.config import CONTROL_MODE
+
+        starts = self.episode_homing_starts(episodes)
+        if not starts:
+            return {}
+
+        def predicate(df: "object") -> "np.ndarray":  # rows at/after each episode's homing start
+            ei = df["episode_index"].to_numpy()
+            fi = df["frame_index"].to_numpy()
+            mask = np.zeros(len(df), dtype=bool)
+            for ep, frm in starts.items():
+                mask |= (ei == ep) & (fi >= frm)
+            return mask
+
+        self._set_control_mode(predicate, float(CONTROL_MODE["homing"]))
+        # frames marked per episode = length - start (length = max frame_index + 1)
+        return starts
 
     def _set_control_mode(self, predicate: "Callable", value: float) -> int:
         """Set ``observation.control_mode = value`` for rows matching ``predicate(df)`` across
