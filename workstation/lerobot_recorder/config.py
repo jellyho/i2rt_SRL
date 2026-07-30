@@ -124,7 +124,8 @@ class RecorderConfig:
     robot_port: int = 11331
     # What drives episode gating + the recorded action:
     #   "teleop" -> gate on teleop_state (ENGAGED..IDLE), action = applied command
-    #   "dagger" -> gate on intervention (HG-DAgger), action = human (leader) action
+    #   "dagger" -> gate on the complete policy rollout, action = executed command;
+    #               observation.control_mode marks policy vs human intervention
     record_source: str = "teleop"
     resume: bool = False  # append to an existing dataset at `root` instead of creating a new one
     min_free_gb: float = 1.0  # refuse to save an episode when free disk drops below this
