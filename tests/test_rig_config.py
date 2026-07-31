@@ -18,6 +18,7 @@ from i2rt.serving.rig_config import (
 )
 from workstation.lerobot_recorder.__main__ import build_config
 from workstation.lerobot_recorder.config import default_cameras
+from workstation.lerobot_recorder.deploy_main import build_configs
 
 
 def _no_repo_rig(monkeypatch, tmp_path):
@@ -227,3 +228,14 @@ def test_recorder_config_uses_shared_button_outcomes(tmp_path):
     cfg = build_config(["--config", str(cfg_path)])
 
     assert cfg.button_map == {"left.2": "success"}
+
+
+def test_reference_overlay_opacity_is_shared_by_record_and_deploy_configs(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("recorder:\n  reference_live_alpha: 0.3\n")
+
+    record_cfg = build_config(["--config", str(cfg_path)])
+    deploy_cfg, _ = build_configs(["--config", str(cfg_path)])
+
+    assert record_cfg.reference_live_alpha == 0.3
+    assert deploy_cfg.reference_live_alpha == 0.3
