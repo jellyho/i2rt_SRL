@@ -6,6 +6,8 @@
   the bottom corners, kept for any callers that still want the compact view.
 * :func:`overlay` — alpha-blend two frames (e.g. an episode's first frame with the
   live camera) so the operator can match object placement before a replay.
+* :func:`overlay_camera_views` — blend synchronized past-episode views into the
+  matching live camera views without modifying the raw recorder images.
 """
 
 from __future__ import annotations
@@ -79,3 +81,25 @@ def overlay(base: Optional[np.ndarray], other: Optional[np.ndarray], alpha: floa
         return base
     o = _resize(np.ascontiguousarray(other), base.shape[0], base.shape[1])
     return (base.astype(np.float32) * (1.0 - alpha) + o.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+
+
+def overlay_camera_views(
+    live: Dict[str, np.ndarray],
+    reference: Dict[str, np.ndarray],
+    live_alpha: float = 0.5,
+) -> Dict[str, np.ndarray]:
+    """Blend each live view over its matching reference view.
+
+    ``live_alpha=1`` is an unchanged live preview and ``live_alpha=0`` is the
+    past episode only.  A new mapping and new blended arrays are returned; this
+    is important because the original frames are also consumed by the dataset
+    writer and deployment policy.
+    """
+
+    alpha = min(max(float(live_alpha), 0.0), 1.0)
+    out = dict(live)
+    for key in live.keys() & reference.keys():
+        blended = overlay(reference[key], live[key], alpha=alpha)
+        if blended is not None:
+            out[key] = blended
+    return out
