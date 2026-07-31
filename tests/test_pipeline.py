@@ -126,6 +126,7 @@ def test_async_writer_resume_preserves_encoding_kwargs(tmp_path, monkeypatch):
         mock=False,
         resume=True,
         vcodec="auto",
+        encoding_backend="pyav",
         batch_encoding_size=4,
         encoder_threads=2,
     )

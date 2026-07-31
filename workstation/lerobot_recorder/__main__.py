@@ -105,6 +105,10 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
     # video-encoding knobs (saving speed): config.yaml recorder.* overrides the defaults
     cfg.use_videos = bool(rec_section.get("use_videos", cfg.use_videos))
     cfg.vcodec = str(rec_section.get("vcodec", cfg.vcodec))
+    cfg.encoding_backend = str(rec_section.get("encoding_backend", cfg.encoding_backend))
+    cfg.torchcodec_max_used_vram_gb = float(
+        rec_section.get("torchcodec_max_used_vram_gb", cfg.torchcodec_max_used_vram_gb)
+    )
     cfg.encoder_threads = int(rec_section.get("encoder_threads", cfg.encoder_threads))
     cfg.batch_encoding_size = int(rec_section.get("batch_encoding_size", cfg.batch_encoding_size))
     cfg.image_writer_threads = int(rec_section.get("image_writer_threads", cfg.image_writer_threads))
