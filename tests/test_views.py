@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from workstation.lerobot_recorder.views import compose_agentview, compose_camera_strip, overlay
+from workstation.lerobot_recorder.views import compose_agentview, compose_camera_strip, overlay, overlay_camera_views
 
 
 def test_compose_camera_strip_orders_left_agent_right():
@@ -44,3 +44,28 @@ def test_overlay_blend():
     assert blended.shape == (10, 10, 3)
     assert np.all(blended == 100)  # 0*0.5 + 200*0.5
     assert overlay(None, b) is b  # degenerate inputs pass through
+
+
+def test_overlay_camera_views_matches_keys_without_mutating_live_frames():
+    live = {
+        "wrist_left": np.full((4, 5, 3), 200, np.uint8),
+        "agentview": np.full((4, 5, 3), 100, np.uint8),
+    }
+    reference = {
+        "wrist_left": np.zeros((8, 10, 3), np.uint8),
+        "wrist_right": np.full((4, 5, 3), 50, np.uint8),
+    }
+
+    blended = overlay_camera_views(live, reference, live_alpha=0.25)
+
+    assert np.all(blended["wrist_left"] == 50)
+    assert blended["agentview"] is live["agentview"]
+    assert np.all(live["wrist_left"] == 200)
+
+
+def test_overlay_camera_views_opacity_endpoints():
+    live = {"agentview": np.full((2, 2, 3), 220, np.uint8)}
+    reference = {"agentview": np.full((2, 2, 3), 20, np.uint8)}
+
+    assert np.all(overlay_camera_views(live, reference, live_alpha=0)["agentview"] == 20)
+    assert np.all(overlay_camera_views(live, reference, live_alpha=1)["agentview"] == 220)

@@ -117,6 +117,7 @@ recorder:
   discount_factor: 0.99      # γ for the Monte-Carlo return-to-go (mc_return)
   review_before_save: false  # auto-save every engage→idle episode (no Keep/Delete hold)
   auto_arm: true             # arm collection on Start; records on the next teleop engage
+  reference_live_alpha: 0.5  # past-episode overlay: 1=live only, 0=past video only (preview only)
   # --- saving speed (video encoding) ---
   # Encoding implementation. TorchCodec is preferred by default. At writer startup
   # and again before each camera encode, it safely falls back to PyAV/CPU H.264

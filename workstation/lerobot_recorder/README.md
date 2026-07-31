@@ -250,6 +250,25 @@ The recorder opens on a **Setup page**:
 3. **START** connects the robot, opens cameras + dataset, and — with `auto_arm` —
    arms collection immediately.
 
+The **Past demonstration overlay** panel at the bottom then reads that dataset's
+LeRobot `meta/episodes` table. Each row is one demonstration (`episode_index`), even
+when many demonstrations share one MP4 container. Selecting a demonstration displays
+all three synchronized slices (left wrist,
+agentview, right wrist) over their matching live cameras. **Live camera opacity** is
+`100%` for live-only, `0%` for the past episode only, and any middle value is a
+blend. Selection always starts paused on the first frame; **Resume reference** starts
+playback, and **Pause reference** freezes the current comparison frame. Use **Continue
+collecting** when the selected folder is the desired source of past episodes—starting
+fresh removes it after the overwrite confirmations. The player reads completed MP4s
+directly, so it can safely coexist with an append session, and **Refresh demonstrations**
+finds newly encoded saves. The first saved demonstration is selected automatically; there
+is no separate Off entry because `100%` live-camera opacity fully hides the reference.
+
+The overlay exists only in the operator display composition. Dataset frames and
+deployment policy observations both use the untouched RealSense arrays. The shared
+panel therefore behaves the same in `yam-data record` and `yam-data deploy` without
+adding video decoding to either robot-side server.
+
 Then teleoperate: **lift both gellos** → records; **bring both home** → episode ends.
 With `review_before_save: true` it's held in the **review panel** for **Keep** (S/F) /
 **Delete** (D); with `review_before_save: false` it **auto-saves** each engage→idle.
@@ -365,6 +384,10 @@ Dry run: `workstation/yam-data replay --mock`.
   **health strip** (robot link · cameras · save queue), **live stats** (kept ✓/✗,
   discarded, success rate), **audio cues** (start, keep/fail/delete, fault), and a
   review **scrubber** — so you can collect while watching the robot.
+- **Past demonstration overlay**: after START, select any completed demonstration in the active
+  dataset to blend its three synchronized camera videos into the matching live
+  previews. It starts paused and plays only after **Resume reference**. The opacity
+  setting persists separately for Record and Deploy.
 - **Task templates**: `--tasks "pick the cube; stack the blocks; open the drawer"`
   gives a quick-switch dropdown; the active task **persists until you change it**
   (editable — type a new one on the fly).
