@@ -14,6 +14,30 @@ Two tools (both have a PyQt GUI):
 | **Recorder** | `workstation.lerobot_recorder` | teleop-gated LeRobot capture + review/delete |
 | **Replay**   | `workstation.lerobot_recorder.replay_main` | play a dataset back onto the robot |
 
+## Recording video backend
+
+The workstation recorder supports two encoding implementations through
+`recorder.encoding_backend` in the repository `config.yaml`:
+
+- `torchcodec` (default): prefers TorchCodec's `VideoEncoder`. At writer startup
+  and again before each camera encode,
+  it falls back to PyAV with CPU H.264 if TorchCodec is unavailable, GPU memory
+  cannot be measured, or primary-GPU usage is at least
+  `recorder.torchcodec_max_used_vram_gb` (5 GiB by default).
+- `pyav`: always uses LeRobot's existing PyAV encoder.
+
+TorchCodec 0.10 accepts a complete episode tensor rather than incremental frames,
+so `streaming_encoding` is disabled while TorchCodec is effective. Cameras are
+encoded sequentially and tensors remain in host memory to keep peak VRAM small.
+PyAV continues to honor `streaming_encoding: true`.
+
+Benchmark both implementations on the workstation with:
+
+```bash
+conda run -n yam_ws python -m workstation.lerobot_recorder.benchmark_video_encoders \
+  --frames 1800 --output-json /tmp/encoder-benchmark.json
+```
+
 ## How recording is triggered (the key idea)
 
 `i2rt.serving.run_robot_server teleop` (on the robot machine) reports a
