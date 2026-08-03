@@ -44,7 +44,8 @@ yam-lerobot-serve \
     --checkpoint /abs/path/to/pretrained_model \
     --device cuda
 
-# MultiTaskDiT diffusion checkpoint through training-free diffusion-to-flow RTC:
+# MultiTaskDiT flow-matching checkpoint with native RTC (the same command also
+# supports diffusion checkpoints through training-free diffusion-to-flow RTC):
 yam-lerobot-serve \
     --checkpoint /abs/path/to/pretrained_model \
     --device cuda \
@@ -56,10 +57,10 @@ yam-lerobot-serve \
 yam-lerobot-serve --checkpoint /abs/path/to/pi05_or_smolvla --device cuda --rtc
 ```
 
-``--num-inference-steps`` is solver-agnostic. For diffusion MultiTaskDiT with
-RTC, it selects trained diffusion timesteps approximately uniformly in the
-converted flow time. Without RTC it is the number of DDIM denoising steps; for
-pi0.5 it overrides
+``--num-inference-steps`` is solver-agnostic. For flow-matching MultiTaskDiT it
+overrides ``num_integration_steps``. For diffusion MultiTaskDiT with RTC, it
+selects trained diffusion timesteps approximately uniformly in the converted
+flow time; without RTC it is the number of DDIM denoising steps. For pi0.5 it overrides
 ``num_inference_steps`` and for SmolVLA it overrides ``num_steps``. Omitting it
 preserves the checkpoint's policy-specific default.
 

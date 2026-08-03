@@ -119,16 +119,18 @@ class LeRobotPolicy(BasePolicy):
             if num_inference_steps <= 0:
                 raise ValueError("num_inference_steps must be positive")
             if policy_type == "multi_task_dit":
-                if filtered.get("objective", getattr(base_config, "objective", None)) != "diffusion":
-                    raise ValueError(
-                        "MultiTaskDiT --num-inference-steps currently supports diffusion checkpoints only"
-                    )
-                # Non-RTC reduced-step inference keeps the existing deterministic
-                # DDIM behavior. RTC instead uses the checkpoint's original
-                # scheduler coefficients through its diffusion-to-flow adapter.
-                if not rtc:
-                    filtered["noise_scheduler_type"] = "DDIM"
-                filtered["num_inference_steps"] = num_inference_steps
+                objective = filtered.get("objective", getattr(base_config, "objective", None))
+                if objective == "diffusion":
+                    # Non-RTC reduced-step inference keeps the existing deterministic
+                    # DDIM behavior. RTC instead uses the checkpoint's original
+                    # scheduler coefficients through its diffusion-to-flow adapter.
+                    if not rtc:
+                        filtered["noise_scheduler_type"] = "DDIM"
+                    filtered["num_inference_steps"] = num_inference_steps
+                elif objective == "flow_matching":
+                    filtered["num_integration_steps"] = num_inference_steps
+                else:
+                    raise ValueError(f"Unsupported MultiTaskDiT objective {objective!r}")
             elif "num_inference_steps" in valid_fields:
                 # pi0/pi0.5 use this for flow integration steps.
                 filtered["num_inference_steps"] = num_inference_steps
@@ -141,9 +143,6 @@ class LeRobotPolicy(BasePolicy):
         if rtc:
             if "rtc_config" not in valid_fields:
                 raise ValueError(f"LeRobot policy type {policy_type!r} has no RTC configuration")
-            if policy_type == "multi_task_dit":
-                if filtered.get("objective", getattr(base_config, "objective", None)) != "diffusion":
-                    raise ValueError("MultiTaskDiT RTC currently requires a diffusion checkpoint")
             filtered["rtc_config"] = {
                 "enabled": True,
                 "max_guidance_weight": float(rtc_guidance_weight),

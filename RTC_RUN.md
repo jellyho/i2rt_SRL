@@ -24,6 +24,10 @@ yam-lerobot-serve \
   --num-inference-steps 20
 ```
 
+The server reads the MultiTaskDiT objective from the checkpoint. For a
+flow-matching checkpoint, RTC guides the native flow integration directly; for
+a diffusion checkpoint, it uses the training-free diffusion-to-flow adapter.
+
 ## 2. Robot machine
 
 ```bash
@@ -49,5 +53,5 @@ workstation/yam-data deploy \
 The checkpoint plans 32 actions and exposes a 24-action execution chunk. At
 30 Hz, the measured 20-step RTC inference delay was about 3 control ticks;
 the broker starts at 4 execute steps and then calibrates from live latency.
-Keep `--num-inference-steps 20`: it controls solver evaluations, not chunk
-overlap.
+Keep `--num-inference-steps 20`: it controls native flow integration steps (or
+converted-flow steps for a diffusion checkpoint), not chunk overlap.

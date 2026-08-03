@@ -88,3 +88,45 @@ def test_multitask_dit_rtc_preserves_checkpoint_diffusion_scheduler(tmp_path):
     assert loaded["num_inference_steps"] == 20
     assert loaded["rtc_config"]["enabled"] is True
     assert LeRobotPolicy._solver_name(FakeConfig(), rtc=True) == "diffusion_to_flow"
+
+
+def test_multitask_dit_flow_matching_rtc_uses_integration_step_override(tmp_path):
+    @dataclass
+    class FakeConfig:
+        type: str = "multi_task_dit"
+        device: str = "cpu"
+        objective: str = "flow_matching"
+        num_integration_steps: int = 100
+        rtc_config: dict | None = None
+
+    class FakeDraccus:
+        config_type = staticmethod(lambda _format: contextlib.nullcontext())
+
+        @staticmethod
+        def parse(_config_type, path, args):
+            assert args == []
+            return json.loads(Path(path).read_text())
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "multi_task_dit",
+                "objective": "flow_matching",
+                "num_integration_steps": 100,
+            }
+        )
+    )
+
+    loaded = LeRobotPolicy._load_config(
+        FakeDraccus,
+        lambda _policy_type: FakeConfig(),
+        tmp_path,
+        "cpu",
+        rtc=True,
+        num_inference_steps=20,
+    )
+
+    assert loaded["objective"] == "flow_matching"
+    assert loaded["num_integration_steps"] == 20
+    assert loaded["rtc_config"]["enabled"] is True
+    assert LeRobotPolicy._solver_name(FakeConfig(), rtc=True) == "flow_matching"

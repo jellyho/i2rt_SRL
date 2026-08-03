@@ -9,7 +9,7 @@ policy class::
 RTC is opt-in.  ``--num-inference-steps`` is intentionally solver-agnostic: it
 selects converted-flow steps for RTC diffusion inference (or DDIM steps for
 ordinary reduced-step diffusion inference) and flow integration steps for
-policies such as pi0.5 and SmolVLA.
+policies such as flow-matching MultiTaskDiT, pi0.5, and SmolVLA.
 """
 
 from __future__ import annotations
