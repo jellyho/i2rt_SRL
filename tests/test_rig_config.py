@@ -239,3 +239,38 @@ def test_reference_overlay_opacity_is_shared_by_record_and_deploy_configs(tmp_pa
 
     assert record_cfg.reference_live_alpha == 0.3
     assert deploy_cfg.reference_live_alpha == 0.3
+
+
+def test_deploy_rtc_config_uses_yaml_with_cli_override(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "policy:\n"
+        "  action_horizon: 24\n"
+        "  rate: 30\n"
+        "  image_size: 320\n"
+        "  rtc:\n"
+        "    enabled: true\n"
+        "    min_execute_steps: 8\n"
+    )
+
+    _, bridge = build_configs(["--config", str(cfg_path)])
+    assert bridge.action_horizon == 24
+    assert bridge.rate_hz == 30
+    assert bridge.image_size == 320
+    assert bridge.rtc_enabled is True
+    assert bridge.rtc_min_execute_steps == 8
+
+    _, overridden = build_configs(
+        [
+            "--config",
+            str(cfg_path),
+            "--no-rtc",
+            "--rtc-min-execute-steps",
+            "5",
+            "--rate",
+            "20",
+        ]
+    )
+    assert overridden.rtc_enabled is False
+    assert overridden.rtc_min_execute_steps == 5
+    assert overridden.rate_hz == 20

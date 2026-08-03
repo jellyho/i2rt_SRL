@@ -48,3 +48,53 @@ def test_deploy_runner_builds_lerobot_observation_schema():
     assert obs["observation.control_mode"].tolist() == [CONTROL_MODE["teleop"]]
     assert obs["observation.images.agentview"].shape == (480, 640, 3)
     assert np.allclose(obs["observation.state"][:21], np.concatenate([robot_obs["left"][k] for k in ("pos", "vel", "eff")]))
+
+
+def test_deploy_runner_resets_chunks_across_home_and_restart():
+    runner = DeploymentPolicyRunner(
+        BridgeConfig(rate_hz=100_000.0),
+        RecorderConfig(mock=False),
+        lambda: {},
+    )
+
+    class FakePolicy:
+        def __init__(self):
+            self.reset_calls = 0
+            self.infer_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+
+        def infer(self, obs):
+            self.infer_calls += 1
+            return {"actions": np.zeros(14, dtype=np.float32)}
+
+    class FakeRobot:
+        def __init__(self):
+            self.states = [
+                {"policy_running": True, "homing": False},
+                {"policy_running": False, "homing": True},
+                {"policy_running": True, "homing": False},
+            ]
+            self.actions = []
+
+        def get_observation(self):
+            state = self.states.pop(0)
+            if not self.states:
+                runner._stop.set()
+            return state
+
+        def set_policy_action(self, action):
+            self.actions.append(action)
+
+    policy = FakePolicy()
+    robot = FakeRobot()
+    runner._policy = policy
+    runner._robot = robot
+    runner._build_obs = lambda robot_obs, images: {"observation/state": np.zeros(14)}
+
+    runner._loop()
+
+    assert policy.infer_calls == 2
+    assert policy.reset_calls == 3  # initial stream, Home entry, post-Home restart
+    assert len(robot.actions) == 2

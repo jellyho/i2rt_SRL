@@ -19,6 +19,8 @@ from .base_policy import BasePolicy
 
 logger = logging.getLogger(__name__)
 
+_CONTROL_KEY = "_yam_policy_control"
+
 
 class WebsocketClientPolicy(BasePolicy):
     def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
@@ -54,7 +56,17 @@ class WebsocketClientPolicy(BasePolicy):
         return msgpack_numpy.unpackb(response)
 
     def reset(self) -> None:
-        pass
+        # Keep wire compatibility with openpi servers: only send the YAM control
+        # message when the peer explicitly advertises support for it.
+        if not self._server_metadata.get("supports_reset"):
+            return
+        self._ws.send(self._packer.pack({_CONTROL_KEY: "reset"}))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Policy server reset error:\n{response}")
+        ack = msgpack_numpy.unpackb(response)
+        if ack.get(_CONTROL_KEY) != "reset" or not ack.get("ok"):
+            raise RuntimeError(f"Unexpected policy server reset response: {ack!r}")
 
     def close(self) -> None:
         try:

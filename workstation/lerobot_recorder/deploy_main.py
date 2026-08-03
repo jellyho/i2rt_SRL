@@ -32,6 +32,18 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     p.add_argument("--action-horizon", type=int, default=16)
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch")
+    p.add_argument(
+        "--rtc",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable/disable real-time chunking (overrides policy.rtc.enabled)",
+    )
+    p.add_argument(
+        "--rtc-min-execute-steps",
+        type=int,
+        default=8,
+        help="minimum control ticks between RTC inference starts",
+    )
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
@@ -44,6 +56,8 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     rec = Resolver(args, p, rig.get("recorder", {}))
     rob = Resolver(args, p, rig.get("robot", {}))
     pol = Resolver(args, p, rig.get("policy", {}))
+    rtc_section = (rig.get("policy", {}) or {}).get("rtc", {}) or {}
+    rtc = Resolver(args, p, rtc_section)
 
     cams = apply_camera_serials(default_cameras(), rig)
     if args.serials:
@@ -91,11 +105,13 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
         robot_port=recorder_cfg.robot_port,
         policy_host=pol.get("policy_host", key="host"),
         policy_port=int(pol.get("policy_port", key="port")),
-        action_horizon=args.action_horizon,
-        rate_hz=args.rate,
-        image_size=args.image_size,
+        action_horizon=int(pol.get("action_horizon")),
+        rate_hz=float(pol.get("rate")),
+        image_size=int(pol.get("image_size")),
         prompt=task,
         use_async=not args.no_async,
+        rtc_enabled=bool(rtc.get("rtc", key="enabled")),
+        rtc_min_execute_steps=int(rtc.get("rtc_min_execute_steps", key="min_execute_steps")),
     )
     return recorder_cfg, bridge_cfg
 

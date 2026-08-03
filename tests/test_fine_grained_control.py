@@ -300,3 +300,59 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
     ctrl.step()  # next takeover starts anchored in normal mode, without a snap
     assert ctrl.snapshot()["fine_grained"] is False
     assert np.allclose(ctrl.snapshot()["left"]["human"][:6], follower.pos[:6])
+
+
+def test_dagger_home_wipes_policy_target_and_rejects_late_response(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, _follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(
+        ctl,
+        "read_handle",
+        lambda _leader: (leader.pos.copy(), 0.0, [0, 0]),
+    )
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=10.0, home_speed=10.0))
+
+    old_action = np.ones(7)
+    ctrl.set_policy_running(True)
+    ctrl.set_policy_action({"left": old_action})
+    assert ctrl._policy_action["left"] is not None
+    assert ctrl._cmd_fresh()
+
+    ctrl.finish_dagger_run("keep")
+    assert ctrl._policy_action["left"] is None
+    assert not ctrl._cmd_fresh()
+
+    # Simulate a response from inference that was already running when Home was
+    # pressed. It must not re-arm the robot-side command cache.
+    ctrl.set_policy_action({"left": old_action})
+    assert ctrl._policy_action["left"] is None
+
+    ctrl.step()  # already at home, so HOMING completes immediately
+    assert ctrl.snapshot()["dagger_state"] == "stopped"
+
+    ctrl.set_policy_running(True)
+    ctrl.step()
+    assert ctrl.snapshot()["left"]["applied"] is None
+
+    ctrl.set_policy_action({"left": np.full(7, 0.5)})
+    ctrl.step()
+    assert ctrl.snapshot()["left"]["applied"] is not None
+
+
+def test_dagger_policy_stop_wipes_target_before_restart(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, _leader, _follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    ctrl = ctl.DaggerController(ctl.DaggerConfig())
+
+    ctrl.set_policy_running(True)
+    ctrl.set_policy_action({"left": np.ones(7)})
+    ctrl.set_policy_running(False)
+
+    assert ctrl._policy_action["left"] is None
+    assert not ctrl._cmd_fresh()
+    ctrl.set_policy_action({"left": np.ones(7)})
+    assert ctrl._policy_action["left"] is None

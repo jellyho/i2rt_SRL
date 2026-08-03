@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 class DeploymentPolicyRunner:
-    def __init__(self, cfg: BridgeConfig, recorder_cfg: RecorderConfig, images_fn: Callable[[], Dict[str, np.ndarray]]):
+    def __init__(
+        self, cfg: BridgeConfig, recorder_cfg: RecorderConfig, images_fn: Callable[[], Dict[str, np.ndarray]]
+    ):
         self.cfg = cfg
         self.recorder_cfg = recorder_cfg
         self.images_fn = images_fn
@@ -43,6 +45,7 @@ class DeploymentPolicyRunner:
             "action_horizon": cfg.action_horizon,
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
+            "rtc_enabled": cfg.rtc_enabled,
         }
 
     def start(self) -> None:
@@ -54,6 +57,13 @@ class DeploymentPolicyRunner:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if self._policy is not None:
+            close = getattr(self._policy, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         if self._policy_client is not None:
             try:
                 self._policy_client.close()
@@ -90,22 +100,43 @@ class DeploymentPolicyRunner:
             return
         if not self._policy_port_open():
             raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
-        from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClientPolicy
+        from yam_policy import (
+            ActionChunkBroker,
+            AsyncActionChunkBroker,
+            RTCActionChunkBroker,
+            WebsocketClientPolicy,
+        )
 
         client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
         meta = client.get_server_metadata() or {}
         action_horizon = int(meta.get("action_horizon", self.cfg.action_horizon))
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
-        broker_cls = AsyncActionChunkBroker if self.cfg.use_async else ActionChunkBroker
         self._policy_client = client
-        self._policy = broker_cls(client, action_horizon=action_horizon)
+        if self.cfg.rtc_enabled:
+            if not meta.get("rtc_enabled"):
+                client.close()
+                self._policy_client = None
+                raise ValueError(
+                    "RTC requested, but policy server is not RTC-enabled; start it with yam-lerobot-serve --rtc"
+                )
+            self._policy = RTCActionChunkBroker(
+                client,
+                action_horizon=action_horizon,
+                min_execute_steps=self.cfg.rtc_min_execute_steps,
+                rate_hz=self.cfg.rate_hz,
+                n_obs_steps=int(meta.get("n_obs_steps", 1)),
+            )
+        else:
+            broker_cls = AsyncActionChunkBroker if self.cfg.use_async else ActionChunkBroker
+            self._policy = broker_cls(client, action_horizon=action_horizon)
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,
             action_horizon=action_horizon,
             image_size=self._image_shape[0],
             image_shape=self._image_shape,
+            rtc_enabled=self.cfg.rtc_enabled,
         )
         logger.info("deploy policy metadata: %s", meta)
 
@@ -152,6 +183,18 @@ class DeploymentPolicyRunner:
                 self._was_streaming = False
                 msg = str(e).lower()
                 if "policy" in msg:
+                    if self._policy is not None:
+                        close = getattr(self._policy, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except Exception:
+                                pass
+                    if self._policy_client is not None:
+                        try:
+                            self._policy_client.close()
+                        except Exception:
+                            pass
                     self._policy = None
                     self._policy_client = None
                     self._set(policy_connected=False)

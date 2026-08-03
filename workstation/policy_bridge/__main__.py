@@ -32,6 +32,18 @@ def main() -> None:
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--prompt", default="do the task")
     p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch (query synchronously)")
+    p.add_argument(
+        "--rtc",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="enable/disable real-time chunking (overrides policy.rtc.enabled)",
+    )
+    p.add_argument(
+        "--rtc-min-execute-steps",
+        type=int,
+        default=8,
+        help="minimum control ticks between RTC inference starts",
+    )
     p.add_argument("--serials", default="", help="comma-separated RealSense serials: wrist_left,wrist_right,agentview")
     p.add_argument("--mock", action="store_true", help="synthetic cameras (no RealSense)")
     args = p.parse_args()
@@ -39,6 +51,8 @@ def main() -> None:
     rig = load_rig(args.config)
     rob = Resolver(args, p, rig.get("robot", {}))
     pol = Resolver(args, p, rig.get("policy", {}))
+    rtc_section = (rig.get("policy", {}) or {}).get("rtc", {}) or {}
+    rtc = Resolver(args, p, rtc_section)
 
     cams = apply_camera_serials(default_cameras(), rig)
     if args.serials:
@@ -51,11 +65,13 @@ def main() -> None:
         robot_port=int(rob.get("robot_port", key="port")),
         policy_host=pol.get("policy_host", key="host"),
         policy_port=int(pol.get("policy_port", key="port")),
-        action_horizon=args.action_horizon,
-        rate_hz=args.rate,
-        image_size=args.image_size,
-        prompt=args.prompt,
+        action_horizon=int(pol.get("action_horizon")),
+        rate_hz=float(pol.get("rate")),
+        image_size=int(pol.get("image_size")),
+        prompt=pol.get("prompt"),
         use_async=not args.no_async,
+        rtc_enabled=bool(rtc.get("rtc", key="enabled")),
+        rtc_min_execute_steps=int(rtc.get("rtc_min_execute_steps", key="min_execute_steps")),
     )
     PolicyBridge(cfg, recorder_cfg).run()
 

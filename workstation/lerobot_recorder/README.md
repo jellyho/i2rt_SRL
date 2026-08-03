@@ -265,9 +265,9 @@ workstation/yam-data record --mock
 robot/yam canup
 robot/yam dagger --mirror-kp 0.2
 
-# 2. [policy]   serve your policy (own env; openpi-compatible websocket)
+# 2. [policy]   serve a LeRobot checkpoint (type auto-detected from config.json)
 #               see policy_serving/README.md
-python -m yam_policy.serve --policy <module>:<Class> --config k=v     # :8000
+yam-lerobot-serve --checkpoint /abs/path/to/pretrained_model --device cuda   # :8000
 
 # 3. [workstation]  deploy UI: robot (portal) <-> policy (websocket) + DAgger recording
 workstation/yam-data deploy \
@@ -276,6 +276,23 @@ workstation/yam-data deploy \
     --repo-id user/yam_pick --prompt "pick up the cube"
 # UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 ```
+
+For RTC, start both sides explicitly:
+
+```bash
+# [policy / GPU]
+yam-lerobot-serve --checkpoint /abs/path/to/mtd/pretrained_model \
+    --device cuda --rtc --num-inference-steps 20
+
+# [workstation]
+workstation/yam-data deploy --rtc \
+    --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
+    --serials <wrist_left_sn>,<wrist_right_sn>,<agentview_sn> \
+    --prompt "Insert the USB-C plug into the USB-C port."
+```
+
+Persistent workstation defaults live under ``policy.rtc`` in ``config.yaml``;
+``--rtc``/``--no-rtc`` and ``--rtc-min-execute-steps`` override them per run.
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
 normal DAgger collection, use `deploy` so the policy bridge, recorder, live stats,

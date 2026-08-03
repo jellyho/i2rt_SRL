@@ -17,6 +17,8 @@ class BridgeConfig:
     image_size: int = 224
     prompt: str = "do the task"
     use_async: bool = True
+    rtc_enabled: bool = False
+    rtc_min_execute_steps: int = 8
     image_keys: Dict[str, str] = field(
         default_factory=lambda: {
             "agentview": "observation/images/agentview",

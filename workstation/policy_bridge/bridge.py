@@ -27,13 +27,20 @@ import time
 from typing import Dict, List
 
 import numpy as np
-from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClientPolicy, image_tools
+from yam_policy import (
+    ActionChunkBroker,
+    AsyncActionChunkBroker,
+    RTCActionChunkBroker,
+    WebsocketClientPolicy,
+    image_tools,
+)
 
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.config import ARM_DOF, ARMS, CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
 
 logger = logging.getLogger(__name__)
+
 
 class PolicyBridge:
     def __init__(self, cfg: BridgeConfig, recorder_cfg: RecorderConfig):
@@ -44,6 +51,7 @@ class PolicyBridge:
         self.robot = RobotClient(host=cfg.robot_host, port=cfg.robot_port)
 
         client = WebsocketClientPolicy(host=cfg.policy_host, port=cfg.policy_port)
+        self._policy_client = client
         # Let the server's metadata override the obs/action spec so we don't have to
         # hand-match action_horizon / image keys / image size to the policy.
         meta = client.get_server_metadata() or {}
@@ -58,9 +66,25 @@ class PolicyBridge:
         if meta:
             logger.info("policy server metadata: %s", meta)
 
-        broker_cls = AsyncActionChunkBroker if cfg.use_async else ActionChunkBroker
-        self.policy = broker_cls(client, action_horizon=self.action_horizon)
+        if cfg.rtc_enabled:
+            if not meta.get("rtc_enabled"):
+                client.close()
+                raise ValueError(
+                    "yam-data RTC was requested, but the connected policy server did not advertise "
+                    "RTC. Start it with yam-lerobot-serve --rtc."
+                )
+            self.policy = RTCActionChunkBroker(
+                client,
+                action_horizon=self.action_horizon,
+                min_execute_steps=cfg.rtc_min_execute_steps,
+                rate_hz=cfg.rate_hz,
+                n_obs_steps=int(meta.get("n_obs_steps", 1)),
+            )
+        else:
+            broker_cls = AsyncActionChunkBroker if cfg.use_async else ActionChunkBroker
+            self.policy = broker_cls(client, action_horizon=self.action_horizon)
         self._stop = False
+        self._was_streaming = False
 
     # ---- obs assembly -------------------------------------------------------
     @staticmethod
@@ -115,7 +139,7 @@ class PolicyBridge:
     def run(self) -> None:
         self.cameras.start()
         logger.info(
-            "PolicyBridge up: robot=%s:%d policy=%s:%d horizon=%d image=%dx%d rate=%.0f Hz",
+            "PolicyBridge up: robot=%s:%d policy=%s:%d horizon=%d image=%dx%d rate=%.0f Hz rtc=%s",
             self.cfg.robot_host,
             self.cfg.robot_port,
             self.cfg.policy_host,
@@ -124,6 +148,7 @@ class PolicyBridge:
             self.image_shape[1],
             self.image_shape[0],
             self.cfg.rate_hz,
+            self.cfg.rtc_enabled,
         )
         period = 1.0 / max(self.cfg.rate_hz, 1.0)
         try:
@@ -135,12 +160,28 @@ class PolicyBridge:
                 t0 = time.monotonic()
                 try:
                     robot_obs = self.robot.get_observation()
-                    images = self.cameras.read()
-                    obs = self._build_obs(robot_obs, images)
-                    if obs:
-                        action = self.policy.infer(obs)["actions"]
-                        self.robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
+                    should_stream = bool(robot_obs.get("policy_running")) and not (
+                        robot_obs.get("intervention")
+                        or robot_obs.get("homing")
+                        or robot_obs.get("estop")
+                    )
+                    if should_stream:
+                        if not self._was_streaming:
+                            self.policy.reset()
+                        images = self.cameras.read()
+                        obs = self._build_obs(robot_obs, images)
+                        if obs:
+                            action = self.policy.infer(obs)["actions"]
+                            self.robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
+                            self._was_streaming = True
+                        else:
+                            self._was_streaming = False
+                    else:
+                        if self._was_streaming:
+                            self.policy.reset()
+                        self._was_streaming = False
                 except Exception as e:
+                    self._was_streaming = False
                     logger.warning("bridge tick failed: %s", e)
                 remaining = period - (time.monotonic() - t0)
                 if remaining > 0:
@@ -153,6 +194,10 @@ class PolicyBridge:
             except Exception:
                 pass
             self.cameras.stop()
+            close = getattr(self.policy, "close", None)
+            if callable(close):
+                close()
+            self._policy_client.close()
 
     def stop(self) -> None:
         self._stop = True

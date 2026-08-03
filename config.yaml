@@ -20,6 +20,10 @@ robot:
 policy:
   host: 127.0.0.1            # websocket policy server (for the bridge)
   port: 8000
+  # Runtime scheduling belongs to yam-data. CLI flags override these values.
+  rtc:
+    enabled: false
+    min_execute_steps: 8
 
 control:                     # overrides i2rt/serving/control_config (robot server)
   bilateral_kp: 0.0

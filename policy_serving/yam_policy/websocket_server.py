@@ -26,6 +26,8 @@ from .base_policy import BasePolicy
 
 logger = logging.getLogger(__name__)
 
+_CONTROL_KEY = "_yam_policy_control"
+
 
 class WebsocketPolicyServer:
     def __init__(
@@ -38,7 +40,8 @@ class WebsocketPolicyServer:
         self._policy = policy
         self._host = host
         self._port = port
-        self._metadata = metadata or {}
+        self._metadata = dict(metadata or {})
+        self._metadata["supports_reset"] = True
 
     def serve_forever(self) -> None:
         asyncio.run(self._run())
@@ -58,6 +61,12 @@ class WebsocketPolicyServer:
             try:
                 t0 = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
+
+                if obs.get(_CONTROL_KEY) == "reset":
+                    self._policy.reset()
+                    await websocket.send(packer.pack({_CONTROL_KEY: "reset", "ok": True}))
+                    prev_total_ms = None
+                    continue
 
                 t_infer = time.monotonic()
                 action = self._policy.infer(obs)

@@ -23,6 +23,7 @@ lerobot = ["lerobot>=0.4.0", "torch"]
 
 [project.scripts]
 yam-serve = "yam_policy.serve:main"
+yam-lerobot-serve = "yam_policy.lerobot_serve:main"
 
 [tool.flit.module]
 name = "yam_policy"

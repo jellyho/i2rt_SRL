@@ -750,6 +750,7 @@ class DaggerController(BaseController):
         self._intervening = False
         self._policy_running = False
         self._homing = False
+        self._policy_lock = threading.RLock()
         self._btn_prev: Dict[str, list] = {}
         self._button_map: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in cfg.button_map.items()}
         self._event_seq = 0
@@ -827,16 +828,32 @@ class DaggerController(BaseController):
         return float(0.5 + 0.785 * np.sin(np.pi * min(max(p, 0.0), 1.0)))
 
     # ---- external inputs ----------------------------------------------------
+    def _clear_policy_action(self) -> None:
+        """Invalidate every cached policy target and its freshness timestamp."""
+        for side in self._policy_action:
+            self._policy_action[side] = None
+        self._last_cmd_t = -1e9
+
     def set_policy_action(self, data: Dict) -> None:
         """data = {side: position_array}. Stored as full-length follower targets."""
-        for side, pos in (data or {}).items():
-            if side not in self.pairs:
-                continue
-            try:
-                self._policy_action[side] = to_full_target(np.asarray(pos, dtype=float), self.pairs[side].follower)
-            except ValueError as e:
-                logger.warning("[%s] bad policy_action: %s", side, e)
-        self._touch_cmd()
+        with self._policy_lock:
+            # An inference that started before Home/Stop may finish afterwards.
+            # Never let that late response repopulate the robot-side command cache.
+            if self._homing or not self._policy_running:
+                return
+            accepted = False
+            for side, pos in (data or {}).items():
+                if side not in self.pairs:
+                    continue
+                try:
+                    self._policy_action[side] = to_full_target(
+                        np.asarray(pos, dtype=float), self.pairs[side].follower
+                    )
+                    accepted = True
+                except ValueError as e:
+                    logger.warning("[%s] bad policy_action: %s", side, e)
+            if accepted:
+                self._touch_cmd()
 
     def set_intervention(self, flag: bool) -> None:
         if self._homing:
@@ -854,33 +871,44 @@ class DaggerController(BaseController):
             )
 
     def set_policy_running(self, flag: bool) -> None:
-        if self._homing:
-            return
-        flag = bool(flag)
-        if flag and not self._policy_running and not self._intervening:
-            for side, pair in self.pairs.items():
-                self._leader_smooth[side].reset(
-                    np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
-                )
-        self._policy_running = flag
-        if not self._policy_running:
-            self.set_intervention(False)
+        with self._policy_lock:
+            if self._homing:
+                return
+            flag = bool(flag)
+            if flag != self._policy_running:
+                # Starting must wait for a newly inferred command; stopping must
+                # make it impossible to replay the previous rollout later.
+                self._clear_policy_action()
+            if flag and not self._policy_running and not self._intervening:
+                for side, pair in self.pairs.items():
+                    self._leader_smooth[side].reset(
+                        np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+                    )
+            self._policy_running = flag
+            if not self._policy_running:
+                self.set_intervention(False)
 
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
         if action not in {"keep", "discard"}:
             logger.warning("unknown dagger finish action: %s", action)
             return
-        self._event_seq += 1
-        self._last_event = {"seq": self._event_seq, "action": action}
-        self._policy_running = False
-        self._intervening = False
-        self._reset_fine_grained()
-        self._homing = True
-        for side, pair in self.pairs.items():
-            self._smooth[side].reset(pair.follower.get_joint_pos())
-            self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
-            self._home_d0[side] = max(float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6)
+        with self._policy_lock:
+            self._event_seq += 1
+            self._last_event = {"seq": self._event_seq, "action": action}
+            self._policy_running = False
+            self._intervening = False
+            self._clear_policy_action()
+            self._reset_fine_grained()
+            self._homing = True
+            for side, pair in self.pairs.items():
+                self._smooth[side].reset(pair.follower.get_joint_pos())
+                self._leader_smooth[side].reset(
+                    np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size]
+                )
+                self._home_d0[side] = max(
+                    float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6
+                )
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":

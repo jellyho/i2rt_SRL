@@ -26,32 +26,65 @@ obs = {
 action_chunk = client.infer(obs)["actions"]       # (action_horizon, action_dim)
 ```
 
-## Install (policy server env — unrestricted)
+## Install (LeRobot policy-server environment)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh && source $HOME/.local/bin/env
-cd policy_serving
-uv venv                      # any Python >= 3.10
-source .venv/bin/activate
-uv pip install -e .          # + your model deps, e.g. uv pip install -e /path/to/openpi
+git submodule update --init lerobot
+bash policy_serving/setup_policy_env.sh
+source policy_serving/.venv/bin/activate
 ```
 
-## Run a server
+## Serve a LeRobot checkpoint
 
 ```bash
-# zero-model smoke test (returns a "hold pose" chunk):
-python -m yam_policy.serve
+# ACT, Diffusion Policy, MultiTaskDiT, pi0.5, SmolVLA, etc. are selected
+# automatically from pretrained_model/config.json.
+yam-lerobot-serve \
+    --checkpoint /abs/path/to/pretrained_model \
+    --device cuda
 
-# a real LeRobot policy (template — adapt policies/lerobot_policy.py):
-python -m yam_policy.serve \
-    --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
-    --config pretrained_path=/abs/path --config device=cuda
+# MultiTaskDiT diffusion checkpoint through training-free diffusion-to-flow RTC:
+yam-lerobot-serve \
+    --checkpoint /abs/path/to/pretrained_model \
+    --device cuda \
+    --rtc \
+    --num-inference-steps 20
 
-# a real openpi checkpoint (template — needs openpi installed here):
-python -m yam_policy.serve \
-    --policy yam_policy.policies.openpi_policy:OpenPiPolicy \
-    --config config_name=pi0_fast_droid --config checkpoint_dir=/abs/ckpt
+# pi0.5 and SmolVLA already default to 10 flow integration steps. Omit the
+# solver override unless you intentionally want to tune it:
+yam-lerobot-serve --checkpoint /abs/path/to/pi05_or_smolvla --device cuda --rtc
 ```
+
+``--num-inference-steps`` is solver-agnostic. For diffusion MultiTaskDiT with
+RTC, it selects trained diffusion timesteps approximately uniformly in the
+converted flow time. Without RTC it is the number of DDIM denoising steps; for
+pi0.5 it overrides
+``num_inference_steps`` and for SmolVLA it overrides ``num_steps``. Omitting it
+preserves the checkpoint's policy-specific default.
+
+The older generic ``yam-serve`` entry point remains available for dummy and
+custom ``BasePolicy`` adapters. It is not needed for normal LeRobot deployment.
+
+## RTC request flow
+
+The workstation keeps the 30 Hz robot clock and owns the action queue. It sends
+a new request after ``rtc.min_execute_steps``, including consecutive observation
+history, the unexecuted normalized action tail, and a conservative inference
+delay. The server performs guided denoising and returns both normalized
+``model_actions`` and executable ``actions``. The workstation continues the old
+chunk while inference is running, then drops the elapsed prefix and swaps to the
+new chunk immediately.
+
+The broker enforces the RTC feasibility condition ``d <= s <= H - d``. The
+initial synchronous prediction is treated as a warmup and is not added to the
+latency window. If measured inference exceeds half of the action horizon, or a
+chunk expires before its replacement is ready, the broker raises instead of
+blocking the control loop or repeating an action whose safety it cannot infer.
+
+The server advertises ``rtc_enabled``, ``n_obs_steps``, policy type, solver, and
+action horizon in its connection metadata. ``yam-data deploy --rtc`` fails fast
+if it connects to a server that was not started with ``--rtc``.
 
 ## Add your own policy
 
