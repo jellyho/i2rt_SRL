@@ -18,7 +18,13 @@
 # RealSense udev rules are NOT installed by the pip wheel — see README.md
 # (workstation -> RealSense cameras) or cameras fail with permission errors.
 
-lerobot>=0.4.0      # LeRobotDataset v3.0 API (create/add_frame/save_episode/finalize)
+# Pinned, not floating: the recorder reaches into LeRobot internals that are not covered
+# by its public API — episode video windows in meta/episodes, save_episode(parallel_encoding=),
+# and _batch_save_episode_video for the trailing-batch flush. A minor bump can move those
+# silently. Re-pin deliberately after checking workstation/lerobot_recorder against the
+# new release; the video-integrity checks in dataset_writer will flag encode regressions.
+lerobot==0.4.4      # LeRobotDataset v3.0 API (create/add_frame/save_episode/finalize)
+torchcodec>=0.9     # VideoEncoder API used by the workstation recording backend
 pyrealsense2        # RealSense D405 / D455 cameras
 PyQt5               # GUI
 numpy

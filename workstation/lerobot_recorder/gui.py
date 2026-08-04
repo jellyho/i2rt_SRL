@@ -838,6 +838,7 @@ class RecorderGUI(QtWidgets.QWidget):
         w = st.get("writer") or {}
         workers = w.get("workers", 1)
         saved = w.get("saved", 0)
+        encoder = w.get("encoding_backend", "—")
         queued = w.get("queued", st.get("queue", 0))
         # idle (green) vs encoding-one-now (amber ⟳, with episode + frame count) vs backlog.
         if w.get("saving"):
@@ -847,9 +848,18 @@ class RecorderGUI(QtWidgets.QWidget):
             save_txt = f'<span style="color:{theme.WARN};">● queued {queued}</span>'
         else:
             save_txt = f'<span style="color:{theme.OK};">● idle</span>'
+        # A short encode (dropped frames) is not a save failure — recording carries on and
+        # finalize repairs it — but it means the encoder is struggling, so surface it here
+        # rather than letting it turn up as a load error at training time.
+        issues = int(w.get("video_issues", 0) or 0)
+        video_txt = (
+            f' &nbsp;&nbsp;|&nbsp;&nbsp; <span style="color:{theme.BAD};">⚠ {issues} short '
+            f'encode{"s" if issues != 1 else ""} — check encoder</span>'
+        ) if issues else ""
         self.health.setText(
             f"{rob} robot &nbsp;&nbsp; {cam} cameras &nbsp;&nbsp; {disk} disk "
-            f"&nbsp;&nbsp;|&nbsp;&nbsp; writer: {workers} worker · saved {saved} · {save_txt}"
+            f"&nbsp;&nbsp;|&nbsp;&nbsp; writer: {workers} worker · {encoder} · saved {saved} · {save_txt}"
+            f"{video_txt}"
         )
 
     def _update_stats(self, st: dict) -> None:

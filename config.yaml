@@ -67,8 +67,16 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
   # sensor counting in 100us steps (1..10000); the D405 has none, so its color comes
   # off the Stereo Module counting in 1us steps (1..165000). Hence 120 vs 16000 below
   # are both ~12-16 ms. Gain ranges differ too: 0..128 (D455 RGB) vs 16..248 (stereo).
+  #
+  # `fps` is the STREAM rate (what the camera pushes over USB), separate from
+  # recorder.fps below (the record-loop rate). Pinned to 30 on all three: at 60 the
+  # three 640x480 streams overrun a single USB 2.0 bus and one camera starves with
+  # "stopped delivering frames". Raise only if every camera links at USB 3 (5000+):
+  #   for d in /sys/bus/usb/devices/*/; do
+  #     [ "$(cat $d/idVendor 2>/dev/null)" = 8086 ] && echo "$(basename $d) $(cat $d/speed)"; done
   agentview:  # D455
     serial: "246322303794"
+    fps: 30
     options:
       enable_auto_exposure: 0
       exposure: 115
@@ -79,6 +87,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
   # Keep these two in sync — if you change one, change the other.
   wrist_left:  # D405
     serial: "352122271652"
+    fps: 30
     options:
       enable_auto_exposure: 0
       exposure: 16389
@@ -87,6 +96,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       white_balance: 4600
   wrist_right:  # D405
     serial: "409122274199"
+    fps: 30
     options:
       enable_auto_exposure: 0
       exposure: 16389
@@ -109,12 +119,17 @@ recorder:
   auto_arm: true             # arm collection on Start; records on the next teleop engage
   reference_live_alpha: 0.5  # past-episode overlay: 1=live only, 0=past video only (preview only)
   # --- saving speed (video encoding) ---
-  # ACTIVE path: streaming_encoding + vcodec are what matter. Frames go straight
-  # into the GPU encoder while the episode is written — no temp PNGs, ~25s per
-  # 7000-frame episode instead of ~80s+.
+  # Encoding implementation. TorchCodec is preferred by default. At writer startup
+  # and again before each camera encode, it safely falls back to PyAV/CPU H.264
+  # when primary-GPU usage is >= 5 GiB (or cannot be measured), leaving room for
+  # a policy process that may load after the recorder opens.
+  encoding_backend: torchcodec  # torchcodec (preferred, VRAM-safe PyAV fallback) | pyav
+  torchcodec_max_used_vram_gb: 5.0
+  # Codec used by the selected implementation.
   vcodec: auto               # auto = GPU h264_nvenc here (fastest) | h264 (CPU, reliable) | libsvtav1 (slow AV1)
-  streaming_encoding: true   # stream frames straight into the encoder (no temp PNGs): ~3x faster
-                             # saves, no PNG CPU storm during collection. Needs this env's patched lerobot.
+  # PyAV can encode continuously during capture. TorchCodec 0.10 is batch-only, so
+  # this is automatically disabled when TorchCodec is selected.
+  streaming_encoding: true
   # FALLBACK path only (streaming off / stock lerobot) — the knobs below are INERT
   # while streaming_encoding is true; they're kept at sensible values for the fallback:
   encoder_threads: 0         # CPU threads per encode; GPU nvenc ignores this (0 = codec default)

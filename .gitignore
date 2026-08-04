@@ -95,3 +95,6 @@ robot/temp_*/
 CLAUDE.md
 *.mjb
 .venv*/
+
+# Staged by workstation/setup_workstation_env.sh before the sudo install into /etc/udev/rules.d/
+workstation/99-realsense-libusb.rules

@@ -39,25 +39,43 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-echo "[setup] system deps (ffmpeg for LeRobot v3.0 video) ..."
-sudo apt-get install -y ffmpeg || echo "  (skip apt; install ffmpeg manually if missing)"
+# ffmpeg: LeRobot v3.0 video encoding. build-essential/cmake: ruckig (pinned in
+# pyproject.toml) is sdist-only and must be compiled from source — without a C++
+# toolchain the uv step below dies with "Failed to build ruckig".
+echo "[setup] system deps (ffmpeg, C++ toolchain for source builds) ..."
+sudo apt-get install -y ffmpeg build-essential cmake ||
+    echo "  (skip apt; install ffmpeg + build-essential + cmake manually if missing)"
+
+# See workstation/build-constraints.txt — pins scikit-build-core for ruckig's build.
+BUILD_CONSTRAINTS="$REPO/workstation/build-constraints.txt"
 
 echo "[setup] uv-installing i2rt + yam-policy + recorder deps into conda env '$ENV' ..."
-uv pip install -e .                                   # uv targets the active conda env
-uv pip install -e policy_serving
-uv pip install -r workstation/lerobot_recorder/requirements.txt
+uv pip install --build-constraint "$BUILD_CONSTRAINTS" -e .  # uv targets the active conda env
+uv pip install --build-constraint "$BUILD_CONSTRAINTS" -e policy_serving
+uv pip install --build-constraint "$BUILD_CONSTRAINTS" -r workstation/lerobot_recorder/requirements.txt
 
 # Optional: abcdl data layer (recorder `format: abcdl` + per-frame RL signals). Pulled
 # from GitHub; skip-on-failure so a network hiccup doesn't break the core setup.
 echo "[setup] abcdl data layer (optional; for format: abcdl + rl_features) ..."
-uv pip install -e '.[abcdl]' || echo "  (abcdl skipped; only needed for abcdl format / rl_features)"
+uv pip install --build-constraint "$BUILD_CONSTRAINTS" -e '.[abcdl]' ||
+    echo "  (abcdl skipped; only needed for abcdl format / rl_features)"
 
+# Fetch just the rules file (a full librealsense clone into /tmp is slow, and /tmp gets
+# reaped — leaving a later `cp` staring at a path that no longer exists). Staged next to
+# this script so a failed `sudo` can be retried by hand without re-downloading.
 echo "[setup] RealSense udev rules (USB permissions) ..."
+RULES_URL="https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules"
+RULES_TMP="$REPO/workstation/99-realsense-libusb.rules"
 if [ ! -e /etc/udev/rules.d/99-realsense-libusb.rules ]; then
-    git clone --depth 1 https://github.com/IntelRealSense/librealsense.git /tmp/librealsense 2>/dev/null || true
-    if [ -f /tmp/librealsense/config/99-realsense-libusb.rules ]; then
-        sudo cp /tmp/librealsense/config/99-realsense-libusb.rules /etc/udev/rules.d/
-        sudo udevadm control --reload-rules && sudo udevadm trigger
+    if curl -fsSL -o "$RULES_TMP" "$RULES_URL" 2>/dev/null ||
+        wget -q -O "$RULES_TMP" "$RULES_URL" 2>/dev/null; then
+        # udev rules only take effect on re-enumeration — replug the cameras afterwards.
+        if sudo cp "$RULES_TMP" /etc/udev/rules.d/ &&
+            sudo udevadm control --reload-rules && sudo udevadm trigger; then
+            echo "  (rules installed — REPLUG the cameras for them to take effect)"
+        else
+            echo "  (sudo failed; retry: sudo cp $RULES_TMP /etc/udev/rules.d/)"
+        fi
     else
         echo "  (could not fetch udev rules; see workstation/lerobot_recorder/README.md)"
     fi

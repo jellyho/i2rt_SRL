@@ -76,11 +76,18 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     )
     recorder_cfg.use_videos = bool(rec_section.get("use_videos", recorder_cfg.use_videos))
     recorder_cfg.vcodec = str(rec_section.get("vcodec", recorder_cfg.vcodec))
+    recorder_cfg.encoding_backend = str(rec_section.get("encoding_backend", recorder_cfg.encoding_backend))
+    recorder_cfg.torchcodec_max_used_vram_gb = float(
+        rec_section.get("torchcodec_max_used_vram_gb", recorder_cfg.torchcodec_max_used_vram_gb)
+    )
     recorder_cfg.encoder_threads = int(rec_section.get("encoder_threads", recorder_cfg.encoder_threads))
     recorder_cfg.batch_encoding_size = int(rec_section.get("batch_encoding_size", recorder_cfg.batch_encoding_size))
     recorder_cfg.image_writer_threads = int(rec_section.get("image_writer_threads", recorder_cfg.image_writer_threads))
     recorder_cfg.image_writer_processes = int(
         rec_section.get("image_writer_processes", recorder_cfg.image_writer_processes)
+    )
+    recorder_cfg.streaming_encoding = bool(
+        rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
     )
     recorder_cfg.reference_live_alpha = min(
         max(float(rec_section.get("reference_live_alpha", recorder_cfg.reference_live_alpha)), 0.0), 1.0

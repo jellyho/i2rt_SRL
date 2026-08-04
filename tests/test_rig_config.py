@@ -18,7 +18,7 @@ from i2rt.serving.rig_config import (
 )
 from workstation.lerobot_recorder.__main__ import build_config
 from workstation.lerobot_recorder.config import default_cameras
-from workstation.lerobot_recorder.deploy_main import build_configs
+from workstation.lerobot_recorder.deploy_main import build_configs as build_deploy_configs
 
 
 def _no_repo_rig(monkeypatch, tmp_path):
@@ -34,6 +34,25 @@ def test_load_rig(tmp_path, monkeypatch):
     assert rig["tasks"] == ["a", "b"]
     _no_repo_rig(monkeypatch, tmp_path)
     assert load_rig(None) == {}  # no in-repo rig, no env -> empty
+
+
+def test_record_and_deploy_share_video_backend_config(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+recorder:
+  encoding_backend: pyav
+  torchcodec_max_used_vram_gb: 6.5
+  streaming_encoding: true
+"""
+    )
+    record_cfg = build_config(["--config", str(config), "--mock"])
+    deploy_cfg, _ = build_deploy_configs(["--config", str(config), "--mock"])
+
+    for cfg in (record_cfg, deploy_cfg):
+        assert cfg.encoding_backend == "pyav"
+        assert cfg.torchcodec_max_used_vram_gb == 6.5
+        assert cfg.streaming_encoding is True
 
 
 def test_find_rig_in_repo(tmp_path, monkeypatch):
@@ -166,6 +185,31 @@ def test_apply_camera_options_bool_and_serial_only_map():
     assert by["agentview"].options == {"enable_auto_exposure": 0.0}
 
 
+def test_apply_camera_stream_settings():
+    """fps/width/height come from the YAML; unset keys keep the CameraSpec default."""
+    cams = apply_camera_serials(
+        default_cameras(),
+        {
+            "cameras": {
+                "agentview": {"serial": "AAA", "fps": 30},
+                "wrist_left": {"serial": "BBB", "fps": 15, "width": 848, "height": 480},
+                "wrist_right": "CCC",  # plain-string form -> defaults untouched
+            }
+        },
+    )
+    by = {c.key: c for c in cams}
+    assert by["agentview"].fps == 30
+    assert (by["agentview"].width, by["agentview"].height) == (640, 480)  # untouched
+    assert (by["wrist_left"].fps, by["wrist_left"].width, by["wrist_left"].height) == (15, 848, 480)
+    assert by["wrist_right"].fps == 60  # CameraSpec default
+
+
+def test_apply_camera_stream_settings_reject_bad_values():
+    for bad in ({"fps": 0}, {"fps": -1}, {"fps": "30"}, {"fps": True}, {"width": 640.5}):
+        with pytest.raises(ValueError):
+            apply_camera_serials(default_cameras(), {"cameras": {"agentview": bad}})
+
+
 def test_apply_camera_options_rejects_bad_shapes():
     with pytest.raises(ValueError):
         apply_camera_serials(default_cameras(), {"cameras": {"agentview": {"options": ["exposure"]}}})
@@ -235,7 +279,7 @@ def test_reference_overlay_opacity_is_shared_by_record_and_deploy_configs(tmp_pa
     cfg_path.write_text("recorder:\n  reference_live_alpha: 0.3\n")
 
     record_cfg = build_config(["--config", str(cfg_path)])
-    deploy_cfg, _ = build_configs(["--config", str(cfg_path)])
+    deploy_cfg, _ = build_deploy_configs(["--config", str(cfg_path)])
 
     assert record_cfg.reference_live_alpha == 0.3
     assert deploy_cfg.reference_live_alpha == 0.3
