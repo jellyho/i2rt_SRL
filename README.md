@@ -73,14 +73,17 @@ The recorder opens on a **Setup page**:
 2. To add to an existing dataset, tick **Continue collecting** (resume/append). Otherwise **START** creates it fresh — and if the folder exists it asks twice before overwriting.
 3. **START** connects the robot, opens cameras + dataset, and (with `auto_arm: true`) arms collection immediately.
 
-After START, **Past demonstration overlay** lists the completed demonstrations already in the
-selected dataset (using LeRobot's `episode_index` metadata, not MP4 container filenames).
+After START, **Past demonstration overlay** can use any dataset folder under the selected
+`root`, including a different dataset from the one currently being recorded. Choose the
+source with **Overlay dataset**; changing it immediately refreshes the completed demonstrations
+(using LeRobot's `episode_index` metadata, not MP4 container filenames).
 Select one to display its synchronized wrist-left, agentview, and
 wrist-right videos over the matching live cameras, then use **Live camera opacity**
 to compare the current scene with the reference. A selected episode starts paused
 on its first frame and advances only after **Resume reference**. Tick **Continue collecting** before
-START when using an existing dataset; starting fresh intentionally deletes its past
-episodes after the two overwrite confirmations. The blend is preview-only: saved
+START when using an existing dataset; starting fresh intentionally deletes that dataset's past
+episodes after the two overwrite confirmations. Other overlay-source datasets are read-only.
+The blend is preview-only: saved
 frames and policy inputs always remain the unmodified camera images. This same panel
 is available in both `yam-data record` and `yam-data deploy`. The first saved demonstration
 is selected automatically; set live-camera opacity to `100%` to hide the reference.
