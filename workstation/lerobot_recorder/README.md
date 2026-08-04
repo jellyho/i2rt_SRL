@@ -284,7 +284,7 @@ identical whether or not you record; only step 3 differs.
 
 ```
 [robot]                        [workstation]                      [policy]
-run_robot_server dagger  ◀─portal─▶  deploy UI  ◀──websocket+msgpack──▶  yam_policy.serve
+run_robot_server deploy  ◀─portal─▶  deploy UI  ◀──websocket+msgpack──▶  yam_policy.serve
   owns the arms,                     owns cameras,                       owns the network
   takeover, homing, e-stop           builds obs, sends action chunks
 ```
@@ -294,10 +294,10 @@ the workstation only streams actions while the robot reports `policy_running` an
 intervention / homing / e-stop. So a takeover or an e-stop stops the policy no matter what
 the UI is doing.
 
-**Why `dagger` and not `teleop` for the robot server** — the two modes differ in who drives
-the follower and what the leader is for:
+**Why `deploy` and not `teleop` for the robot server** — the two differ in who drives the
+follower and what the leader is for:
 
-| | `run_robot_server teleop` | `run_robot_server dagger` |
+| | `run_robot_server teleop` | `run_robot_server deploy` |
 |---|---|---|
 | drives the follower | the human, through the leader (gello) arm | the **policy**, via `set_policy_action` from the workstation |
 | accepts policy actions | no | yes |
@@ -306,14 +306,22 @@ the follower and what the leader is for:
 | handle buttons | label the episode (success / fail / discard) | drive the rollout state machine (start/stop, takeover, keep/discard + home) |
 | used by | `yam-data record` | `yam-data deploy`, `yam-data bridge` |
 
+(The `deploy` controller was called `dagger` until it also started serving plain
+deployment — HG-DAgger is one *use* of it, not what it is. `robot/yam dagger` still
+works as an alias, and an un-updated robot server reporting the old name is accepted.)
+
 A `teleop` server ignores `set_policy_action` entirely, so deployment against it does
-nothing. (`wrapper` is a third mode: the follower tracks an external command with no leader
-at all — that is what replay uses.)
+nothing — hence the startup check below.
+
+There is a third mode, `wrapper`: the followers track an external command with **no
+leader arms at all**, which is what `yam-data replay` drives. So the robot server has
+three controllers — `teleop`, `deploy`, `wrapper` — plus `robot/yam can` / `canup`,
+which are CAN-bus utilities rather than modes.
 
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
 robot/yam canup
-robot/yam dagger --mirror-kp 0.2
+robot/yam deploy --mirror-kp 0.2
 
 # 2. [policy]   serve your policy (own env; openpi-compatible websocket)
 #               see policy_serving/README.md
@@ -352,7 +360,7 @@ no dataset is created, opened, or resumed and no frames are buffered.
 
 Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
 (it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /
-`--no-leader-mirror` only set the initial values; `robot/yam dagger --mirror-kp 0` makes
+`--no-leader-mirror` only set the initial values; `robot/yam deploy --mirror-kp 0` makes
 "no mirroring" the robot's own default. The mirror setting is latched workstation-side and
 re-applied on reconnect, so the robot never silently reverts mid-session.
 
@@ -370,7 +378,7 @@ and the arms never move. Both GUIs now check the mode the robot reports and refu
 ```
 The robot server at 10.0.0.5:11331 is running in 'teleop' mode, but this needs 'dagger'.
 
-On the robot machine, restart it with:  robot/yam dagger
+On the robot machine, restart it with:  robot/yam deploy
 ```
 
 ### Operating it

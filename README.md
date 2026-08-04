@@ -84,7 +84,7 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ### C · Deployment / DAgger (policy + human takeover)
 
 ```bash
-robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.0      # 🤖 robot
+robot/yam deploy --mirror-kp 0.2 --feedback-kp 0.0      # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
 workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
 # Left upper starts/stops rollout, or toggles fine control during intervention.
@@ -276,7 +276,7 @@ inference is a separate **websocket** link (openpi-compatible). Bimanual by defa
 ```bash
 source .venv/bin/activate                       # robot env (uv; robot/setup_robot_env.sh)
 python -m i2rt.serving.run_robot_server teleop  --sim   # auto home/engage teleop
-python -m i2rt.serving.run_robot_server dagger  --sim   # HG-DAgger: policy + button takeover
+python -m i2rt.serving.run_robot_server deploy  --sim   # HG-DAgger: policy + button takeover
 python -m i2rt.serving.run_robot_server wrapper --sim   # followers track an external command
 
 # …or the shortcut launcher (activates the env for you):

@@ -694,7 +694,7 @@ class TeleopController(BaseController):
 # DAgger
 # ---------------------------------------------------------------------------
 @dataclass
-class DaggerConfig:
+class DeployConfig:
     sim: bool = False
     home: str = ""
     mirror_kp: float = cc.DAGGER_MIRROR_KP
@@ -725,10 +725,17 @@ class DaggerConfig:
     )
 
 
-class DaggerController(BaseController):
-    mode = "dagger"
+class DeployController(BaseController):
+    """A policy drives the followers; a human can take over with a handle button.
 
-    def __init__(self, cfg: DaggerConfig):
+    Used for plain deployment *and* for HG-DAgger — they are the same control loop,
+    differing only in what the workstation does with the run (record it or not) and
+    whether the leader mirrors. Hence "deploy" rather than "dagger".
+    """
+
+    mode = "deploy"
+
+    def __init__(self, cfg: DeployConfig):
         self.cfg = cfg
         self.command_timeout = cfg.command_timeout
         self.mirror_kp = cfg.mirror_kp
@@ -1331,3 +1338,9 @@ class WrapperController(BaseController):
                 f.close()
             except Exception:
                 pass
+
+
+# Back-compat: this controller was called "dagger" before it was also used for plain
+# deployment. Keep the old names importable so out-of-tree scripts do not break.
+DaggerConfig = DeployConfig
+DaggerController = DeployController

@@ -549,7 +549,7 @@ def test_wrong_robot_mode_refuses_to_start_with_an_actionable_message(tmp_path, 
     """A crossed robot server otherwise fails SILENTLY (a teleop server just ignores
     policy actions), so starting must refuse and name the command to run."""
     cfg = RecorderConfig(repo_id="test/mode", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="dagger")
+                         record_source="deploy", expected_robot_mode="deploy")
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
@@ -560,21 +560,21 @@ def test_wrong_robot_mode_refuses_to_start_with_an_actionable_message(tmp_path, 
     try:
         rec.start()
     except RuntimeError as exc:
-        assert "'teleop'" in str(exc) and "'dagger'" in str(exc)
-        assert "robot/yam dagger" in str(exc)
+        assert "'teleop'" in str(exc) and "'deploy'" in str(exc)
+        assert "robot/yam deploy" in str(exc)
     else:
         raise AssertionError("a teleop server must not satisfy a deployment session")
 
 
 def test_matching_robot_mode_starts_normally(tmp_path, monkeypatch):
     cfg = RecorderConfig(repo_id="test/modeok", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="dagger")
+                         record_source="deploy", expected_robot_mode="deploy")
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
     monkeypatch.setattr(rec.robot, "start", lambda: None)
     monkeypatch.setattr(rec.robot, "stop", lambda: None)
-    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "dagger"))
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "deploy"))
     rec.start()
     rec.shutdown()
     assert rec.writer is None  # deploy source: still no dataset
@@ -583,7 +583,7 @@ def test_matching_robot_mode_starts_normally(tmp_path, monkeypatch):
 def test_unknown_robot_mode_does_not_block_startup(tmp_path, monkeypatch):
     """An older server that reports no mode must not become un-startable."""
     cfg = RecorderConfig(repo_id="test/modenone", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="dagger")
+                         record_source="deploy", expected_robot_mode="deploy")
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
@@ -596,7 +596,22 @@ def test_unknown_robot_mode_does_not_block_startup(tmp_path, monkeypatch):
 
 def test_mock_sessions_skip_the_mode_check(tmp_path):
     cfg = RecorderConfig(repo_id="test/modemock", root=str(tmp_path), mock=True,
-                         record_source="deploy", expected_robot_mode="dagger")
+                         record_source="deploy", expected_robot_mode="deploy")
     rec = Recorder(cfg)
     rec.start()  # mock has no robot at all — the check must not fire
+    rec.shutdown()
+
+
+def test_older_robot_reporting_the_pre_rename_mode_is_accepted(tmp_path, monkeypatch):
+    """The controller was renamed dagger -> deploy once it also served plain deployment.
+    An un-updated robot server still says "dagger"; that skew must not read as a mismatch."""
+    cfg = RecorderConfig(repo_id="test/modeold", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="deploy")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "dagger"))
+    rec.start()  # must not raise
     rec.shutdown()

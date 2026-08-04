@@ -1,7 +1,7 @@
 """Run the YAM robot server on the robot machine.
 
     python -m i2rt.serving.run_robot_server teleop  [--sim] [--bilateral-kp 0.15]
-    python -m i2rt.serving.run_robot_server dagger  [--sim] [--mirror-kp 0.2]
+    python -m i2rt.serving.run_robot_server deploy  [--sim] [--mirror-kp 0.2]
     python -m i2rt.serving.run_robot_server wrapper [--sim]            # replay target
 
 The workstation connects with :class:`i2rt.serving.robot_client.RobotClient`.
@@ -15,8 +15,8 @@ import logging
 from i2rt.robots.utils import ArmType, GripperType
 from i2rt.serving import control_config as cc
 from i2rt.serving.controllers import (
-    DaggerConfig,
-    DaggerController,
+    DeployConfig,
+    DeployController,
     TeleopConfig,
     TeleopController,
     WrapperConfig,
@@ -107,7 +107,12 @@ def main() -> None:
     pt.add_argument("--gripper", default=default_gripper, help="follower (end-effector) gripper type")
     pt.add_argument("--leader-gripper", default=default_leader_gripper)
 
-    pd = sub.add_parser("dagger", help="HG-DAgger policy + button takeover")
+    pd = sub.add_parser(
+        "deploy",
+        aliases=["dagger"],  # the old name, kept so existing scripts keep working
+        help="a policy drives the followers; handle button = human takeover "
+        "(plain deployment and HG-DAgger both use this)",
+    )
     pd.add_argument("--config", default=None, help="config.yaml (control overrides + port)")
     pd.add_argument("--port", type=int, default=default_port)
     pd.add_argument("--sim", action="store_true")
@@ -184,10 +189,11 @@ def main() -> None:
                 follower_gripper=args.gripper,
             )
         )
-    elif args.mode == "dagger":
-        dagger_sec = rig.get("dagger", {}) or {}
-        ctrl = DaggerController(
-            DaggerConfig(
+    elif args.mode in ("deploy", "dagger"):
+        # `dagger:` is the original config section name; `deploy:` is preferred.
+        dagger_sec = rig.get("deploy", rig.get("dagger", {})) or {}
+        ctrl = DeployController(
+            DeployConfig(
                 sim=args.sim,
                 home=args.home,
                 mirror_kp=args.mirror_kp,
@@ -206,7 +212,7 @@ def main() -> None:
                 max_joint_speed=args.max_joint_speed,
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
-                else DaggerConfig().button_map,
+                else DeployConfig().button_map,
                 arm_type=args.arm_type,
                 leader_gripper=args.leader_gripper,
                 follower_gripper=args.gripper,

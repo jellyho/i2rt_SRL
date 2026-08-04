@@ -29,7 +29,7 @@ DEPLOYMENT
 source .venv/bin/activate        # robot env (uv; see robot/setup_robot_env.sh)
 
 robot/yam teleop  --bilateral-kp 0.15     # auto home/engage bimanual teleop
-robot/yam dagger  --mirror-kp 0.2         # HG-DAgger: policy drives, button takeover
+robot/yam deploy  --mirror-kp 0.2         # a policy drives the followers, button = takeover
 robot/yam wrapper                          # followers track an external command (replay)
 robot/yam teleop  --sim                    # no hardware
 ```
@@ -79,7 +79,7 @@ robot.set_estop(True)                    # network e-stop: hold, ignore all comm
 
 | key | meaning |
 |-----|---------|
-| `mode` | `teleop` / `dagger` / `wrapper` |
+| `mode` | `teleop` / `deploy` / `wrapper` |
 | `t` | robot monotonic timestamp |
 | `teleop_state` | `HOMING`/`IDLE`/`ENGAGED` (teleop) — the episode gate signal |
 | `active` | True iff ENGAGED (teleop) |

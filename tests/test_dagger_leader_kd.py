@@ -109,7 +109,7 @@ def _make_dagger(monkeypatch, feedback_kp: float, leader_kd: np.ndarray = None):
     pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
                        base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
-    dc = ctl.DaggerController(ctl.DaggerConfig(feedback_kp=feedback_kp))
+    dc = ctl.DeployController(ctl.DeployConfig(feedback_kp=feedback_kp))
     return dc, leader, follower
 
 
@@ -314,4 +314,4 @@ def test_mirror_state_defaults_from_mirror_kp_and_is_reported(monkeypatch):
     pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
                        base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
-    assert ctl.DaggerController(ctl.DaggerConfig(mirror_kp=0.0))._leader_mirror is False
+    assert ctl.DeployController(ctl.DeployConfig(mirror_kp=0.0))._leader_mirror is False

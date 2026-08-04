@@ -136,10 +136,13 @@ class Recorder:
             self.cameras.stop()
             raise
 
-    #: Which robot controller each tool needs, and how to start the right one.
-    _ROBOT_MODE_HINT = {
-        "teleop": "robot/yam teleop",
-        "dagger": "robot/yam dagger",
+    #: Which robot controller each tool needs -> the mode strings that satisfy it, and how
+    #: to start the right one. "deploy" also accepts "dagger": that controller was renamed
+    #: once it started serving plain deployment as well as HG-DAgger, and an older robot
+    #: server still reports the old name — a version skew must not read as a mismatch.
+    _ROBOT_MODES = {
+        "teleop": ({"teleop"}, "robot/yam teleop"),
+        "deploy": ({"deploy", "dagger"}, "robot/yam deploy"),
     }
 
     def _check_robot_mode(self, timeout: float = 3.0) -> None:
@@ -162,11 +165,12 @@ class Recorder:
         if mode is None:
             logger.warning("could not read the robot server mode; skipping the %s check", want)
             return
-        if mode != want:
+        accepted, hint = self._ROBOT_MODES.get(want, ({want}, want))
+        if mode not in accepted:
             raise RuntimeError(
                 f"The robot server at {self.cfg.robot_host}:{self.cfg.robot_port} is running in "
                 f"'{mode}' mode, but this needs '{want}'.\n\n"
-                f"On the robot machine, restart it with:  {self._ROBOT_MODE_HINT.get(want, want)}"
+                f"On the robot machine, restart it with:  {hint}"
             )
 
     def _open_writer(self) -> AsyncDatasetWriter:

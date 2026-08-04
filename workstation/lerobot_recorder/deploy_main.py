@@ -126,7 +126,7 @@ def build_configs(
     recorder_cfg.streaming_encoding = bool(
         rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
     )
-    recorder_cfg.expected_robot_mode = "dagger"  # only that controller accepts policy actions
+    recorder_cfg.expected_robot_mode = "deploy"  # only that controller accepts policy actions
 
     bridge_cfg = BridgeConfig(
         robot_host=recorder_cfg.robot_host,

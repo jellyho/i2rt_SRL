@@ -132,7 +132,7 @@ python -c "from i2rt.serving.robot_client import RobotClient; import numpy as np
 ```bash
 # [policy]  smoke test with the zero-model "hold" policy:
 python -m yam_policy.serve            # :8000
-# [robot]  robot/yam dagger --mirror-kp 0.2
+# [robot]  robot/yam deploy --mirror-kp 0.2
 # [ws]
 workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
     --serials <wl>,<wr>,<agent> --prompt "do the task"
@@ -144,7 +144,7 @@ workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
 ## 11. HG-DAgger collection
 
 ```bash
-# [robot]  robot/yam dagger --mirror-kp 0.2   (+ policy server + bridge as above)
+# [robot]  robot/yam deploy --mirror-kp 0.2   (+ policy server + bridge as above)
 # [ws]
 workstation/yam-data record --source dagger --robot-host <ROBOT_IP> \
     --repo-id user/yam_dagger --serials <wl>,<wr>,<agent>
