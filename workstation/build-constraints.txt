@@ -1,0 +1,12 @@
+# Build-time (PEP 518) constraints for source builds in the workstation env.
+#
+# ruckig 0.15.3 (pinned in ../pyproject.toml) ships sdist-only — no wheels — so pip/uv
+# must compile it. Its pyproject declares an UNPINNED `scikit-build-core` build
+# requirement while still using the old `cmake.targets` key, which scikit-build-core
+# >= 0.10 rejects outright:
+#
+#   ERROR: Use build.targets instead of cmake.targets for scikit-build-core >= 0.10
+#
+# Pinning the build backend below 0.10 lets it build unchanged. Drop this line if
+# ruckig is ever bumped to a release that uses `build.targets` (>= 0.16).
+scikit-build-core<0.10
