@@ -1073,6 +1073,15 @@ class DaggerController(BaseController):
 
                 if desired is not None:
                     target = desired if self._leader_recentering else smoother.step(desired)
+                    if self._intervening and human is not None and self._has_grip:
+                        # Match steady teleoperation: the teaching-handle trigger
+                        # directly controls the normalized gripper command.  Keep
+                        # arm joints rate-limited across the policy/human handoff,
+                        # but do not make a full gripper close take 1 / joint-speed
+                        # seconds.  Synchronize the smoother so the next handoff
+                        # still starts from the command that was actually applied.
+                        target[-1] = human[-1]
+                        smoother.cur[-1] = human[-1]
                     applied = self._apply(pair.follower, target)
                     if not self._intervening and self._policy_running and applied is not None:
                         # Mirror the command sent after follower smoothing/clamping.
