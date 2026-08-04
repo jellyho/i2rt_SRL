@@ -14,8 +14,9 @@ Example:
     control:  {bilateral_kp: 0.15, home_speed: 0.4, follower_effort_limit: 30.0,
                follower_joint_limits: [[-3.0, 3.0], ...]}
     cameras:  {agentview: "1234", wrist_left: "5678", wrist_right: "9012"}
-              # or, per camera, with sensor options:
-              #   agentview: {serial: "1234", options: {enable_auto_exposure: 0, exposure: 300}}
+              # or, per camera, with stream rate and sensor options:
+              #   agentview: {serial: "1234", fps: 30,
+              #               options: {enable_auto_exposure: 0, exposure: 300}}
     recorder: {repo_id: user/yam_pick, root: ~/lerobot_data, fps: 60, min_free_gb: 2.0}
     tasks:    ["pick the cube", "stack the blocks"]
 """
@@ -157,13 +158,21 @@ def teleop_button_outcomes(rig: Dict[str, Any]) -> Dict[str, str]:
 
 
 def apply_camera_serials(cameras: List[Any], rig: Dict[str, Any]) -> List[Any]:
-    """Set each ``CameraSpec.serial`` (and optional sensor ``options``) from
-    ``rig['cameras']``, by camera key.
+    """Set each ``CameraSpec.serial`` (plus optional stream geometry and sensor
+    ``options``) from ``rig['cameras']``, by camera key.
 
     Two entry shapes per camera, so existing configs keep working:
 
         agentview: "246322303794"                       # serial only
         agentview: {serial: "2463...", options: {enable_auto_exposure: 0, exposure: 300}}
+
+    ``fps`` / ``width`` / ``height`` set the STREAM the camera is asked to deliver.
+    This is not ``recorder.fps`` (the record-loop / dataset rate) — it is what the
+    camera actually pushes over USB, so it decides bandwidth. Three 640x480 cameras
+    at 60 fps do not fit on a single USB 2.0 bus; dropping them to 30 roughly halves
+    the load. Unsupported values still fall back via ``CameraManager._resolve_fps``.
+
+        wrist_right: {serial: "4091...", fps: 30}
 
     ``options`` are RealSense option names (``rs.option`` members) -> numeric value,
     applied after the stream starts to whichever sensor owns the color controls (the
@@ -178,6 +187,16 @@ def apply_camera_serials(cameras: List[Any], rig: Dict[str, Any]) -> List[Any]:
         if isinstance(entry, dict):
             if entry.get("serial"):
                 cam.serial = str(entry["serial"])
+            for name in ("fps", "width", "height"):
+                if name not in entry:
+                    continue
+                value = entry[name]
+                # bool is an int subclass — `fps: true` is a config error, not 1 fps.
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(
+                        f"camera {cam.key!r}: {name!r} must be a positive integer, got {value!r}"
+                    )
+                setattr(cam, name, value)
             options = entry.get("options") or {}
             if not isinstance(options, dict):
                 raise ValueError(f"camera {cam.key!r}: 'options' must be a mapping of option name -> value")

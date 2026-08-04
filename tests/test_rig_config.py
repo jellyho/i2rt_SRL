@@ -165,6 +165,31 @@ def test_apply_camera_options_bool_and_serial_only_map():
     assert by["agentview"].options == {"enable_auto_exposure": 0.0}
 
 
+def test_apply_camera_stream_settings():
+    """fps/width/height come from the YAML; unset keys keep the CameraSpec default."""
+    cams = apply_camera_serials(
+        default_cameras(),
+        {
+            "cameras": {
+                "agentview": {"serial": "AAA", "fps": 30},
+                "wrist_left": {"serial": "BBB", "fps": 15, "width": 848, "height": 480},
+                "wrist_right": "CCC",  # plain-string form -> defaults untouched
+            }
+        },
+    )
+    by = {c.key: c for c in cams}
+    assert by["agentview"].fps == 30
+    assert (by["agentview"].width, by["agentview"].height) == (640, 480)  # untouched
+    assert (by["wrist_left"].fps, by["wrist_left"].width, by["wrist_left"].height) == (15, 848, 480)
+    assert by["wrist_right"].fps == 60  # CameraSpec default
+
+
+def test_apply_camera_stream_settings_reject_bad_values():
+    for bad in ({"fps": 0}, {"fps": -1}, {"fps": "30"}, {"fps": True}, {"width": 640.5}):
+        with pytest.raises(ValueError):
+            apply_camera_serials(default_cameras(), {"cameras": {"agentview": bad}})
+
+
 def test_apply_camera_options_rejects_bad_shapes():
     with pytest.raises(ValueError):
         apply_camera_serials(default_cameras(), {"cameras": {"agentview": {"options": ["exposure"]}}})
