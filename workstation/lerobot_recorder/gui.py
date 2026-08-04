@@ -318,9 +318,10 @@ class RecorderGUI(QtWidgets.QWidget):
         self.live_lbl.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
         self.live_lbl.setStyleSheet(f"background:#000;border:1px solid #30363d;border-radius:8px;color:{theme.MUTED};")
 
-        # Past demonstrations from the selected dataset can be overlaid on the three
-        # corresponding live views.  This panel sits entirely in the display
-        # path: Recorder and DeploymentPolicyRunner continue to receive raw images.
+        # Past demonstrations from any dataset under the selected root can be
+        # overlaid on the three corresponding live views.  This panel sits entirely
+        # in the display path: Recorder and DeploymentPolicyRunner continue to
+        # receive raw images.
         self.reference_box = QtWidgets.QGroupBox("Past demonstration overlay · preview only")
         reference_layout = QtWidgets.QHBoxLayout(self.reference_box)
         self.reference_list = QtWidgets.QListWidget()
@@ -330,6 +331,13 @@ class RecorderGUI(QtWidgets.QWidget):
         reference_layout.addWidget(self.reference_list, 1)
 
         reference_controls = QtWidgets.QVBoxLayout()
+        self.reference_dataset_combo = PickerComboBox()
+        self.reference_dataset_combo.setMinimumWidth(220)
+        self.reference_dataset_combo.setToolTip("Dataset folder under the session root used for the overlay")
+        self.reference_dataset_combo.currentTextChanged.connect(self._on_reference_dataset_changed)
+        dataset_row = QtWidgets.QHBoxLayout()
+        dataset_row.addWidget(QtWidgets.QLabel("Overlay dataset:"))
+        dataset_row.addWidget(self.reference_dataset_combo, 1)
         self.reference_status = QtWidgets.QLabel("Select a saved demonstration to compare all three camera views.")
         self.reference_status.setWordWrap(True)
         self.reference_status.setStyleSheet(f"color:{theme.MUTED};")
@@ -345,10 +353,11 @@ class RecorderGUI(QtWidgets.QWidget):
         self.reference_pause_btn.setEnabled(False)
         self.reference_pause_btn.clicked.connect(self._on_reference_pause)
         self.reference_refresh_btn = QtWidgets.QPushButton("Refresh demonstrations")
-        self.reference_refresh_btn.clicked.connect(self._refresh_reference_episodes)
+        self.reference_refresh_btn.clicked.connect(self._refresh_reference_datasets)
         button_row = QtWidgets.QHBoxLayout()
         button_row.addWidget(self.reference_pause_btn)
         button_row.addWidget(self.reference_refresh_btn)
+        reference_controls.addLayout(dataset_row)
         reference_controls.addWidget(self.reference_status)
         reference_controls.addLayout(opacity_row)
         reference_controls.addLayout(button_row)
@@ -584,16 +593,52 @@ class RecorderGUI(QtWidgets.QWidget):
         self._prev = self.recorder.get_status()
         self.stack.setCurrentWidget(self.collect_page)
         self.collect_btn.setEnabled(True)
-        self._refresh_reference_episodes()
+        self._refresh_reference_datasets(preferred=self._active_dataset_name())
         if cfg.auto_arm:  # arm immediately so the next teleop engage records
             self.collect_btn.setChecked(True)
             self._on_collect()
 
+    def _active_dataset_name(self) -> str:
+        """Folder name for the dataset being written in this session."""
+        return os.path.basename(os.path.normpath(dataset_dir(self.cfg.root, self.cfg.repo_id)))
+
+    def _refresh_reference_datasets(self, *, preferred: Optional[str] = None) -> None:
+        """Rescan overlay source folders under the session root, then their episodes."""
+        current = preferred or self.reference_dataset_combo.currentText().strip()
+        choices = list_datasets(self.cfg.root)
+        if current not in choices:
+            active = self._active_dataset_name()
+            current = active if active in choices else (choices[0] if choices else "")
+
+        self.reference_dataset_combo.blockSignals(True)
+        self.reference_dataset_combo.clear()
+        self.reference_dataset_combo.addItems(choices)
+        if current:
+            self.reference_dataset_combo.setCurrentText(current)
+        self.reference_dataset_combo.setEnabled(bool(choices))
+        self.reference_dataset_combo.blockSignals(False)
+        self._refresh_reference_episodes()
+
+    def _on_reference_dataset_changed(self, _dataset: str) -> None:
+        """Immediately replace the episode list when a different source is chosen."""
+        self._reference_player.stop()
+        self._refresh_reference_episodes()
+
     def _refresh_reference_episodes(self) -> None:
-        """Rescan completed three-camera demonstrations in the active dataset."""
+        """Rescan completed three-camera demonstrations in the overlay dataset."""
+        dataset_name = self.reference_dataset_combo.currentText().strip()
+        if not dataset_name:
+            self._reference_episodes = []
+            self.reference_list.clear()
+            self._reference_player.stop()
+            self.reference_pause_btn.setEnabled(False)
+            self.reference_pause_btn.setText("Resume reference")
+            self.reference_status.setText(f"No dataset folders found under {os.path.expanduser(self.cfg.root)}.")
+            return
+
         selected = self._reference_player.episode
         selected_number = selected.episode if selected is not None else None
-        root = dataset_dir(self.cfg.root, self.cfg.repo_id)
+        root = dataset_dir(self.cfg.root, dataset_name)
         try:
             episodes = discover_reference_episodes(root, self._reference_camera_keys)
         except Exception as exc:
@@ -621,8 +666,8 @@ class RecorderGUI(QtWidgets.QWidget):
             self.reference_pause_btn.setEnabled(False)
             self.reference_pause_btn.setText("Resume reference")
             self.reference_status.setText(
-                "No completed three-camera demonstrations in this dataset yet. "
-                "Use Continue collecting to retain past demonstrations, then refresh after a save."
+                f"No completed three-camera demonstrations in {dataset_name}. "
+                "Choose another overlay dataset or refresh after a save."
             )
         elif not kept_selection:
             # START and a refresh with no surviving selection both default to
@@ -630,7 +675,7 @@ class RecorderGUI(QtWidgets.QWidget):
             self._on_reference_selected(selected_row)
         else:
             self.reference_status.setText(
-                f"{len(episodes)} saved demonstration(s) available. "
+                f"{len(episodes)} saved demonstration(s) available in {dataset_name}. "
                 "Set live camera opacity to 100% to hide the reference."
             )
 
@@ -650,8 +695,10 @@ class RecorderGUI(QtWidgets.QWidget):
             return
         self.reference_pause_btn.setEnabled(True)
         self.reference_pause_btn.setText("Resume reference")
+        dataset_name = self.reference_dataset_combo.currentText().strip()
         self.reference_status.setText(
-            f"Paused {episode.label} at its first frame over wrist-left · agentview · wrist-right (preview only)."
+            f"Paused {episode.label} from {dataset_name} at its first frame over "
+            "wrist-left · agentview · wrist-right (preview only)."
         )
 
     def _on_reference_opacity(self, value: int) -> None:
