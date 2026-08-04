@@ -89,6 +89,9 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     recorder_cfg.streaming_encoding = bool(
         rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
     )
+    recorder_cfg.reference_live_alpha = min(
+        max(float(rec_section.get("reference_live_alpha", recorder_cfg.reference_live_alpha)), 0.0), 1.0
+    )
 
     bridge_cfg = BridgeConfig(
         robot_host=recorder_cfg.robot_host,

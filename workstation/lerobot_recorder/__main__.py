@@ -114,6 +114,9 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
     cfg.image_writer_threads = int(rec_section.get("image_writer_threads", cfg.image_writer_threads))
     cfg.image_writer_processes = int(rec_section.get("image_writer_processes", cfg.image_writer_processes))
     cfg.streaming_encoding = bool(rec_section.get("streaming_encoding", cfg.streaming_encoding))
+    cfg.reference_live_alpha = min(
+        max(float(rec_section.get("reference_live_alpha", cfg.reference_live_alpha)), 0.0), 1.0
+    )
     return cfg
 
 

@@ -272,3 +272,14 @@ def test_recorder_config_uses_shared_button_outcomes(tmp_path):
     cfg = build_config(["--config", str(cfg_path)])
 
     assert cfg.button_map == {"left.2": "success"}
+
+
+def test_reference_overlay_opacity_is_shared_by_record_and_deploy_configs(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("recorder:\n  reference_live_alpha: 0.3\n")
+
+    record_cfg = build_config(["--config", str(cfg_path)])
+    deploy_cfg, _ = build_deploy_configs(["--config", str(cfg_path)])
+
+    assert record_cfg.reference_live_alpha == 0.3
+    assert deploy_cfg.reference_live_alpha == 0.3
