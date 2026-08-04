@@ -304,7 +304,7 @@ follower and what the leader is for:
 | what the leader is | the **input device**; `bilateral_kp` gives force feedback | an **override handle**: mirrors the follower while the policy drives, goes free when you take over |
 | episode boundary | the engage gate (IDLE → ENGAGED → HOMING → IDLE) | a policy rollout (start/stop by button or UI) |
 | handle buttons | label the episode (success / fail / discard) | drive the rollout state machine (start/stop, takeover, keep/discard + home) |
-| used by | `yam-data record` | `yam-data deploy`, `yam-data bridge` |
+| used by | `yam-data record` | `yam-data deploy` (GUI or `--headless`) |
 
 (The `deploy` controller was called `dagger` until it also started serving plain
 deployment — HG-DAgger is one *use* of it, not what it is. `robot/yam dagger` still
@@ -393,9 +393,23 @@ On the robot machine, restart it with:  robot/yam deploy
 The prompt sent to the policy is the **task** field, so switching task in the UI switches
 the instruction the policy is conditioned on.
 
-`workstation/yam-data bridge` remains as a headless/debug bridge — no GUI, no start/stop,
-and it opens the cameras itself, so do not run it alongside the deploy UI (they fight over
-the RealSense devices). Prefer `deploy` / `deploy --no-record`.
+### No screen on the workstation?
+
+`yam-data deploy --headless` runs the same loop without Qt: same observation, same policy
+client, same robot-mode check — and unlike the old `yam-data bridge` it can record, because
+it drives the very same `Recorder`.
+
+```bash
+workstation/yam-data deploy --headless --mode deploy --no-record
+```
+
+It starts the policy on launch (there is no button to press), so **the arms begin moving
+when you run it** — `--no-autostart` waits for the handle button instead. Ctrl-C stops the
+policy, closes any in-flight episode, and finalizes the dataset.
+
+`yam-data bridge` was a second, independent copy of this loop and has been removed: the
+duplicated code decided *what the policy receives*, so the two could drift into feeding the
+same policy different observations.
 
 This closes the loop: train → deploy (`--no-record`) to sanity-check → DAgger to collect
 where it fails → retrain.

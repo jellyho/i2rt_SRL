@@ -3,7 +3,8 @@
 This replaces the normal headless ``yam-data bridge`` operator flow: the UI owns
 policy streaming and (optionally) DAgger recording in one workstation process.
 
-    workstation/yam-data deploy      # everything else is chosen in the UI
+    workstation/yam-data deploy              # everything else is chosen in the UI
+    workstation/yam-data deploy --headless   # no GUI (replaces the old `yam-data bridge`)
 
 A run has two independent axes, both on the setup page: **mode** (deploy = watch the
 policy, leader free; dagger = correct it, leader mirrors) and **record** (whether the run
@@ -24,7 +25,7 @@ from workstation.policy_bridge.config import BridgeConfig
 
 def build_configs(
     argv: Optional[List[str]] = None,
-) -> Tuple[RecorderConfig, BridgeConfig, str, bool, bool]:
+) -> Tuple[RecorderConfig, BridgeConfig, argparse.Namespace]:
     p = argparse.ArgumentParser(description="YAM policy deployment UI (DAgger or watch-only)")
     p.add_argument("--config", default=None, help="config.yaml (robot/policy/cameras/recorder)")
     p.add_argument("--repo-id", default="user/yam_bimanual")
@@ -65,6 +66,19 @@ def build_configs(
         action="store_true",
         default=None,
         help="force leader mirroring ON regardless of the record mode",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="run without the GUI (replaces the old `yam-data bridge`): same loop, same "
+        "obs, and unlike the old bridge it can record",
+    )
+    p.add_argument(
+        "--no-autostart",
+        dest="autostart",
+        action="store_false",
+        help="headless only: wait for the handle button instead of starting the policy "
+        "(and moving the arms) on launch",
     )
     mirror.add_argument(
         "--no-leader-mirror",
@@ -139,11 +153,27 @@ def build_configs(
         prompt=task,
         use_async=not args.no_async,
     )
-    return recorder_cfg, bridge_cfg, args.mode, not args.no_record, args.leader_mirror
+    return recorder_cfg, bridge_cfg, args
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    recorder_cfg, bridge_cfg, mode, record, leader_mirror = build_configs(argv)
+    recorder_cfg, bridge_cfg, args = build_configs(argv)
+
+    if args.headless:
+        import logging
+
+        from workstation.lerobot_recorder.deploy_headless import run_headless
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        sys.exit(
+            run_headless(
+                recorder_cfg,
+                bridge_cfg,
+                leader_mirror=args.leader_mirror,
+                autostart=args.autostart,
+            )
+        )
+
     from PyQt5 import QtWidgets
 
     from workstation.lerobot_recorder import theme
@@ -152,7 +182,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(theme.QSS)
     gui = DeployGUI(
-        recorder_cfg, bridge_cfg, mode=mode, record=record, leader_mirror=leader_mirror
+        recorder_cfg, bridge_cfg, mode=args.mode, record=not args.no_record,
+        leader_mirror=args.leader_mirror,
     )
     gui.resize(900, 980)
     gui.show()

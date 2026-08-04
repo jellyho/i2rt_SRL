@@ -134,7 +134,7 @@ python -c "from i2rt.serving.robot_client import RobotClient; import numpy as np
 python -m yam_policy.serve            # :8000
 # [robot]  robot/yam deploy --mirror-kp 0.2
 # [ws]
-workstation/yam-data bridge --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
+workstation/yam-data deploy --headless --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
     --serials <wl>,<wr>,<agent> --prompt "do the task"
 ```
 - [ ] Bridge logs the policy **server metadata** and auto-configures `action_horizon`/image keys (no hand-matching).
