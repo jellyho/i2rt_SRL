@@ -118,7 +118,8 @@ class DeploymentPolicyRunner:
                 client.close()
                 self._policy_client = None
                 raise ValueError(
-                    "RTC requested, but policy server is not RTC-enabled; start it with yam-lerobot-serve --rtc"
+                    "RTC requested, but policy server is not RTC-enabled; "
+                    "start it with policy_serving/yam-serve --rtc"
                 )
             self._policy = RTCActionChunkBroker(
                 client,
@@ -127,9 +128,14 @@ class DeploymentPolicyRunner:
                 rate_hz=self.cfg.rate_hz,
                 n_obs_steps=int(meta.get("n_obs_steps", 1)),
             )
+        elif self.cfg.use_async:
+            self._policy = AsyncActionChunkBroker(
+                client,
+                action_horizon=action_horizon,
+                prefetch_at=self.cfg.prefetch_at(action_horizon),
+            )
         else:
-            broker_cls = AsyncActionChunkBroker if self.cfg.use_async else ActionChunkBroker
-            self._policy = broker_cls(client, action_horizon=action_horizon)
+            self._policy = ActionChunkBroker(client, action_horizon=action_horizon)
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,

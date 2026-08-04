@@ -21,6 +21,7 @@ policy:
   host: 127.0.0.1            # websocket policy server (for the bridge)
   port: 8000
   # Runtime scheduling belongs to yam-data. CLI flags override these values.
+  prefetch_steps: 2          # ordinary async: request with this many cached actions left
   rtc:
     enabled: false
     min_execute_steps: 8
@@ -143,3 +144,4 @@ tasks:                       # quick-switch language instructions in the recorde
   - "assemble lego blocks to make red firetruck"
   - "assemble lego blocks to make green dumptruck"
   - "Insert the USB-C plug into the USB-C port."
+  - "Insert the LAN cable into the ethernet port."

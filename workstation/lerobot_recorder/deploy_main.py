@@ -33,6 +33,12 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch")
     p.add_argument(
+        "--prefetch-steps",
+        type=int,
+        default=None,
+        help="start ordinary async inference with this many cached actions remaining (default: 2)",
+    )
+    p.add_argument(
         "--rtc",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -58,6 +64,7 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     pol = Resolver(args, p, rig.get("policy", {}))
     rtc_section = (rig.get("policy", {}) or {}).get("rtc", {}) or {}
     rtc = Resolver(args, p, rtc_section)
+    prefetch_steps = pol.get("prefetch_steps")
 
     cams = apply_camera_serials(default_cameras(), rig)
     if args.serials:
@@ -110,6 +117,7 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
         image_size=int(pol.get("image_size")),
         prompt=task,
         use_async=not args.no_async,
+        prefetch_steps=int(prefetch_steps if prefetch_steps is not None else 2),
         rtc_enabled=bool(rtc.get("rtc", key="enabled")),
         rtc_min_execute_steps=int(rtc.get("rtc_min_execute_steps", key="min_execute_steps")),
     )

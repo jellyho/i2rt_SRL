@@ -71,7 +71,7 @@ class PolicyBridge:
                 client.close()
                 raise ValueError(
                     "yam-data RTC was requested, but the connected policy server did not advertise "
-                    "RTC. Start it with yam-lerobot-serve --rtc."
+                    "RTC. Start it with policy_serving/yam-serve --rtc."
                 )
             self.policy = RTCActionChunkBroker(
                 client,
@@ -80,9 +80,14 @@ class PolicyBridge:
                 rate_hz=cfg.rate_hz,
                 n_obs_steps=int(meta.get("n_obs_steps", 1)),
             )
+        elif cfg.use_async:
+            self.policy = AsyncActionChunkBroker(
+                client,
+                action_horizon=self.action_horizon,
+                prefetch_at=cfg.prefetch_at(self.action_horizon),
+            )
         else:
-            broker_cls = AsyncActionChunkBroker if cfg.use_async else ActionChunkBroker
-            self.policy = broker_cls(client, action_horizon=self.action_horizon)
+            self.policy = ActionChunkBroker(client, action_horizon=self.action_horizon)
         self._stop = False
         self._was_streaming = False
 

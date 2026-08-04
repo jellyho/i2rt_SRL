@@ -107,6 +107,8 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call, re-qu
 - **AsyncActionChunkBroker** fetches the next chunk in a background thread so the
   per-chunk inference latency doesn't stall the control loop (use
   `ActionChunkBroker` for the simple synchronous version).
+- The workstation exposes the async lead as `yam-data deploy --prefetch-steps N`,
+  meaning the next request starts with `N` cached actions still remaining.
 - **Metadata-driven config**: declare `action_horizon` (and optionally an
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from

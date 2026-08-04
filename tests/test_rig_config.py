@@ -248,6 +248,7 @@ def test_deploy_rtc_config_uses_yaml_with_cli_override(tmp_path):
         "  action_horizon: 24\n"
         "  rate: 30\n"
         "  image_size: 320\n"
+        "  prefetch_steps: 7\n"
         "  rtc:\n"
         "    enabled: true\n"
         "    min_execute_steps: 8\n"
@@ -257,6 +258,8 @@ def test_deploy_rtc_config_uses_yaml_with_cli_override(tmp_path):
     assert bridge.action_horizon == 24
     assert bridge.rate_hz == 30
     assert bridge.image_size == 320
+    assert bridge.prefetch_steps == 7
+    assert bridge.prefetch_at(24) == 17
     assert bridge.rtc_enabled is True
     assert bridge.rtc_min_execute_steps == 8
 
@@ -269,8 +272,20 @@ def test_deploy_rtc_config_uses_yaml_with_cli_override(tmp_path):
             "5",
             "--rate",
             "20",
+            "--prefetch-steps",
+            "2",
         ]
     )
     assert overridden.rtc_enabled is False
     assert overridden.rtc_min_execute_steps == 5
     assert overridden.rate_hz == 20
+    assert overridden.prefetch_steps == 2
+    assert overridden.prefetch_at(24) == 22
+
+
+@pytest.mark.parametrize("prefetch_steps", [0, 24, 25])
+def test_prefetch_steps_must_fit_action_horizon(prefetch_steps):
+    from workstation.policy_bridge.config import BridgeConfig
+
+    with pytest.raises(ValueError, match="prefetch_steps"):
+        BridgeConfig(prefetch_steps=prefetch_steps).prefetch_at(24)

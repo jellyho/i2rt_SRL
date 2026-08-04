@@ -95,6 +95,12 @@ def test_async_broker_prefetch():
     broker.close()
 
 
+@pytest.mark.parametrize("prefetch_at", [0, HORIZON, HORIZON + 1])
+def test_async_broker_rejects_prefetch_outside_chunk(prefetch_at):
+    with pytest.raises(ValueError, match="prefetch_at"):
+        AsyncActionChunkBroker(DummyPolicy(action_horizon=HORIZON), HORIZON, prefetch_at=prefetch_at)
+
+
 def test_async_broker_reset_waits_for_and_discards_prefetch():
     policy = _ControlledRTCPolicy()
     broker = AsyncActionChunkBroker(policy, action_horizon=HORIZON, prefetch_at=1)

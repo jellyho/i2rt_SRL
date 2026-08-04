@@ -297,6 +297,8 @@ workstation/yam-data deploy --rtc \
 
 Persistent workstation defaults live under ``policy.rtc`` in ``config.yaml``;
 ``--rtc``/``--no-rtc`` and ``--rtc-min-execute-steps`` override them per run.
+For ordinary async inference, ``--prefetch-steps N`` launches the next request
+with ``N`` cached actions remaining; ``policy.prefetch_steps`` sets its default.
 
 `workstation/yam-data bridge` is still available as a headless/debug bridge. For
 normal DAgger collection, use `deploy` so the policy bridge, recorder, live stats,

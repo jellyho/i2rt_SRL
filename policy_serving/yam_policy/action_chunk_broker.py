@@ -66,6 +66,11 @@ class AsyncActionChunkBroker(BasePolicy):
         self._policy = policy
         self._h = int(action_horizon)
         self._prefetch_at = int(prefetch_at) if prefetch_at is not None else max(self._h - 2, 1)
+        if not 0 < self._prefetch_at < self._h:
+            raise ValueError(
+                f"prefetch_at must be between 1 and action_horizon - 1; got {self._prefetch_at} "
+                f"for horizon {self._h}"
+            )
         self._exec = ThreadPoolExecutor(max_workers=1)  # serializes inference calls
         self._cur: Dict | None = None
         self._step = 0
