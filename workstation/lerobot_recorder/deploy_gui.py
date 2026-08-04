@@ -360,12 +360,14 @@ class DeployGUI(RecorderGUI):
         for btn in buttons:
             btn.setEnabled(not blocked)
         runner = self.runner.get_status() if self.runner is not None else {}
-        horizon = runner.get("action_horizon", self.bridge_cfg.action_horizon)
+        # 0 until the first chunk arrives — the policy decides, we do not configure it.
+        horizon = runner.get("action_horizon", 0)
         img = runner.get("image_size", self.bridge_cfg.image_size)
         # Report the robot's OWN mirror state, not the checkbox: they can differ for a tick
         # after a toggle or a reconnect, and the robot is the one actually driving the leader.
         leader = "mirroring the policy" if st.get("leader_mirror", True) else "free (not mirroring)"
-        self.runner_status.setText(f"policy horizon {horizon} · image {img}px · leader {leader}")
+        chunk = f"chunk {horizon}" if horizon else "chunk —"
+        self.runner_status.setText(f"policy {chunk} · image {img}px · leader {leader}")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.runner is not None:

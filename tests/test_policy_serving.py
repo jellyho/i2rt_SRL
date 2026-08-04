@@ -7,7 +7,7 @@ import threading
 import numpy as np
 import pytest
 
-pytest.importorskip("msgpack_numpy")
+pytest.importorskip("msgpack")
 pytest.importorskip("websockets")
 
 from yam_policy import (

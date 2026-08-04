@@ -39,7 +39,6 @@ def build_configs(
     p.add_argument("--policy-host", default="127.0.0.1")
     p.add_argument("--policy-port", type=int, default=8000)
     p.add_argument("--rate", type=float, default=30.0)
-    p.add_argument("--action-horizon", type=int, default=16)
     p.add_argument("--image-size", type=int, default=224)
     p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch")
     p.add_argument("--min-free-gb", type=float, default=1.0)
@@ -147,7 +146,6 @@ def build_configs(
         robot_port=recorder_cfg.robot_port,
         policy_host=pol.get("policy_host", key="host"),
         policy_port=int(pol.get("policy_port", key="port")),
-        action_horizon=args.action_horizon,
         rate_hz=args.rate,
         image_size=args.image_size,
         prompt=task,

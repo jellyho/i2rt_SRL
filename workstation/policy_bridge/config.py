@@ -12,15 +12,20 @@ class BridgeConfig:
     robot_port: int = 11331
     policy_host: str = "127.0.0.1"
     policy_port: int = 8000
-    action_horizon: int = 16
     rate_hz: float = 30.0
     image_size: int = 224
     prompt: str = "do the task"
     use_async: bool = True
+    # Camera role -> the observation key the policy reads. These are openpi's slot names,
+    # shared by every multi-camera policy there (libero uses the first two; RoboCasa and
+    # YAM all three), so one client drives any of them without a per-robot branch.
+    #
+    # The chunk size is deliberately NOT here: the broker takes it from what the policy
+    # returns, so there is no number to keep in sync with the checkpoint.
     image_keys: Dict[str, str] = field(
         default_factory=lambda: {
-            "agentview": "observation/images/agentview",
-            "wrist_left": "observation/images/wrist_left",
-            "wrist_right": "observation/images/wrist_right",
+            "agentview": "observation/image",
+            "wrist_left": "observation/wrist_image",
+            "wrist_right": "observation/image_right",
         }
     )

@@ -16,7 +16,7 @@ from typing import Callable, Dict, Optional
 
 import numpy as np
 
-from workstation.lerobot_recorder.config import ARM_DOF, ARMS, CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
+from workstation.lerobot_recorder.config import ARM_DOF, ARMS, RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ class DeploymentPolicyRunner:
             "policy_connected": False,
             "streaming": False,
             "last_error": "",
-            "action_horizon": cfg.action_horizon,
+            "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
         }
@@ -94,16 +94,16 @@ class DeploymentPolicyRunner:
 
         client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
         meta = client.get_server_metadata() or {}
-        action_horizon = int(meta.get("action_horizon", self.cfg.action_horizon))
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
+        # No action_horizon here on purpose: the broker reads the chunk size off each
+        # response, so a checkpoint's horizon can never disagree with a client setting.
         broker_cls = AsyncActionChunkBroker if self.cfg.use_async else ActionChunkBroker
         self._policy_client = client
-        self._policy = broker_cls(client, action_horizon=action_horizon)
+        self._policy = broker_cls(client)
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,
-            action_horizon=action_horizon,
             image_size=self._image_shape[0],
             image_shape=self._image_shape,
         )
@@ -137,7 +137,11 @@ class DeploymentPolicyRunner:
                         if policy_obs:
                             action = self._policy.infer(policy_obs)["actions"]
                             self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
-                            self._set(streaming=True, last_error="")
+                            self._set(
+                                streaming=True,
+                                last_error="",
+                                action_horizon=getattr(self._policy, "action_horizon", 0),
+                            )
                             self._was_streaming = True
                         else:
                             self._set(streaming=False)
@@ -183,32 +187,21 @@ class DeploymentPolicyRunner:
             parts.append(vec)
         return np.concatenate(parts).astype(np.float32)
 
-    @staticmethod
-    def _fit(value: np.ndarray | None, dim: int) -> np.ndarray:
-        out = np.zeros(dim, dtype=np.float32)
-        if value is None:
-            return out
-        arr = np.asarray(value, dtype=np.float32).reshape(-1)
-        n = min(dim, arr.size)
-        if n:
-            out[:n] = arr[:n]
-        return out
 
     def _build_obs(self, robot_obs: Dict, images: Dict[str, np.ndarray]) -> Dict:
         from yam_policy import image_tools
 
         sides = [robot_obs.get(arm) for arm in ARMS]
-        pos = self._fuse(sides, ("pos",), ARM_DOF)
-        if pos is None:
+        # `observation/state` must be the SAME vector the policy was trained on. Training
+        # repacks the dataset's `observation.state` (pos+vel+eff per arm, 42) into this
+        # key, so sending only the 14 joint positions would keep the key valid, pass every
+        # check, and quietly normalize against the wrong statistics. Send all 42 and let
+        # the policy's input transform take the slice it wants.
+        state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
+        if state is None:
             return {}
 
-        obs = {"observation/state": pos, "prompt": self.cfg.prompt}
-        full_state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
-        if full_state is not None:
-            obs["observation.state"] = full_state
-        obs["observation.leader"] = self._fit(self._fuse(sides, ("leader_pos",)), LEADER_DIM)
-        obs["observation.eef"] = self._fit(self._fuse(sides, ("eef",)), EEF_DIM)
-        obs["observation.control_mode"] = np.array([CONTROL_MODE["teleop"]], dtype=np.float32)
+        obs = {"observation/state": state, "prompt": self.cfg.prompt}
 
         height, width = self._image_shape
         for role, key in self.cfg.image_keys.items():
