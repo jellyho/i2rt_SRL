@@ -126,6 +126,9 @@ class LeRobotPolicy(BasePolicy):
                     self._fit_feature(canonical.get(key, np.zeros(shape, dtype=np.float32)), shape),
                     dtype=torch.float32,
                 )
+                
+        batch["task"] = obs.get("task", obs.get("prompt", ""))
+        
         return self._preprocessor(batch)
 
     def infer(self, obs: Dict) -> Dict:

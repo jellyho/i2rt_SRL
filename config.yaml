@@ -118,12 +118,17 @@ recorder:
   review_before_save: false  # auto-save every engage→idle episode (no Keep/Delete hold)
   auto_arm: true             # arm collection on Start; records on the next teleop engage
   # --- saving speed (video encoding) ---
-  # ACTIVE path: streaming_encoding + vcodec are what matter. Frames go straight
-  # into the GPU encoder while the episode is written — no temp PNGs, ~25s per
-  # 7000-frame episode instead of ~80s+.
+  # Encoding implementation. TorchCodec is preferred by default. At writer startup
+  # and again before each camera encode, it safely falls back to PyAV/CPU H.264
+  # when primary-GPU usage is >= 5 GiB (or cannot be measured), leaving room for
+  # a policy process that may load after the recorder opens.
+  encoding_backend: torchcodec  # torchcodec (preferred, VRAM-safe PyAV fallback) | pyav
+  torchcodec_max_used_vram_gb: 5.0
+  # Codec used by the selected implementation.
   vcodec: auto               # auto = GPU h264_nvenc here (fastest) | h264 (CPU, reliable) | libsvtav1 (slow AV1)
-  streaming_encoding: true   # stream frames straight into the encoder (no temp PNGs): ~3x faster
-                             # saves, no PNG CPU storm during collection. Needs this env's patched lerobot.
+  # PyAV can encode continuously during capture. TorchCodec 0.10 is batch-only, so
+  # this is automatically disabled when TorchCodec is selected.
+  streaming_encoding: true
   # FALLBACK path only (streaming off / stock lerobot) — the knobs below are INERT
   # while streaming_encoding is true; they're kept at sensible values for the fallback:
   encoder_threads: 0         # CPU threads per encode; GPU nvenc ignores this (0 = codec default)

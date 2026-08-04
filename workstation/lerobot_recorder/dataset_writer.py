@@ -24,13 +24,21 @@ import logging
 import os
 import queue
 import shutil
+import tempfile
 import threading
 import time
+from pathlib import Path
+from types import MethodType
 from typing import Dict, List, Optional
 
 import numpy as np
 
 from workstation.lerobot_recorder.config import RecorderConfig
+from workstation.lerobot_recorder.video_encoding import (
+    EncodingBackendDecision,
+    encode_frames_torchcodec,
+    select_encoding_backend,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +148,28 @@ class AsyncDatasetWriter:
         self._abcdl = str(getattr(cfg, "record_format", "lerobot")).lower() == "abcdl"
         self._ds = None
         self._features: Optional[dict] = None
+        self._active_episode_frames: Optional[List[dict]] = None
+        self._pyav_encode_temporary = None
+        if cfg.use_videos and not self._mock and not self._abcdl:
+            self._encoding_decision = select_encoding_backend(
+                getattr(cfg, "encoding_backend", "torchcodec"),
+                float(getattr(cfg, "torchcodec_max_used_vram_gb", 5.0)),
+            )
+        else:
+            self._encoding_decision = EncodingBackendDecision(
+                str(getattr(cfg, "encoding_backend", "torchcodec")),
+                "pyav",
+                "video encoding is inactive",
+            )
+        self._effective_vcodec = str(cfg.vcodec)
+        if (
+            self._encoding_decision.requested == "torchcodec"
+            and self._encoding_decision.effective == "pyav"
+            and self._effective_vcodec == "auto"
+        ):
+            # The fallback is specifically meant to protect a policy already using
+            # the GPU, so do not resolve auto back to NVENC through PyAV.
+            self._effective_vcodec = "h264"
         # The dataset lives in <root>/<name>; root is just the parent directory.
         self._root = dataset_dir(cfg.root, cfg.repo_id)
         self._outcomes_path = os.path.join(self._root, "outcomes.jsonl")
@@ -211,17 +241,81 @@ class AsyncDatasetWriter:
         return feats
 
     def _dataset_encoding_kwargs(self) -> dict:
+        torchcodec = self._encoding_decision.effective == "torchcodec"
         enc = {
-            "vcodec": self.cfg.vcodec,
-            "batch_encoding_size": max(1, int(self.cfg.batch_encoding_size)),
+            "vcodec": self._effective_vcodec,
+            # TorchCodec 0.10's VideoEncoder is episode-batch based. Encoding one
+            # episode/camera at a time bounds host memory and uses our adapter.
+            "batch_encoding_size": 1 if torchcodec else max(1, int(self.cfg.batch_encoding_size)),
         }
         if int(self.cfg.encoder_threads) > 0:
             enc["encoder_threads"] = int(self.cfg.encoder_threads)
         # Direct-to-encoder streaming (no temp-PNG round-trip). Only passed when
         # enabled so stock lerobot builds without the kwarg keep working.
-        if bool(getattr(self.cfg, "streaming_encoding", False)):
+        if bool(getattr(self.cfg, "streaming_encoding", False)) and not torchcodec:
             enc["streaming_encoding"] = True
         return enc
+
+    @property
+    def encoding_backend(self) -> str:
+        return self._encoding_decision.effective
+
+    def _configure_torchcodec_encoder(self) -> None:
+        if self._encoding_decision.effective != "torchcodec" or self._ds is None:
+            return
+        original = getattr(self._ds, "_encode_temporary_episode_video", None)
+        if original is None:
+            logger.warning("LeRobot has no episode encoder hook; falling back to PyAV")
+            self._encoding_decision = EncodingBackendDecision(
+                self._encoding_decision.requested,
+                "pyav",
+                "installed LeRobot has no episode encoder hook",
+                self._encoding_decision.gpu_memory,
+            )
+            return
+        self._pyav_encode_temporary = original
+
+        def encode_episode(_dataset: object, video_key: str, episode_index: int) -> Path:
+            return self._encode_torchcodec_episode(video_key, episode_index)
+
+        self._ds._encode_temporary_episode_video = MethodType(encode_episode, self._ds)
+
+    def _encode_torchcodec_episode(self, video_key: str, episode_index: int) -> Path:
+        frames = self._active_episode_frames
+        if frames is None:
+            raise RuntimeError("TorchCodec encoder called without an active episode")
+        current = select_encoding_backend(
+            self._encoding_decision.requested,
+            float(getattr(self.cfg, "torchcodec_max_used_vram_gb", 5.0)),
+        )
+        if current.effective != "torchcodec":
+            if self._pyav_encode_temporary is None:
+                raise RuntimeError(f"TorchCodec became unsafe and PyAV is unavailable: {current.reason}")
+            logger.warning("encode-time VRAM check selected PyAV for %s: %s", video_key, current.reason)
+            original_vcodec = getattr(self._ds, "vcodec", self._effective_vcodec)
+            try:
+                if str(self.cfg.vcodec) == "auto":
+                    self._ds.vcodec = "h264"
+                return self._pyav_encode_temporary(video_key, episode_index)
+            finally:
+                self._ds.vcodec = original_vcodec
+        camera = video_key.split("observation.images.", 1)[-1]
+        temp_dir = Path(tempfile.mkdtemp(dir=self._root))
+        output = temp_dir / f"{video_key}_{episode_index:03d}.mp4"
+        try:
+            encode_frames_torchcodec(
+                (frame["images"][camera] for frame in frames),
+                output,
+                fps=int(self.cfg.fps),
+                vcodec=str(getattr(self._ds, "vcodec", self._effective_vcodec)),
+            )
+            return output
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if self._pyav_encode_temporary is None:
+                raise
+            logger.exception("TorchCodec failed for %s; retrying this camera with PyAV", video_key)
+            return self._pyav_encode_temporary(video_key, episode_index)
 
     def _create_encoding_kwargs(self) -> dict:
         enc = self._dataset_encoding_kwargs()
@@ -371,6 +465,17 @@ class AsyncDatasetWriter:
         # reward/return scheme stays consistent across a continued collection.
         self._read_rl_config_on_resume()
         self._features = self._build_features(sample_frame)
+        logger.warning(
+            "recording encoder: requested=%s effective=%s vcodec=%s (%s)",
+            self._encoding_decision.requested,
+            self._encoding_decision.effective,
+            self._effective_vcodec,
+            self._encoding_decision.reason,
+        )
+        if self._encoding_decision.effective == "torchcodec" and bool(
+            getattr(self.cfg, "streaming_encoding", False)
+        ):
+            logger.warning("TorchCodec 0.10 is batch-only; recorder.streaming_encoding is disabled")
         if self._abcdl:
             os.makedirs(self._root, exist_ok=True)
             if self.cfg.resume and os.path.isdir(self._root):
@@ -469,6 +574,7 @@ class AsyncDatasetWriter:
                     "dataset created at %s (repo_id=%s, vcodec=%s, batch=%s)",
                     self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
+            self._configure_torchcodec_encoder()
         else:
             if self.cfg.resume:
                 self._n_episodes = self._existing_outcome_count()
@@ -579,6 +685,8 @@ class AsyncDatasetWriter:
                 "last_error": self._last_error,
                 "failed_episodes": self._failed_episodes,
                 "video_issues": self._video_issues,
+                "encoding_backend": self._encoding_decision.effective,
+                "encoding_backend_reason": self._encoding_decision.reason,
             }
 
     @property
@@ -672,18 +780,27 @@ class AsyncDatasetWriter:
             if self._abcdl:
                 self._save_episode_abcdl(frames, task, self._n_episodes, ff)
             else:
-                for i, f in enumerate(frames):
-                    frame = {f"observation.images.{k}": v for k, v in f["images"].items()}
-                    for key, val in f.items():
-                        if key in ("images", "task"):
-                            continue
-                        frame[key] = np.asarray(val, dtype=np.float32)
-                    if ff:
-                        for k, v in ff.items():
-                            frame[k] = np.asarray([v[i]], dtype=np.float32)
-                    frame["task"] = task
-                    self._ds.add_frame(frame)
-                self._ds.save_episode()
+                self._active_episode_frames = frames
+                try:
+                    for i, f in enumerate(frames):
+                        frame = {f"observation.images.{k}": v for k, v in f["images"].items()}
+                        for key, val in f.items():
+                            if key in ("images", "task"):
+                                continue
+                            frame[key] = np.asarray(val, dtype=np.float32)
+                        if ff:
+                            for k, v in ff.items():
+                                frame[k] = np.asarray([v[i]], dtype=np.float32)
+                        frame["task"] = task
+                        self._ds.add_frame(frame)
+                    if self._encoding_decision.effective == "torchcodec":
+                        self._ds.save_episode(parallel_encoding=False)
+                    else:
+                        self._ds.save_episode()
+                finally:
+                    self._active_episode_frames = None
+                # The episode's video is on disk now — check it really holds the frames
+                # LeRobot just recorded for it, whichever backend encoded it.
                 self._verify_episode_video(self._n_episodes)
         self._write_rl_config_once()
         with self._lock:
@@ -739,12 +856,24 @@ class AsyncDatasetWriter:
                     "DROPPED VIDEO FRAMES on episode #%d camera %s: %s holds %d frames but the "
                     "metadata expects %d. Later episodes in this file are now misaligned and the "
                     "dataset will raise 'IndexError: Invalid frame index' when loaded. It is "
-                    "auto-repaired when you stop recording; if this keeps happening, set "
-                    "recorder.streaming_encoding: false or recorder.vcodec: h264 in config.yaml.",
+                    "auto-repaired when you stop recording; if this keeps happening, %s",
                     episode_index, key, os.path.basename(path), actual, claimed,
+                    self._encoder_remedy(),
                 )
         except Exception as e:
             logger.debug("per-episode video verification skipped: %s", e)
+
+    def _encoder_remedy(self) -> str:
+        """What to change in config.yaml when an encoder keeps dropping frames.
+
+        The advice depends on which backend actually encoded: telling someone to turn off
+        ``streaming_encoding`` is useless under TorchCodec, which is batch-only and already
+        disables it."""
+        if self._encoding_decision.effective == "torchcodec":
+            return "try recorder.encoding_backend: pyav in config.yaml."
+        if bool(getattr(self.cfg, "streaming_encoding", False)):
+            return "set recorder.streaming_encoding: false or recorder.vcodec: h264 in config.yaml."
+        return "set recorder.vcodec: h264 in config.yaml (CPU encode; slower but reliable)."
 
     def _save_episode_abcdl(self, frames: List[dict], task: str, ep_index: int,
                             frame_features: Optional[dict] = None) -> None:
@@ -844,12 +973,12 @@ class AsyncDatasetWriter:
                 logger.warning(
                     "TRUNCATED VIDEO on %d file(s): %s — the encoder/concat dropped %d frame(s), "
                     "which would raise 'IndexError: Invalid frame index' when this dataset is "
-                    "loaded. Repairing now; if this recurs, set recorder.streaming_encoding: "
-                    "false or vcodec: h264.",
+                    "loaded. Repairing now; if this recurs, %s",
                     len(short),
                     ", ".join(f"{s['video_key'].split('.')[-1]} file-{s['file']:03d} "
                               f"({s['actual']}/{s['claimed']} frames)" for s in short),
                     sum(s["missing"] for s in short),
+                    self._encoder_remedy(),
                 )
                 for r in repair_short_videos(self._root):
                     if r["status"] == "repaired":
@@ -874,8 +1003,8 @@ class AsyncDatasetWriter:
             logger.warning(
                 "video/length mismatch on %d episode(s) %s (cameras: %s) — the video encoder "
                 "dropped a trailing frame. Repairing metadata so the dataset stays editable; "
-                "if this recurs often, set recorder.streaming_encoding: false or vcodec: h264.",
-                len(eps), eps, ", ".join(cams),
+                "if this recurs often, %s",
+                len(eps), eps, ", ".join(cams), self._encoder_remedy(),
             )
             n = repair_length_consistency(self._root)
             logger.warning("repaired %d episode-video length field(s) to match frame length", n)

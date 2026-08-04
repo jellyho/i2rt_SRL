@@ -18,6 +18,7 @@ from i2rt.serving.rig_config import (
 )
 from workstation.lerobot_recorder.__main__ import build_config
 from workstation.lerobot_recorder.config import default_cameras
+from workstation.lerobot_recorder.deploy_main import build_configs as build_deploy_configs
 
 
 def _no_repo_rig(monkeypatch, tmp_path):
@@ -33,6 +34,25 @@ def test_load_rig(tmp_path, monkeypatch):
     assert rig["tasks"] == ["a", "b"]
     _no_repo_rig(monkeypatch, tmp_path)
     assert load_rig(None) == {}  # no in-repo rig, no env -> empty
+
+
+def test_record_and_deploy_share_video_backend_config(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+recorder:
+  encoding_backend: pyav
+  torchcodec_max_used_vram_gb: 6.5
+  streaming_encoding: true
+"""
+    )
+    record_cfg = build_config(["--config", str(config), "--mock"])
+    deploy_cfg, _ = build_deploy_configs(["--config", str(config), "--mock"])
+
+    for cfg in (record_cfg, deploy_cfg):
+        assert cfg.encoding_backend == "pyav"
+        assert cfg.torchcodec_max_used_vram_gb == 6.5
+        assert cfg.streaming_encoding is True
 
 
 def test_find_rig_in_repo(tmp_path, monkeypatch):

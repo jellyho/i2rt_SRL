@@ -107,6 +107,10 @@ class RecorderConfig:
     # Video encoding speed (LeRobot). The default 'libsvtav1' (AV1) is SLOW to encode;
     # 'h264' is much faster, 'auto' picks a hardware encoder (e.g. nvenc) if available.
     vcodec: str = "libsvtav1"
+    # Workstation encoder implementation. TorchCodec is preferred, with an automatic
+    # PyAV fallback if GPU usage is already at/above the configured safety threshold.
+    encoding_backend: str = "torchcodec"  # torchcodec | pyav
+    torchcodec_max_used_vram_gb: float = 5.0
     encoder_threads: int = 0  # threads per video encode (0 = let LeRobot decide)
     # >1 accumulates that many episodes and encodes their videos in PARALLEL (LeRobot's
     # ProcessPoolExecutor) — the supported way to use more than one encoder "worker".
