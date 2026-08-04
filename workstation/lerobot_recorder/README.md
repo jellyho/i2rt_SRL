@@ -250,16 +250,20 @@ The recorder opens on a **Setup page**:
 3. **START** connects the robot, opens cameras + dataset, and — with `auto_arm` —
    arms collection immediately.
 
-The **Past demonstration overlay** panel at the bottom then reads that dataset's
-LeRobot `meta/episodes` table. Each row is one demonstration (`episode_index`), even
+The **Past demonstration overlay** panel at the bottom can read any dataset folder
+under the session `root`, not just the dataset currently being recorded. The
+**Overlay dataset** dropdown contains the same sibling folders as the setup-page
+dataset picker; changing it immediately refreshes that folder's LeRobot
+`meta/episodes` table. Each row is one demonstration (`episode_index`), even
 when many demonstrations share one MP4 container. Selecting a demonstration displays
 all three synchronized slices (left wrist,
 agentview, right wrist) over their matching live cameras. **Live camera opacity** is
 `100%` for live-only, `0%` for the past episode only, and any middle value is a
 blend. Selection always starts paused on the first frame; **Resume reference** starts
 playback, and **Pause reference** freezes the current comparison frame. Use **Continue
-collecting** when the selected folder is the desired source of past episodes—starting
-fresh removes it after the overwrite confirmations. The player reads completed MP4s
+collecting** when the recording folder itself must retain past episodes—starting
+fresh removes it after the overwrite confirmations. Other overlay-source folders are
+read-only. The player reads completed MP4s
 directly, so it can safely coexist with an append session, and **Refresh demonstrations**
 finds newly encoded saves. The first saved demonstration is selected automatically; there
 is no separate Off entry because `100%` live-camera opacity fully hides the reference.

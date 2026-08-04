@@ -86,6 +86,7 @@ def test_record_and_deploy_use_separate_setting_scopes(tmp_path, qapp, no_camera
 
 
 def test_reference_list_defaults_to_first_demonstration_without_off_row(tmp_path, qapp, no_camera_scan, monkeypatch):
+    (tmp_path / "data").mkdir()
     episodes = [
         ReferenceEpisode(
             episode=index,
@@ -107,7 +108,7 @@ def test_reference_list_defaults_to_first_demonstration_without_off_row(tmp_path
     )
 
     try:
-        gui._refresh_reference_episodes()
+        gui._refresh_reference_datasets()
 
         assert gui.reference_list.count() == 2
         assert gui.reference_list.currentRow() == 0
@@ -115,5 +116,65 @@ def test_reference_list_defaults_to_first_demonstration_without_off_row(tmp_path
         assert gui.reference_list.item(0).text().startswith("demonstration 0003")
         assert played == [(3, True)]
         assert gui.reference_pause_btn.text() == "Resume reference"
+    finally:
+        gui.close()
+
+
+def test_reference_dataset_picker_switches_between_root_subfolders(
+    tmp_path, qapp, no_camera_scan, monkeypatch
+):
+    for name in ("current", "older_runs"):
+        (tmp_path / name).mkdir()
+
+    episodes = {
+        "current": [
+            ReferenceEpisode(
+                episode=2,
+                paths={key: Path(f"current-{key}.mp4") for key in ("wrist_left", "agentview", "wrist_right")},
+                fps=30,
+            )
+        ],
+        "older_runs": [
+            ReferenceEpisode(
+                episode=9,
+                paths={key: Path(f"older-{key}.mp4") for key in ("wrist_left", "agentview", "wrist_right")},
+                fps=30,
+            )
+        ],
+    }
+    discovered = []
+
+    def discover(root, _camera_keys):
+        name = Path(root).name
+        discovered.append(name)
+        return episodes[name]
+
+    monkeypatch.setattr(gui_module, "discover_reference_episodes", discover)
+    gui = RecorderGUI(
+        RecorderConfig(root=str(tmp_path), repo_id="operator/current", mock=True),
+        settings=QtCore.QSettings(str(tmp_path / "ui.ini"), QtCore.QSettings.IniFormat),
+    )
+    played = []
+    monkeypatch.setattr(
+        gui._reference_player,
+        "play",
+        lambda episode, *, start_paused: played.append((episode.episode, start_paused)),
+    )
+
+    try:
+        gui._refresh_reference_datasets(preferred=gui._active_dataset_name())
+
+        assert [gui.reference_dataset_combo.itemText(i) for i in range(gui.reference_dataset_combo.count())] == [
+            "current",
+            "older_runs",
+        ]
+        assert gui.reference_dataset_combo.currentText() == "current"
+        assert gui.reference_list.item(0).text().startswith("demonstration 0002")
+
+        gui.reference_dataset_combo.setCurrentText("older_runs")
+
+        assert discovered[-1] == "older_runs"
+        assert gui.reference_list.item(0).text().startswith("demonstration 0009")
+        assert played[-1] == (9, True)
     finally:
         gui.close()
