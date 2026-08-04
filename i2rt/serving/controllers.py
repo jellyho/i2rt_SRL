@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 _HOME_TOL = 0.05  # rad; homing considered done when the ramp is within this of home
 _LEADER_HOME_TOL = 0.1  # rad; the PHYSICAL leader must also be this close (weak home_kp lags)
+_GRIPPER_OPEN = 1.0  # normalized follower gripper command
 _DAGGER_RETURN_SPEED_SCALE = 0.5  # recovery moves at half the configured homing speed
 _DAGGER_RETURN_TIMEOUT_MARGIN = 2.0  # s beyond the conservative planned move time
 
@@ -349,6 +350,7 @@ class TeleopController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._prehome_opening = False
         self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
         self._recenter_target = {
             s: np.asarray(p.follower.get_joint_pos(), dtype=float).copy() for s, p in self.pairs.items()
@@ -541,6 +543,12 @@ class TeleopController(BaseController):
         # a leader "end episode" button (success/fail) forces homing while engaged
         if state == TeleopStateMachine.ENGAGED and self._home_button_pressed(buttons):
             self.sm.state = state = TeleopStateMachine.HOMING
+        if (
+            self._has_grip
+            and state == TeleopStateMachine.HOMING
+            and self._prev_state == TeleopStateMachine.ENGAGED
+        ):
+            self._prehome_opening = True
         if state == TeleopStateMachine.ENGAGED and self._prev_state != TeleopStateMachine.ENGAGED:
             self._reset_fine_grained()
             for s in self.pairs:
@@ -647,16 +655,26 @@ class TeleopController(BaseController):
                         self._free_leader(pair, kd=self._free_kd())
                     lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
                 elif state == TeleopStateMachine.HOMING:
-                    # Cosine velocity profile: ease in/out at the ends, faster through
-                    # the middle (avg ≈ home_speed, so total time stays similar but the
-                    # return is smooth rather than a constant crawl).
-                    d = float(np.linalg.norm(fsm.cur - self.home_full))
-                    if self._prev_state != TeleopStateMachine.HOMING:
-                        self._home_d0[side] = max(d, 1e-6)  # capture the start distance once
-                    p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
-                    fsm.max_step = lsm.max_step = self._home_step * self._ease_vel_scale(p)
-                    applied = fsm.step(self.home_full)
-                    self._home_leader(pair, lsm.step(self.home_arm))
+                    if self._prehome_opening:
+                        # Release anything held before either arm starts returning.
+                        # Opening is direct, matching human trigger control; the arm
+                        # target remains fixed until every physical gripper is open.
+                        applied = fsm.cur.copy()
+                        applied[-1] = _GRIPPER_OPEN
+                        fsm.reset(applied)
+                        lsm.reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
+                        self._home_leader(pair, lsm.cur)
+                    else:
+                        # Cosine velocity profile: ease in/out at the ends, faster through
+                        # the middle (avg ≈ home_speed, so total time stays similar but the
+                        # return is smooth rather than a constant crawl).
+                        d = float(np.linalg.norm(fsm.cur - self.home_full))
+                        if self._prev_state != TeleopStateMachine.HOMING:
+                            self._home_d0[side] = max(d, 1e-6)  # capture the start distance once
+                        p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
+                        fsm.max_step = lsm.max_step = self._home_step * self._ease_vel_scale(p)
+                        applied = fsm.step(self.home_full)
+                        self._home_leader(pair, lsm.step(self.home_arm))
                 else:  # IDLE — free with the built-in ORIGINAL damping (human not holding yet)
                     fsm.max_step = self._ramp_step
                     applied = fsm.step(self.home_full)
@@ -676,6 +694,17 @@ class TeleopController(BaseController):
                 logger.warning("[%s] teleop step failed: %s", side, e)
 
         self._update_recenter_state(now)
+
+        if self._prehome_opening and all(
+            float(np.asarray(pair.follower.get_joint_pos(), dtype=float)[-1])
+            >= _GRIPPER_OPEN - _HOME_TOL
+            for pair in self.pairs.values()
+        ):
+            self._prehome_opening = False
+            for side in self.pairs:
+                self._home_d0[side] = max(
+                    float(np.linalg.norm(self._fsmooth[side].cur - self.home_full)), 1e-6
+                )
 
         with self._lock:
             self._snap = {
@@ -836,6 +865,7 @@ class DaggerController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        self._prehome_opening = False
         self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
         self._recenter_target = {
             s: np.asarray(p.follower.get_joint_pos(), dtype=float).copy() for s, p in self.pairs.items()
@@ -991,6 +1021,7 @@ class DaggerController(BaseController):
         self._cancel_return()
         self._reset_fine_grained()
         self._homing = True
+        self._prehome_opening = self._has_grip
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
             self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
@@ -1288,11 +1319,21 @@ class DaggerController(BaseController):
                             self._leader_smooth[side].step(target[: self.home_arm.size]),
                         )
                 elif self._homing:
-                    d = float(np.linalg.norm(smoother.cur - self.home_full))
-                    p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
-                    smoother.max_step = self._leader_smooth[side].max_step = self._home_step * self._ease_vel_scale(p)
-                    desired = smoother.step(self.home_full)
-                    self._home_leader(pair, self._leader_smooth[side].step(self.home_arm))
+                    if self._prehome_opening:
+                        desired = smoother.cur.copy()
+                        desired[-1] = _GRIPPER_OPEN
+                        smoother.reset(desired)
+                        leader_smoother = self._leader_smooth[side]
+                        leader_smoother.reset(
+                            np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size]
+                        )
+                        self._home_leader(pair, leader_smoother.cur)
+                    else:
+                        d = float(np.linalg.norm(smoother.cur - self.home_full))
+                        p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
+                        smoother.max_step = self._leader_smooth[side].max_step = self._home_step * self._ease_vel_scale(p)
+                        desired = smoother.step(self.home_full)
+                        self._home_leader(pair, self._leader_smooth[side].step(self.home_arm))
                 elif self._intervening:
                     smoother.max_step = self._run_step
                     if self._leader_recentering:
@@ -1392,7 +1433,18 @@ class DaggerController(BaseController):
             if leaders_done or leader_timed_out:
                 self._complete_return(leader_timed_out=leader_timed_out)
 
-        if self._homing and self._homing_done():
+        if self._prehome_opening and all(
+            float(np.asarray(pair.follower.get_joint_pos(), dtype=float)[-1])
+            >= _GRIPPER_OPEN - _HOME_TOL
+            for pair in self.pairs.values()
+        ):
+            self._prehome_opening = False
+            for side in self.pairs:
+                self._home_d0[side] = max(
+                    float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6
+                )
+
+        if self._homing and not self._prehome_opening and self._homing_done():
             self._homing = False
 
         dagger_state = self._state_name()

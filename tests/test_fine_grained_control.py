@@ -219,6 +219,9 @@ def test_teleop_homing_is_derived_from_outcome_mapping(monkeypatch):
     )
     ctrl.set_sim_engage(True)
     ctrl.step()
+    leader.pos[:] = 0.4
+    ctrl.step()
+    before_home = _follower.pos.copy()
 
     current["buttons"] = [0, 1, 0]
     ctrl.step()
@@ -227,6 +230,8 @@ def test_teleop_homing_is_derived_from_outcome_mapping(monkeypatch):
     current["buttons"] = [0, 0, 1]
     ctrl.step()
     assert ctrl.snapshot()["teleop_state"] == "HOMING"
+    assert np.allclose(_follower.pos[:-1], before_home[:-1])
+    assert _follower.pos[-1] == 1.0
 
 
 def test_teleop_rejects_fine_button_outcome_conflict(monkeypatch):
@@ -300,3 +305,29 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
     ctrl.step()  # next takeover starts anchored in normal mode, without a snap
     assert ctrl.snapshot()["fine_grained"] is False
     assert np.allclose(ctrl.snapshot()["left"]["human"][:6], follower.pos[:6])
+
+
+def test_dagger_home_opens_gripper_before_arm_return(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(
+        ctl,
+        "read_handle",
+        lambda _leader: (leader.pos.copy(), 0.0, [0, 0]),
+    )
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(rate=20.0, home_speed=1.0))
+    follower.pos = np.array([0.4] * 6 + [0.0])
+    ctrl._smooth["left"].reset(follower.pos)
+
+    ctrl.finish_dagger_run("discard")
+    ctrl.step()
+
+    assert np.allclose(follower.pos[:-1], 0.4)
+    assert follower.pos[-1] == 1.0
+    assert ctrl.snapshot()["dagger_state"] == "homing"
+
+    ctrl.step()
+    assert np.all(follower.pos[:-1] < 0.4)
+    assert follower.pos[-1] < 1.0
