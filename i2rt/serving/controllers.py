@@ -1133,6 +1133,8 @@ class DaggerController(BaseController):
             self.set_policy_running(not self._policy_running)
         elif action == "intervention_toggle":
             self.set_intervention(not self._intervening)
+        elif action == "return":
+            self.return_to_dagger_pose()
         elif action == "keep_home":
             self.finish_dagger_run("keep")
         elif action == "discard_home":

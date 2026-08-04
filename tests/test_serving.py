@@ -380,6 +380,35 @@ def test_dagger_button_map_toggles_rollout(monkeypatch):
     ctrl.close()
 
 
+def test_dagger_button_map_can_request_return(monkeypatch):
+    relative = [0.0] * 14
+    relative[1] = 0.2
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            return_mode="relative",
+            return_rel_pos=relative,
+            button_map={"left.1": "return"},
+        )
+    )
+    current = {"buttons": [0, 0]}
+
+    def fake_read_handle(leader):
+        return np.zeros(leader.num_dofs()), None, list(current["buttons"])
+
+    monkeypatch.setattr("i2rt.serving.controllers.read_handle", fake_read_handle)
+    try:
+        ctrl.step()  # initialize button edge state
+        ctrl.set_policy_running(True)
+        current["buttons"] = [0, 1]
+        ctrl.step()
+
+        assert ctrl.snapshot()["returning"] is True
+        assert ctrl.snapshot()["dagger_state"] == "returning"
+    finally:
+        ctrl.close()
+
+
 @pytest.mark.parametrize("policy_running", [False, True])
 def test_dagger_intervention_off_relocks_leader_to_held_follower(policy_running):
     ctrl = DaggerController(

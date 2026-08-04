@@ -62,6 +62,15 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # Optional stricter per-joint clamp [lo, hi]; intersects the robot's native XML limits.
   # follower_joint_limits: [[-3.0, 3.0], [-2.0, 2.0]]
 
+# DAgger leader-handle actions. Change `return` back to
+# `intervention_toggle` to restore direct human-intervention toggling.
+dagger:
+  buttons:
+    left.0: rollout_toggle
+    left.1: return
+    right.0: discard_home
+    right.1: keep_home
+
 
 cameras:                     # RealSense serials by role (run `yam-data cams` to list)
   # Either `key: "<serial>"`, or a map with `serial:` plus optional `options:`
