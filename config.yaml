@@ -67,8 +67,16 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
   # sensor counting in 100us steps (1..10000); the D405 has none, so its color comes
   # off the Stereo Module counting in 1us steps (1..165000). Hence 120 vs 16000 below
   # are both ~12-16 ms. Gain ranges differ too: 0..128 (D455 RGB) vs 16..248 (stereo).
+  #
+  # `fps` is the STREAM rate (what the camera pushes over USB), separate from
+  # recorder.fps below (the record-loop rate). Pinned to 30 on all three: at 60 the
+  # three 640x480 streams overrun a single USB 2.0 bus and one camera starves with
+  # "stopped delivering frames". Raise only if every camera links at USB 3 (5000+):
+  #   for d in /sys/bus/usb/devices/*/; do
+  #     [ "$(cat $d/idVendor 2>/dev/null)" = 8086 ] && echo "$(basename $d) $(cat $d/speed)"; done
   agentview:  # D455
     serial: "246322303794"
+    fps: 30
     options:
       enable_auto_exposure: 0
       exposure: 115
@@ -79,6 +87,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
   # Keep these two in sync — if you change one, change the other.
   wrist_left:  # D405
     serial: "352122271652"
+    fps: 30
     options:
       enable_auto_exposure: 0
       exposure: 16389
@@ -87,6 +96,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       white_balance: 4600
   wrist_right:  # D405
     serial: "409122274199"
+    fps: 30
     options:
       enable_auto_exposure: 0
       exposure: 16389
