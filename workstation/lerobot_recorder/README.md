@@ -267,7 +267,7 @@ robot/yam dagger --mirror-kp 0.2
 
 # 2. [policy]   serve a LeRobot checkpoint (type auto-detected from config.json)
 #               see policy_serving/README.md
-policy_serving/yam-lerobot-serve --checkpoint /abs/path/to/pretrained_model --device cuda   # :8000
+policy_serving/yam-serve --checkpoint /abs/path/to/pretrained_model --device cuda   # :8000
 
 # 3. [workstation]  deploy UI: robot (portal) <-> policy (websocket) + DAgger recording
 workstation/yam-data deploy \
@@ -281,7 +281,7 @@ For RTC, start both sides explicitly:
 
 ```bash
 # [policy / GPU]
-policy_serving/yam-lerobot-serve --checkpoint /abs/path/to/mtd/pretrained_model \
+policy_serving/yam-serve --checkpoint /abs/path/to/mtd/pretrained_model \
     --device cuda --rtc --num-inference-steps 20
 
 # [workstation]

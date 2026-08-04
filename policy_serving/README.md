@@ -39,13 +39,13 @@ bash policy_serving/setup_policy_env.sh
 ```bash
 # ACT, Diffusion Policy, MultiTaskDiT, pi0.5, SmolVLA, etc. are selected
 # automatically from pretrained_model/config.json.
-policy_serving/yam-lerobot-serve \
+policy_serving/yam-serve \
     --checkpoint /abs/path/to/pretrained_model \
     --device cuda
 
 # MultiTaskDiT flow-matching checkpoint with native RTC (the same command also
 # supports diffusion checkpoints through training-free diffusion-to-flow RTC):
-policy_serving/yam-lerobot-serve \
+policy_serving/yam-serve \
     --checkpoint /abs/path/to/pretrained_model \
     --device cuda \
     --rtc \
@@ -53,7 +53,7 @@ policy_serving/yam-lerobot-serve \
 
 # pi0.5 and SmolVLA already default to 10 flow integration steps. Omit the
 # solver override unless you intentionally want to tune it:
-policy_serving/yam-lerobot-serve --checkpoint /abs/path/to/pi05_or_smolvla --device cuda --rtc
+policy_serving/yam-serve --checkpoint /abs/path/to/pi05_or_smolvla --device cuda --rtc
 ```
 
 ``--num-inference-steps`` is solver-agnostic. For flow-matching MultiTaskDiT it
@@ -63,8 +63,9 @@ flow time; without RTC it is the number of DDIM denoising steps. For pi0.5 it ov
 ``num_inference_steps`` and for SmolVLA it overrides ``num_steps``. Omitting it
 preserves the checkpoint's policy-specific default.
 
-The older generic ``yam-serve`` entry point remains available for dummy and
-custom ``BasePolicy`` adapters. It is not needed for normal LeRobot deployment.
+The generic ``.venv/bin/yam-serve`` entry point remains available for dummy and
+custom ``BasePolicy`` adapters. The ``policy_serving/yam-serve`` launcher above
+is the normal LeRobot deployment command.
 
 ## RTC request flow
 

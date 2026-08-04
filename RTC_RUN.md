@@ -13,7 +13,7 @@ bash policy_serving/setup_policy_env.sh
 Start the policy server:
 
 ```bash
-policy_serving/yam-lerobot-serve \
+policy_serving/yam-serve \
   --checkpoint /home/rllab2/zac-models/mtd_90_eth_insertion_full2/checkpoints/040000/pretrained_model \
   --device cuda \
   --host 0.0.0.0 \

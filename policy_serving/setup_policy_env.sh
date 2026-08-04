@@ -43,7 +43,7 @@ if [ -f ../lerobot/pyproject.toml ]; then
     SETUPTOOLS_USE_DISTUTILS=local \
         uv pip install -e '../lerobot[multi_task_dit,pi,smolvla,diffusion]'
 else
-    echo "[setup] local LeRobot submodule not found; install LeRobot before running yam-lerobot-serve" >&2
+    echo "[setup] local LeRobot submodule not found; install LeRobot before running the policy server" >&2
 fi
 
 python -c "import yam_policy, lerobot; print('LeRobot policy env ready')"
@@ -51,7 +51,7 @@ python -c "import yam_policy, lerobot; print('LeRobot policy env ready')"
 cat <<EOF
 
 [setup] done. No environment activation is needed.
-  Serve LeRobot: $HERE/yam-lerobot-serve --checkpoint /path/to/pretrained_model --device cuda
-  Serve MTD RTC: $HERE/yam-lerobot-serve --checkpoint /path/to/pretrained_model --device cuda \\
+  Serve LeRobot: $HERE/yam-serve --checkpoint /path/to/pretrained_model --device cuda
+  Serve MTD RTC: $HERE/yam-serve --checkpoint /path/to/pretrained_model --device cuda \\
                    --rtc --num-inference-steps 20
 EOF
