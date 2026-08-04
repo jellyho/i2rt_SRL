@@ -237,20 +237,39 @@ class PortalBridge:
         leader = self._fuse(sides, ("leader_pos",))  # variable per-arm dof; saved when present
         eef = self._fuse(sides, ("eef",))  # follower end-effector pose (FK), when the robot provides it
         intervening = bool(obs.get("intervention"))
+        returning = bool(obs.get("returning"))
         buttons = {a: (obs.get(a, {}) or {}).get("buttons", []) for a in ARMS}
 
         if self.cfg.record_source == "dagger":
             # HG-DAgger: an episode = an intervention segment; the label is the
             # human (leader) action, recorded only while intervening.
-            teleop_state = "ENGAGED" if intervening else "IDLE"
-            action = self._fuse(sides, ("human",), ARM_DOF) if intervening else None
-            control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
+            teleop_state = "ENGAGED" if intervening or returning else "IDLE"
+            action = (
+                self._fuse(sides, ("applied",), ARM_DOF)
+                if returning
+                else self._fuse(sides, ("human",), ARM_DOF)
+                if intervening
+                else None
+            )
+            control_mode = (
+                CONTROL_MODE["replay"]
+                if returning
+                else CONTROL_MODE["intervention"]
+                if intervening
+                else CONTROL_MODE["policy"]
+            )
         elif self.cfg.record_source == "eval":
             # Evaluation rollout: record the executed action every tick, labeled by
             # who produced it (policy vs human intervention). Episode = arm..disarm.
             teleop_state = "ENGAGED"
             action = self._fuse(sides, ("applied",), ARM_DOF)
-            control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
+            control_mode = (
+                CONTROL_MODE["replay"]
+                if returning
+                else CONTROL_MODE["intervention"]
+                if intervening
+                else CONTROL_MODE["policy"]
+            )
         else:
             teleop_state = obs.get("teleop_state") or ("ENGAGED" if intervening else "IDLE")
             action = self._fuse(sides, ("applied",), ARM_DOF)
@@ -304,7 +323,7 @@ class PortalBridge:
                 self._snap = {
                     **_EMPTY,
                     "teleop_state": name,
-                    "control_mode": CONTROL_MODE["teleop"],
+                    "control_mode": CONTROL_MODE["replay"] if returning else CONTROL_MODE["teleop"],
                     "state": state,
                     "joint_pos": action.copy(),
                     "leader": leader,

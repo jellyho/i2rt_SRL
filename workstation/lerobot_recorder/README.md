@@ -376,8 +376,10 @@ Dry run: `workstation/yam-data replay --mock`.
   gives a quick-switch dropdown; the active task **persists until you change it**
   (editable — type a new one on the fly).
 - **Eval rollouts**: `--source eval` records a continuous policy rollout from
-  Start to Stop (action = the executed command, labeled policy/intervention) — for
+  Start to Stop (action = the executed command, labeled policy/intervention/replay) — for
   saving evaluation episodes as datasets.
+- **DAgger Return labels**: configured Return frames store the executed command as
+  `observation.control_mode = 3` (replay), followed by human intervention as mode 2.
 - **Camera fault tolerance**: a faulted RealSense shows a red ⚠ warning, recording
   pauses (no garbage frames), and the capture thread auto-reconnects in the
   background (logging only the down/recovered transitions, not every retry).

@@ -302,6 +302,19 @@ def test_dagger_source_assembly():
     assert snap_idle["teleop_state"] == "IDLE"
     assert snap_idle["action"] is None  # not intervening -> nothing to record
 
+    returning = {
+        "intervention": False,
+        "policy_running": True,
+        "returning": True,
+        "left": {**pose, "applied": human_l.tolist()},
+        "right": {**pose, "applied": human_r.tolist()},
+        "t": 3.0,
+    }
+    snap_returning = bridge._assemble(returning)
+    assert snap_returning["teleop_state"] == "ENGAGED"
+    assert snap_returning["control_mode"] == 3
+    assert np.allclose(snap_returning["action"], np.concatenate([human_l, human_r]))
+
 
 def test_dagger_snapshot_carries_state_and_event():
     cfg = RecorderConfig(record_source="dagger", mock=False)
@@ -333,6 +346,7 @@ def test_dagger_snapshot_carries_state_and_event():
     assert snap["leader_recentering"] is True
     assert snap["recenter_fault"] is False
     assert snap["returning"] is True
+    assert snap["control_mode"] == 3
     assert snap["dagger_return_configured"] is True
     assert snap["dagger_return_mode"] == "absolute"
     assert snap["joint_pos"].tolist() == list(range(14))
