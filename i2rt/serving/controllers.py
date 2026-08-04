@@ -46,6 +46,7 @@ _LEADER_HOME_TOL = 0.1  # rad; the PHYSICAL leader must also be this close (weak
 _GRIPPER_OPEN = 1.0  # normalized follower gripper command
 _DAGGER_RETURN_SPEED_SCALE = 0.5  # recovery moves at half the configured homing speed
 _DAGGER_RETURN_TIMEOUT_MARGIN = 2.0  # s beyond the conservative planned move time
+_DAGGER_RETURN_IK_ATTEMPTS = 20
 
 
 def _side_state(robot: Any, kin: Optional[ArmKinematics] = None) -> Dict[str, list]:
@@ -791,6 +792,8 @@ class DaggerConfig:
     return_mode: str = ""
     return_rel_pos: list[float] = field(default_factory=list)
     return_abs_pos: list[float] = field(default_factory=list)
+    return_sampling: str = cc.DAGGER_RETURN_SAMPLING
+    return_radius: float = cc.DAGGER_RETURN_RADIUS
     arm_type: str = "yam"
     leader_gripper: str = "yam_teaching_handle"
     follower_gripper: str = "linear_4310"
@@ -858,11 +861,23 @@ class DaggerController(BaseController):
             for side, pair in self.pairs.items()
         }
         self._return_mode, self._return_values = self._parse_return_config(cfg)
+        self._return_sampling, self._return_radius = self._parse_return_sampling(cfg)
+        self._return_rng = np.random.default_rng()
         self._return_configured = self._return_values is not None
         first = next(iter(self.pairs.values())).follower
         n = int(first.num_dofs())
         self._has_grip = "gripper_pos" in first.get_observations()
         n_arm = n - 1 if self._has_grip else n
+        if self._return_sampling == "probabilistic" and self._return_values is not None:
+            offset = 0
+            for side, pair in self.pairs.items():
+                configured = self._return_values[offset : offset + pair.follower.num_dofs()]
+                offset += pair.follower.num_dofs()
+                if np.any(configured[:n_arm] == 0.0):
+                    raise ValueError(
+                        "probabilistic DAgger return requires every arm joint in "
+                        f"dagger_return_abs_pos to be nonzero ({side} contains a zero mask)"
+                    )
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
         self._prehome_opening = False
@@ -898,19 +913,23 @@ class DaggerController(BaseController):
             "returning": False,
             "dagger_return_configured": self._return_configured,
             "dagger_return_mode": self._return_mode or None,
+            "dagger_return_sampling": self._return_sampling,
+            "dagger_return_radius": self._return_radius,
             "dagger_state": "stopped",
             "last_dagger_event": None,
         }
         self._metadata = {"mode": self.mode, "sides": list(self.pairs), "has_gripper": self._has_grip}
         logger.info(
             "DaggerController up: sides=%s home_arm=%s mirror_kp=%s feedback_kp=%s "
-            "max_joint_speed=%s return_mode=%s sim=%s",
+            "max_joint_speed=%s return_mode=%s return_sampling=%s return_radius=%s sim=%s",
             list(self.pairs),
             np.round(self.home_arm, 2).tolist(),
             cfg.mirror_kp,
             cfg.feedback_kp,
             cfg.max_joint_speed,
             self._return_mode or "disabled",
+            self._return_sampling,
+            self._return_radius,
             cfg.sim,
         )
 
@@ -959,6 +978,87 @@ class DaggerController(BaseController):
             key = "dagger_return_rel_pos" if mode == "relative" else "dagger_return_abs_pos"
             raise ValueError(f"{key} is required when dagger_return_mode is {mode!r}")
         return mode, selected
+
+    def _parse_return_sampling(self, cfg: DaggerConfig) -> "tuple[str, float]":
+        sampling = str(cfg.return_sampling or "deterministic").strip().lower()
+        if sampling not in {"deterministic", "probabilistic"}:
+            raise ValueError(
+                "dagger_return_sampling must be 'deterministic' or 'probabilistic'"
+            )
+        radius = float(cfg.return_radius)
+        if not np.isfinite(radius) or radius < 0.0:
+            raise ValueError("dagger_return_radius must be a finite nonnegative value")
+        if sampling == "probabilistic":
+            if self._return_mode != "absolute":
+                raise ValueError(
+                    "probabilistic DAgger return requires dagger_return_mode: absolute"
+                )
+            if radius <= 0.0:
+                raise ValueError(
+                    "dagger_return_radius must be positive for probabilistic return"
+                )
+        return sampling, radius
+
+    def _within_return_limits(self, side: str, target: np.ndarray) -> bool:
+        target = np.asarray(target, dtype=float).reshape(-1)
+        if not np.all(np.isfinite(target)):
+            return False
+        for idx, bounds in enumerate(self._return_limits[side]):
+            if idx >= target.size or bounds is None:
+                continue
+            lo, hi = bounds
+            if target[idx] < float(lo) or target[idx] > float(hi):
+                return False
+        return True
+
+    def _probabilistic_return_target(
+        self, side: str, nominal: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Sample an independently randomized reachable EE target for one arm."""
+        kin = self._kin.get(side)
+        pose = kin.fk(nominal) if kin is not None else None
+        if pose is None:
+            logger.warning(
+                "[%s] probabilistic DAgger return has no FK model; using deterministic pose",
+                side,
+            )
+            return None
+
+        pose = np.asarray(pose, dtype=float).reshape(-1)
+        n_arm = self.home_arm.size
+        for _ in range(_DAGGER_RETURN_IK_ATTEMPTS):
+            direction = self._return_rng.normal(size=3)
+            norm = float(np.linalg.norm(direction))
+            if norm <= 1e-12:
+                continue
+            # cbrt(U) makes samples uniform by volume rather than biased inward.
+            offset = direction / norm * self._return_radius * np.cbrt(self._return_rng.random())
+            sampled_pose = pose.copy()
+            sampled_pose[:3] += offset
+            solved = kin.ik(sampled_pose, init_q=nominal)
+            if solved is None:
+                continue
+            solved = np.asarray(solved, dtype=float).reshape(-1)
+            if solved.size < n_arm:
+                continue
+            candidate = nominal.copy()
+            candidate[:n_arm] = solved[:n_arm]
+            # The configured gripper target and nominal EE orientation are unchanged.
+            if self._within_return_limits(side, candidate):
+                logger.info(
+                    "[%s] probabilistic DAgger return EE offset=%s m",
+                    side,
+                    np.round(offset, 4).tolist(),
+                )
+                return candidate
+
+        logger.warning(
+            "[%s] no valid probabilistic DAgger return after %d IK attempts; "
+            "using deterministic pose",
+            side,
+            _DAGGER_RETURN_IK_ATTEMPTS,
+        )
+        return None
 
     @staticmethod
     def _ease_vel_scale(p: float) -> float:
@@ -1083,6 +1183,10 @@ class DaggerController(BaseController):
                 else:
                     target = np.where(active, configured, current)
                 target = clamp_limits(target, self._return_limits[side])
+                if self._return_sampling == "probabilistic":
+                    sampled = self._probabilistic_return_target(side, target)
+                    if sampled is not None:
+                        target = sampled
                 targets[side] = target
                 self._smooth[side].reset(current)
                 self._leader_smooth[side].reset(
@@ -1461,6 +1565,8 @@ class DaggerController(BaseController):
                 "returning": bool(self._returning),
                 "dagger_return_configured": self._return_configured,
                 "dagger_return_mode": self._return_mode or None,
+                "dagger_return_sampling": self._return_sampling,
+                "dagger_return_radius": self._return_radius,
                 "dagger_state": dagger_state,
                 "last_dagger_event": dict(self._last_event) if self._last_event is not None else None,
                 "estop": self._estop,

@@ -198,6 +198,8 @@ def main() -> None:
                 return_mode=str(cc.DAGGER_RETURN_MODE or ""),
                 return_rel_pos=list(cc.DAGGER_RETURN_REL_POS or []),
                 return_abs_pos=list(cc.DAGGER_RETURN_ABS_POS or []),
+                return_sampling=str(cc.DAGGER_RETURN_SAMPLING or "deterministic"),
+                return_radius=float(cc.DAGGER_RETURN_RADIUS),
                 button_map=dict(dagger_sec.get("buttons", {}))
                 if dagger_sec.get("buttons")
                 else DaggerConfig().button_map,

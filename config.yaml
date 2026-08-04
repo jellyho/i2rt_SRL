@@ -28,6 +28,8 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # to human intervention. Order is left[6 arm joints, gripper], then right[...].
   # Every 0 is a mask meaning "leave this joint where it is when Return is pressed."
   dagger_return_mode: relative  # relative | absolute
+  dagger_return_sampling: deterministic  # deterministic | probabilistic
+  dagger_return_radius: 0.03    # metres; sampled independently per arm inside each EE sphere
   dagger_return_rel_pos: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   dagger_return_abs_pos: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   fine_grained_scale: 0.4    # left.0 toggle: move leader 2.5x for 1x follower motion

@@ -93,6 +93,8 @@ def test_apply_dagger_return_overrides(monkeypatch):
     monkeypatch.setattr(cc, "DAGGER_RETURN_MODE", "", raising=False)
     monkeypatch.setattr(cc, "DAGGER_RETURN_REL_POS", [], raising=False)
     monkeypatch.setattr(cc, "DAGGER_RETURN_ABS_POS", [], raising=False)
+    monkeypatch.setattr(cc, "DAGGER_RETURN_SAMPLING", "deterministic", raising=False)
+    monkeypatch.setattr(cc, "DAGGER_RETURN_RADIUS", 0.0, raising=False)
     relative = [0.0] * 14
     relative[2] = 0.15
     applied = apply_control_overrides(
@@ -101,12 +103,16 @@ def test_apply_dagger_return_overrides(monkeypatch):
                 "dagger_return_mode": "relative",
                 "dagger_return_rel_pos": relative,
                 "dagger_return_abs_pos": [0.0] * 14,
+                "dagger_return_sampling": "probabilistic",
+                "dagger_return_radius": 0.03,
             }
         }
     )
     assert cc.DAGGER_RETURN_MODE == "relative"
     assert cc.DAGGER_RETURN_REL_POS == relative
     assert len(cc.DAGGER_RETURN_ABS_POS) == 14
+    assert cc.DAGGER_RETURN_SAMPLING == "probabilistic"
+    assert cc.DAGGER_RETURN_RADIUS == 0.03
     assert applied["DAGGER_RETURN_MODE"] == "relative"
 
 

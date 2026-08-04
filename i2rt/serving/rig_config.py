@@ -55,6 +55,8 @@ _CONTROL_MAP = {
     "dagger_return_mode": "DAGGER_RETURN_MODE",
     "dagger_return_rel_pos": "DAGGER_RETURN_REL_POS",
     "dagger_return_abs_pos": "DAGGER_RETURN_ABS_POS",
+    "dagger_return_sampling": "DAGGER_RETURN_SAMPLING",
+    "dagger_return_radius": "DAGGER_RETURN_RADIUS",
     "follower_joint_limits": "FOLLOWER_JOINT_LIMITS",
     "follower_effort_limit": "FOLLOWER_EFFORT_LIMIT",
     "follower_payload_kg": "FOLLOWER_PAYLOAD_KG",

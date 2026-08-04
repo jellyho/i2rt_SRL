@@ -266,6 +266,8 @@ intervention only after the configured joint target is reached:
 ```yaml
 control:
   dagger_return_mode: relative  # relative | absolute
+  dagger_return_sampling: deterministic  # deterministic | probabilistic
+  dagger_return_radius: 0.03  # metres; used only for probabilistic sampling
   # left 7 values, then right 7; each 0 means hold that joint at its press-time position
   dagger_return_rel_pos: [0, 0, 0.15, 0, 0, 0, 0, 0, 0, 0.15, 0, 0, 0, 0]
   dagger_return_abs_pos: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -276,6 +278,13 @@ absolute nonzero values replace the corresponding joints. The order per arm is
 six arm joints followed by the gripper. Targets are clamped to the intersection
 of the robot's runtime arm/gripper limits and any narrower
 `control.follower_joint_limits` configured by the operator.
+With `dagger_return_sampling: probabilistic`, return mode must be `absolute` and
+all six arm joints per side must be specified (nonzero). Each Return press samples
+each arm independently and uniformly inside a Cartesian sphere centered at the
+configured pose's end-effector position. The radius is in metres. Orientation and
+the configured gripper target are preserved. Unreachable or out-of-limit IK
+solutions are rejected; after 20 failed samples that arm safely falls back to its
+deterministic configured pose.
 The deploy UI continuously shows the current follower positions in the same
 left-7-then-right-7 order, with a copy button for pasting into
 `dagger_return_abs_pos`.

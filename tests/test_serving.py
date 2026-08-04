@@ -237,6 +237,98 @@ def test_dagger_absolute_return_uses_zero_as_hold_mask():
         ctrl.close()
 
 
+@pytest.mark.parametrize(
+    ("sampling", "radius", "mode", "message"),
+    [
+        ("random", 0.03, "absolute", "deterministic.*probabilistic"),
+        ("deterministic", -0.01, "absolute", "nonnegative"),
+        ("probabilistic", 0.0, "absolute", "must be positive"),
+        ("probabilistic", 0.03, "relative", "requires.*absolute"),
+    ],
+)
+def test_dagger_return_sampling_config_fails_fast(sampling, radius, mode, message):
+    values = [0.2] * 14
+    with pytest.raises(ValueError, match=message):
+        DaggerController(
+            DaggerConfig(
+                sim=True,
+                return_mode=mode,
+                return_rel_pos=values,
+                return_abs_pos=values,
+                return_sampling=sampling,
+                return_radius=radius,
+            )
+        )
+
+
+def test_dagger_probabilistic_return_samples_each_arm_and_rejects_joint_limits():
+    absolute = [0.2] * 14
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            return_mode="absolute",
+            return_abs_pos=absolute,
+            return_sampling="probabilistic",
+            return_radius=0.03,
+        )
+    )
+
+    class FakeKinematics:
+        def __init__(self, x):
+            self.center = np.array([x, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+            self.sampled = []
+            self.seeds = []
+
+        def fk(self, _q):
+            return self.center.copy()
+
+        def ik(self, pose, init_q):
+            self.sampled.append(np.asarray(pose, dtype=float).copy())
+            self.seeds.append(np.asarray(init_q, dtype=float).copy())
+            solved = np.asarray(init_q, dtype=float).copy()
+            solved[0] = 99.0 if len(self.sampled) == 1 else solved[0] + 0.01
+            return solved
+
+    fake = {"left": FakeKinematics(0.4), "right": FakeKinematics(-0.4)}
+    ctrl._kin = fake
+    ctrl._return_rng = np.random.default_rng(123)
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.return_to_dagger_pose()
+        ctrl.step()
+
+        offsets = []
+        for side in ("left", "right"):
+            kin = fake[side]
+            assert len(kin.sampled) == 2
+            sampled = kin.sampled[-1]
+            offset = sampled[:3] - kin.center[:3]
+            offsets.append(offset)
+            assert np.linalg.norm(offset) <= 0.03
+            assert sampled[3:] == pytest.approx(kin.center[3:])
+            assert kin.seeds[-1] == pytest.approx(np.full(7, 0.2))
+            assert ctrl._return_target[side][-1] == pytest.approx(0.2)
+            assert ctrl._return_target[side][0] == pytest.approx(0.21)
+        assert not np.allclose(offsets[0], offsets[1])
+    finally:
+        ctrl.close()
+
+
+def test_dagger_probabilistic_return_rejects_arm_zero_masks():
+    absolute = [0.2] * 14
+    absolute[2] = 0.0
+    with pytest.raises(ValueError, match="requires every arm joint.*zero mask"):
+        DaggerController(
+            DaggerConfig(
+                sim=True,
+                return_mode="absolute",
+                return_abs_pos=absolute,
+                return_sampling="probabilistic",
+                return_radius=0.03,
+            )
+        )
+
+
 def test_dagger_estop_cancels_return_and_invalidates_policy_target():
     relative = [0.0] * 14
     relative[1] = 0.5

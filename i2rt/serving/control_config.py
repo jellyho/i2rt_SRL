@@ -113,6 +113,8 @@ DAGGER_FEEDBACK_KP: float = 0.0  # human intervention stays gravity-compensated/
 DAGGER_RETURN_MODE: str = ""  # "relative" | "absolute" | "" (disabled)
 DAGGER_RETURN_REL_POS: List[float] = []
 DAGGER_RETURN_ABS_POS: List[float] = []
+DAGGER_RETURN_SAMPLING: str = "deterministic"  # deterministic | probabilistic
+DAGGER_RETURN_RADIUS: float = 0.0  # metres; probabilistic EE-position sphere radius
 
 
 # --- Wrist payload for gravity compensation (e.g. a D405 camera) -------------
