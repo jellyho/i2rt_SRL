@@ -16,8 +16,8 @@ Transports: robot↔workstation = **portal** (TCP, default `:11331`); workstatio
 bash robot/setup_robot_env.sh                     # optional pre-create + verify
 # [ws]      conda env + uv installs
 bash workstation/setup_workstation_env.sh && conda activate yam_ws
-# [policy]  (any host/GPU)
-bash policy_serving/setup_policy_env.sh && source policy_serving/.venv/bin/activate
+# [policy]  (any host/GPU; launcher uses its dedicated env without activation)
+bash policy_serving/setup_policy_env.sh
 ```
 - [ ] Workstation env imports cleanly (`python -c "import i2rt, yam_policy, lerobot, pyrealsense2"`).
 - [ ] Robot: `robot/yam teleop --sim` boots (uv resolves the env on first run).

@@ -50,8 +50,8 @@ python -c "import yam_policy, lerobot; print('LeRobot policy env ready')"
 
 cat <<EOF
 
-[setup] done.  Activate: source $HERE/.venv/bin/activate
-  Serve LeRobot: yam-lerobot-serve --checkpoint /path/to/pretrained_model --device cuda
-  Serve MTD RTC: yam-lerobot-serve --checkpoint /path/to/pretrained_model --device cuda \\
+[setup] done. No environment activation is needed.
+  Serve LeRobot: $HERE/yam-lerobot-serve --checkpoint /path/to/pretrained_model --device cuda
+  Serve MTD RTC: $HERE/yam-lerobot-serve --checkpoint /path/to/pretrained_model --device cuda \\
                    --rtc --num-inference-steps 20
 EOF

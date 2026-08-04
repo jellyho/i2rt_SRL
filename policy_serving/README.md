@@ -32,7 +32,6 @@ action_chunk = client.infer(obs)["actions"]       # (action_horizon, action_dim)
 curl -LsSf https://astral.sh/uv/install.sh | sh && source $HOME/.local/bin/env
 git submodule update --init lerobot
 bash policy_serving/setup_policy_env.sh
-source policy_serving/.venv/bin/activate
 ```
 
 ## Serve a LeRobot checkpoint
@@ -40,13 +39,13 @@ source policy_serving/.venv/bin/activate
 ```bash
 # ACT, Diffusion Policy, MultiTaskDiT, pi0.5, SmolVLA, etc. are selected
 # automatically from pretrained_model/config.json.
-yam-lerobot-serve \
+policy_serving/yam-lerobot-serve \
     --checkpoint /abs/path/to/pretrained_model \
     --device cuda
 
 # MultiTaskDiT flow-matching checkpoint with native RTC (the same command also
 # supports diffusion checkpoints through training-free diffusion-to-flow RTC):
-yam-lerobot-serve \
+policy_serving/yam-lerobot-serve \
     --checkpoint /abs/path/to/pretrained_model \
     --device cuda \
     --rtc \
@@ -54,7 +53,7 @@ yam-lerobot-serve \
 
 # pi0.5 and SmolVLA already default to 10 flow integration steps. Omit the
 # solver override unless you intentionally want to tune it:
-yam-lerobot-serve --checkpoint /abs/path/to/pi05_or_smolvla --device cuda --rtc
+policy_serving/yam-lerobot-serve --checkpoint /abs/path/to/pi05_or_smolvla --device cuda --rtc
 ```
 
 ``--num-inference-steps`` is solver-agnostic. For flow-matching MultiTaskDiT it
