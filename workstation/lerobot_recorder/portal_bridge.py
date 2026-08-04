@@ -38,6 +38,7 @@ _EMPTY = {
     "leader_recentering": False,
     "recenter_fault": False,
     "policy_running": False,
+    "leader_mirror": True,
     "homing": False,
     "dagger_state": "stopped",
     "last_dagger_event": None,
@@ -63,6 +64,8 @@ class PortalBridge:
         self._policy_running_sent: Optional[bool] = None
         self._intervention_req: Optional[bool] = None
         self._intervention_sent: Optional[bool] = None
+        self._leader_mirror_req: Optional[bool] = None
+        self._leader_mirror_sent: Optional[bool] = None
         self._finish_req: Optional[str] = None
         self._policy_action_req: Optional[Dict[str, np.ndarray]] = None
         self._policy_action_seq = 0
@@ -107,6 +110,14 @@ class PortalBridge:
         self._intervention_req = bool(flag)
         self._intervention_sent = None
 
+    def set_leader_mirror(self, flag: bool) -> None:
+        """Request whether the leader tracks the follower while the policy drives.
+
+        Latched (not cleared after sending) so a reconnect re-applies it — otherwise the
+        robot would silently fall back to its launch default mid-session."""
+        self._leader_mirror_req = bool(flag)
+        self._leader_mirror_sent = None
+
     def finish_dagger_run(self, action: str) -> None:
         """Request DAgger keep/discard + homing."""
         action = str(action).lower()
@@ -136,6 +147,17 @@ class PortalBridge:
     def get_snapshot(self) -> dict:
         with self._lock:
             return dict(self._snap)
+
+    @property
+    def robot_mode(self) -> Optional[str]:
+        """Which controller the robot server is running ("teleop"/"dagger"/"wrapper").
+
+        None until the first observation arrives. The robot modes are mutually exclusive
+        and launched separately, so this is what lets a tool notice it is talking to the
+        wrong one instead of silently doing nothing."""
+        with self._lock:
+            obs = self._raw_obs
+        return str(obs.get("mode")) if obs and obs.get("mode") else None
 
     def get_observation(self) -> Dict:
         """Return the latest raw robot observation for in-process policy serving."""
@@ -199,6 +221,9 @@ class PortalBridge:
                 if self._intervention_req is not None and self._intervention_sent != self._intervention_req:
                     self._client.set_intervention(self._intervention_req)
                     self._intervention_sent = self._intervention_req
+                if self._leader_mirror_req is not None and self._leader_mirror_sent != self._leader_mirror_req:
+                    self._client.set_leader_mirror(self._leader_mirror_req)
+                    self._leader_mirror_sent = self._leader_mirror_req
                 if self._finish_req is not None:
                     action = self._finish_req
                     self._finish_req = None
@@ -220,6 +245,7 @@ class PortalBridge:
                 self._estop_sent = None  # force re-apply after reconnect
                 self._policy_running_sent = None
                 self._intervention_sent = None
+                self._leader_mirror_sent = None
                 self._policy_action_sent_seq = 0
                 # Surface *why* the link is down instead of failing silently — but only
                 # when the reason changes, so a persistently-down server doesn't spam.
@@ -286,6 +312,7 @@ class PortalBridge:
             "leader_recentering": bool(obs.get("leader_recentering")),
             "recenter_fault": bool(obs.get("recenter_fault")),
             "policy_running": bool(obs.get("policy_running")),
+            "leader_mirror": bool(obs.get("leader_mirror", True)),
             "homing": bool(obs.get("homing")),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
             "last_dagger_event": obs.get("last_dagger_event"),

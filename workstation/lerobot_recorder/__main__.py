@@ -95,6 +95,7 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
         auto_arm=auto_arm,
     )
     cfg.button_map = teleop_button_outcomes(rig)
+    cfg.expected_robot_mode = "teleop"  # the engage gate only exists in the teleop controller
     # output format: "lerobot" (default) or "abcdl" (abcdl MP4+binary training cache)
     cfg.record_format = str(rec_section.get("format", rec_section.get("record_format", cfg.record_format)))
     cfg.abcdl_size = int(rec_section.get("abcdl_size", cfg.abcdl_size))

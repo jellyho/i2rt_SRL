@@ -222,6 +222,7 @@ class BaseController:
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
+    def set_leader_mirror(self, flag: bool) -> None: ...
     def finish_dagger_run(self, action: str) -> None: ...
     def command(self, data: Dict) -> None: ...
     def set_sim_engage(self, flag: bool) -> None: ...
@@ -731,6 +732,12 @@ class DaggerController(BaseController):
         self.cfg = cfg
         self.command_timeout = cfg.command_timeout
         self.mirror_kp = cfg.mirror_kp
+        # Whether the leader physically follows the policy while the policy drives.
+        # Mirroring exists so a takeover starts from the follower's pose (grab the leader
+        # and it is already where the arm is). With it off the leader just hangs free, so
+        # the follower travels — rate-limited — to wherever the leader happens to be when
+        # intervention starts. Launch default comes from mirror_kp; togglable at runtime.
+        self._leader_mirror = cfg.mirror_kp > 0.0
         self.feedback_kp = cfg.feedback_kp
         self.home_kp = cfg.home_kp
         self.fine_grained_button = str(cfg.fine_grained_button).lower()
@@ -848,6 +855,25 @@ class DaggerController(BaseController):
         self._reset_fine_grained()
         # Handoff to policy mirroring starts from the physical leader pose, never
         # from a potentially distant target left by an offset intervention.
+        for side, pair in self.pairs.items():
+            self._leader_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
+
+    def set_leader_mirror(self, flag: bool) -> None:
+        """Turn leader mirroring on/off while the policy drives.
+
+        Off means the leader hangs free instead of tracking the follower — useful when you
+        just want to watch the policy run without the handles moving. The trade-off is on
+        takeover: with mirroring the leader is already at the follower's pose, without it
+        the follower has to travel (rate-limited by the smoother) to meet the leader.
+        """
+        flag = bool(flag)
+        if flag == self._leader_mirror:
+            return
+        self._leader_mirror = flag
+        # Re-seed the mirror limiter from the physical leader so re-enabling mid-rollout
+        # ramps from where the leader actually is rather than a stale target.
         for side, pair in self.pairs.items():
             self._leader_smooth[side].reset(
                 np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
@@ -1075,15 +1101,22 @@ class DaggerController(BaseController):
                     target = desired if self._leader_recentering else smoother.step(desired)
                     applied = self._apply(pair.follower, target)
                     if not self._intervening and self._policy_running and applied is not None:
-                        # Mirror the command sent after follower smoothing/clamping.
-                        # The independent limiter prevents a PD target jump when an
-                        # offset human intervention hands control back to the policy.
-                        leader_smoother = self._leader_smooth[side]
-                        leader_smoother.max_step = self._run_step
-                        mirror_target = leader_smoother.step(
-                            np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
-                        )
-                        self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
+                        if self._leader_mirror:
+                            # Mirror the command sent after follower smoothing/clamping.
+                            # The independent limiter prevents a PD target jump when an
+                            # offset human intervention hands control back to the policy.
+                            leader_smoother = self._leader_smooth[side]
+                            leader_smoother.max_step = self._run_step
+                            mirror_target = leader_smoother.step(
+                                np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
+                            )
+                            self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
+                        else:
+                            # Mirroring off: hold the leader gravity-compensated and FREE.
+                            # Explicitly freeing it matters — simply skipping the drive
+                            # would leave whatever PD gains were last commanded, so the
+                            # leader would keep stiffly holding a stale target.
+                            self._free_leader(pair)
                 else:
                     smoother.reset(pair.follower.get_joint_pos())
 
@@ -1115,6 +1148,7 @@ class DaggerController(BaseController):
                 "leader_recentering": self._leader_recentering,
                 "recenter_fault": self._recenter_fault,
                 "policy_running": bool(self._policy_running),
+                "leader_mirror": bool(self._leader_mirror),
                 "homing": bool(self._homing),
                 "dagger_state": dagger_state,
                 "last_dagger_event": dict(self._last_event) if self._last_event is not None else None,

@@ -44,6 +44,7 @@ class RobotServer:
         self._server.bind("set_policy_action", self.controller.set_policy_action)
         self._server.bind("set_intervention", self.controller.set_intervention)
         self._server.bind("set_policy_running", self.controller.set_policy_running)
+        self._server.bind("set_leader_mirror", self.controller.set_leader_mirror)
         self._server.bind("finish_dagger_run", self.controller.finish_dagger_run)
         self._server.bind("command", self.controller.command)
         self._server.bind("set_sim_engage", self.controller.set_sim_engage)

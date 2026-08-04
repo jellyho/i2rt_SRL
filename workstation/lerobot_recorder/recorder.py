@@ -77,6 +77,7 @@ class Recorder:
             "interventions": 0,
             "dagger_state": "stopped",
             "policy_running": False,
+            "leader_mirror": True,
             "intervention": False,
             "fine_grained": False,
             "leader_recentering": False,
@@ -92,21 +93,32 @@ class Recorder:
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
         # "<side>.<index>" -> outcome (success/fail/discard); see RecorderConfig.button_map
         self._button_outcome: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in (cfg.button_map or {}).items()}
-        if cfg.record_source == "dagger":
-            self._button_outcome = {}  # DAgger buttons are handled by the robot state machine.
+        if cfg.record_source in ("dagger", "deploy"):
+            # Policy-driven modes: the handle buttons drive the robot's own rollout state
+            # machine (start/stop, takeover, home), not an episode outcome label.
+            self._button_outcome = {}
         self._last_dagger_event_seq = 0
         self._dagger_intervention_active = False
         # "eval": record a continuous rollout (policy / intervention) from arm to disarm,
         # instead of gating on the teleop engage signal.
         self._eval = cfg.record_source == "eval"
+        # "deploy": run the policy and watch it, but record NOTHING — no dataset is opened
+        # and no frames are buffered. Cameras, robot link, live view, e-stop and human
+        # takeover are unchanged, so this is the recorder minus the dataset.
+        self._deploy = cfg.record_source == "deploy"
 
     # ------------------------------------------------------------------ control
     def start(self) -> None:
-        """Open cameras + robot link + dataset and begin the record loop (gate stays disarmed)."""
+        """Open cameras + robot link + dataset and begin the record loop (gate stays disarmed).
+
+        In ``deploy`` mode no dataset is opened at all — ``self.writer`` stays None, which
+        every consumer below already treats as "nothing to record"."""
         try:
             self.cameras.start()
             self.robot.start()
-            self.writer = self._open_writer()
+            self._check_robot_mode()
+            if not self._deploy:
+                self.writer = self._open_writer()
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
@@ -123,6 +135,39 @@ class Recorder:
             self.robot.stop()
             self.cameras.stop()
             raise
+
+    #: Which robot controller each tool needs, and how to start the right one.
+    _ROBOT_MODE_HINT = {
+        "teleop": "robot/yam teleop",
+        "dagger": "robot/yam dagger",
+    }
+
+    def _check_robot_mode(self, timeout: float = 3.0) -> None:
+        """Fail loudly when the robot server is running the wrong controller.
+
+        The robot modes are mutually exclusive and launched separately on the robot
+        machine, so getting them crossed is easy — and it fails *silently*: a ``teleop``
+        server simply ignores ``set_policy_action`` (the policy appears connected and the
+        arms never move), and a ``dagger`` server never reports the engage gate (the
+        recorder waits forever for an episode). Better to refuse to start and say which
+        command to run."""
+        want = str(getattr(self.cfg, "expected_robot_mode", "") or "")
+        if not want or self.cfg.mock:
+            return
+        deadline = time.time() + timeout
+        mode = self.robot.robot_mode
+        while mode is None and time.time() < deadline:
+            time.sleep(0.05)
+            mode = self.robot.robot_mode
+        if mode is None:
+            logger.warning("could not read the robot server mode; skipping the %s check", want)
+            return
+        if mode != want:
+            raise RuntimeError(
+                f"The robot server at {self.cfg.robot_host}:{self.cfg.robot_port} is running in "
+                f"'{mode}' mode, but this needs '{want}'.\n\n"
+                f"On the robot machine, restart it with:  {self._ROBOT_MODE_HINT.get(want, want)}"
+            )
 
     def _open_writer(self) -> AsyncDatasetWriter:
         shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}
@@ -168,7 +213,12 @@ class Recorder:
         return out
 
     def arm(self) -> None:
-        """GUI 'Start collection': begin gating (teleop/dagger) or a rollout (eval)."""
+        """GUI 'Start collection': begin gating (teleop/dagger) or a rollout (eval).
+
+        No-op in ``deploy`` mode — there is no dataset to collect into, so the concept of
+        arming does not apply and the GUI hides the control."""
+        if self._deploy:
+            return
         self.gate.arm()
         if self._eval:  # eval: arm starts one continuous rollout
             self._episode, self._preview, self._btn_outcome = [], [], None
@@ -181,7 +231,10 @@ class Recorder:
 
     def disarm(self) -> None:
         """GUI 'Stop collection'. In eval mode this ENDS the rollout and saves it
-        (or holds it for review); otherwise it just stops the gate and drops partials."""
+        (or holds it for review); otherwise it just stops the gate and drops partials.
+        No-op in ``deploy`` mode (nothing was ever armed)."""
+        if self._deploy:
+            return
         self.gate.disarm()
         if self._eval:
             if self._btn_outcome == "discard":
@@ -245,7 +298,10 @@ class Recorder:
         self._set(running=False)
 
     def save_dataset(self) -> None:
-        """Finalize saved episodes now, without closing cameras or the robot link."""
+        """Finalize saved episodes now, without closing cameras or the robot link.
+        Nothing to do in ``deploy`` mode — no dataset was ever opened."""
+        if self._deploy:
+            return
         if self._pending:
             raise RuntimeError("review the pending episode before saving the dataset")
         if self.gate.recording or (self._eval and self.gate.armed and self._episode):
@@ -299,6 +355,10 @@ class Recorder:
     def set_intervention(self, flag: bool) -> None:
         """Forward a DAgger human-intervention request."""
         self.robot.set_intervention(flag)
+
+    def set_leader_mirror(self, flag: bool) -> None:
+        """Forward whether the leader tracks the follower while the policy drives."""
+        self.robot.set_leader_mirror(flag)
 
     def finish_dagger_run(self, action: str) -> None:
         """Forward a DAgger keep/discard + home request."""
@@ -384,6 +444,24 @@ class Recorder:
     def _step(self, images: dict, snap: dict) -> None:
         self._scan_buttons(snap)
         self._scan_dagger_event(snap)
+
+        if self._deploy:
+            # Watch-only: publish liveness + rollout state for the UI and return before
+            # anything touches an episode buffer or the (absent) writer. The robot-side
+            # controller still owns policy/intervention/homing exactly as in dagger mode.
+            self._set(
+                armed=False,
+                recording=False,
+                pending=False,
+                teleop=snap["teleop_state"],
+                frames=0,
+                queue=0,
+                cam_ok=self.cameras.healthy,
+                robot_ok=self.robot.connected,
+                **self._dagger_status(snap),
+            )
+            return
+
         # Recentring is part of the same episode, but dataset time is paused:
         # append neither sensors nor actions until physical alignment completes.
         recording_paused = bool(snap.get("leader_recentering"))
@@ -481,6 +559,7 @@ class Recorder:
         return {
             "dagger_state": snap.get("dagger_state", "stopped"),
             "policy_running": bool(snap.get("policy_running")),
+            "leader_mirror": bool(snap.get("leader_mirror", True)),
             "intervention": bool(snap.get("intervention")),
             "fine_grained": bool(snap.get("fine_grained")),
             "leader_recentering": bool(snap.get("leader_recentering")),

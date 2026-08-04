@@ -1,7 +1,13 @@
-"""Entry point for the DAgger deployment UI.
+"""Entry point for the policy deployment UI.
 
 This replaces the normal headless ``yam-data bridge`` operator flow: the UI owns
-policy streaming and DAgger recording in one workstation process.
+policy streaming and (optionally) DAgger recording in one workstation process.
+
+    workstation/yam-data deploy      # everything else is chosen in the UI
+
+A run has two independent axes, both on the setup page: **mode** (deploy = watch the
+policy, leader free; dagger = correct it, leader mirrors) and **record** (whether the run
+lands in a dataset). The flags below only set their initial values.
 """
 
 from __future__ import annotations
@@ -12,11 +18,14 @@ from typing import List, Optional, Tuple
 
 from i2rt.serving.rig_config import Resolver, apply_camera_serials, load_rig
 from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
+from workstation.lerobot_recorder.deploy_gui import DeployGUI
 from workstation.policy_bridge.config import BridgeConfig
 
 
-def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, BridgeConfig]:
-    p = argparse.ArgumentParser(description="YAM DAgger deployment UI")
+def build_configs(
+    argv: Optional[List[str]] = None,
+) -> Tuple[RecorderConfig, BridgeConfig, str, bool, bool]:
+    p = argparse.ArgumentParser(description="YAM policy deployment UI (DAgger or watch-only)")
     p.add_argument("--config", default=None, help="config.yaml (robot/policy/cameras/recorder)")
     p.add_argument("--repo-id", default="user/yam_bimanual")
     p.add_argument("--root", default="~/lerobot_data")
@@ -36,6 +45,34 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
     p.add_argument("--resume", action="store_true", help="append to an existing dataset at --root")
+    p.add_argument(
+        "--mode",
+        choices=["deploy", "dagger"],
+        default="dagger",
+        help="deploy = watch the policy (leader free); dagger = correct it (leader mirrors). "
+        "Also selectable on the setup page.",
+    )
+    p.add_argument(
+        "--no-record",
+        action="store_true",
+        help="start with recording OFF (no dataset is created or opened). Independent of "
+        "--mode; also togglable on the setup page.",
+    )
+    mirror = p.add_mutually_exclusive_group()
+    mirror.add_argument(
+        "--leader-mirror",
+        dest="leader_mirror",
+        action="store_true",
+        default=None,
+        help="force leader mirroring ON regardless of the record mode",
+    )
+    mirror.add_argument(
+        "--no-leader-mirror",
+        dest="leader_mirror",
+        action="store_false",
+        help="force leader mirroring OFF: the handles hang free instead of tracking the "
+        "follower while the policy drives",
+    )
     p.add_argument("--mock", action="store_true", help="synthetic cameras/robot state")
     p.add_argument("--serials", default="", help="comma-separated RealSense serials")
     args = p.parse_args(argv)
@@ -67,7 +104,7 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
         cameras=cams,
         robot_host=rob.get("robot_host", key="host"),
         robot_port=int(rob.get("robot_port", key="port")),
-        record_source="dagger",
+        record_source=DeployGUI.SOURCES[(args.mode, not args.no_record)],
         resume=args.resume,
         min_free_gb=float(rec.get("min_free_gb")),
         mock=args.mock,
@@ -89,6 +126,7 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     recorder_cfg.streaming_encoding = bool(
         rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
     )
+    recorder_cfg.expected_robot_mode = "dagger"  # only that controller accepts policy actions
 
     bridge_cfg = BridgeConfig(
         robot_host=recorder_cfg.robot_host,
@@ -101,11 +139,11 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
         prompt=task,
         use_async=not args.no_async,
     )
-    return recorder_cfg, bridge_cfg
+    return recorder_cfg, bridge_cfg, args.mode, not args.no_record, args.leader_mirror
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    recorder_cfg, bridge_cfg = build_configs(argv)
+    recorder_cfg, bridge_cfg, mode, record, leader_mirror = build_configs(argv)
     from PyQt5 import QtWidgets
 
     from workstation.lerobot_recorder import theme
@@ -113,7 +151,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(theme.QSS)
-    gui = DeployGUI(recorder_cfg, bridge_cfg)
+    gui = DeployGUI(
+        recorder_cfg, bridge_cfg, mode=mode, record=record, leader_mirror=leader_mirror
+    )
     gui.resize(900, 980)
     gui.show()
     sys.exit(app.exec_())

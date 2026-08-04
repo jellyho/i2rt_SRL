@@ -108,7 +108,10 @@ recorder:
   root: ~/lerobot_data
   fps: 30
   min_free_gb: 1.0
-  source: teleop             # teleop | dagger | eval
+  # teleop = gate on the teleop engage signal | dagger = one policy rollout per episode
+  # eval   = one continuous rollout from Start to Stop collection
+  # deploy = run the policy WITHOUT recording (no dataset); `yam-data deploy --no-record`
+  source: teleop             # teleop | dagger | eval | deploy (deploy UI derives its own)
   format: lerobot            # lerobot (LeRobotDataset) | abcdl (abcdl MP4+binary cache; needs the `abcdl` pkg)
   # abcdl_size: 224          # square px cameras are resized to for the abcdl format
   # --- per-frame RL signals (stored as dataset features; preserved across resume) ---

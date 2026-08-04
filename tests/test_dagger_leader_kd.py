@@ -259,3 +259,59 @@ def test_enter_gravity_comp_idle_kd_override():
     assert np.allclose(r._commands.kd, GRAV_COMP_KD)  # default: configured damping
     r.enter_gravity_comp_idle(kd=np.zeros(6))
     assert np.allclose(r._commands.kd, np.zeros(6))  # per-call override
+
+
+# ------------------------------------------------------- leader mirroring on/off
+def test_mirroring_off_frees_the_leader_instead_of_driving_it(monkeypatch):
+    """Mirroring off must FREE the leader, not merely skip the drive.
+
+    Skipping alone would leave whatever PD gains were last commanded, so the handles
+    would keep stiffly holding a stale target — worse than mirroring."""
+    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc.set_policy_running(True)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    assert leader.cmd_calls, "sanity: mirroring on should command the leader"
+
+    dc.set_leader_mirror(False)
+    n_cmds, n_idle = len(leader.cmd_calls), len(leader.idle_calls)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    assert len(leader.cmd_calls) == n_cmds  # no new PD target
+    assert len(leader.idle_calls) > n_idle  # explicitly freed instead
+
+
+def test_mirroring_can_be_turned_back_on_mid_rollout(monkeypatch):
+    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc.set_policy_running(True)
+    dc.set_leader_mirror(False)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    n_cmds = len(leader.cmd_calls)
+
+    dc.set_leader_mirror(True)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    assert len(leader.cmd_calls) > n_cmds  # driving the leader again
+    kp, _ = leader.kp_kd_calls[-1]
+    assert np.allclose(kp, np.full(6, 10.0) * dc.mirror_kp)
+
+
+def test_mirror_state_defaults_from_mirror_kp_and_is_reported(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    assert dc._leader_mirror is True  # default mirror_kp > 0
+    dc.step()
+    assert dc.snapshot()["leader_mirror"] is True
+    dc.set_leader_mirror(False)
+    dc.step()
+    assert dc.snapshot()["leader_mirror"] is False
+
+    # launching with --mirror-kp 0 means "do not mirror" rather than a silent no-op
+    _set_free_feel(monkeypatch)
+    leader, follower = StubLeader(), StubFollower()
+    pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
+                       base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    assert ctl.DaggerController(ctl.DaggerConfig(mirror_kp=0.0))._leader_mirror is False

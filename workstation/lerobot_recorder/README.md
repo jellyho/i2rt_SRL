@@ -62,6 +62,20 @@ leader **button** can end+label in one press (see *Labeling*). The engage/releas
 thresholds (`control.engage_thr` / `release_thr` / `dwell` / `gate_joints`) live in
 `config.yaml` too and are applied by the robot server.
 
+That gate is the `teleop` source. `recorder.source` picks which one is used:
+
+| source | what starts/stops an episode | action stored | dataset |
+|---|---|---|---|
+| `teleop` | the engage gate above (ENGAGED → IDLE) | `applied` | yes |
+| `dagger` | one complete policy rollout | `executed` | yes |
+| `eval` | Start collection → Stop collection, continuously | `executed` | yes |
+| `deploy` | nothing is recorded | — | **no** |
+
+`yam-data record` uses `teleop`. The deploy UI picks between the other three from its
+**mode** + **record** choices — you never set the source by hand there. In `deploy` the
+cameras, robot link, live view, takeover and e-stop all behave the same; no writer is
+opened and no frames are buffered. See *C. Deployment*.
+
 ## Dataset schema (LeRobot v3.0)
 
 | Key | Shape | Source |
@@ -263,7 +277,38 @@ Quick dry run with no robot/cameras/lerobot:
 workstation/yam-data record --mock
 ```
 
-## C. Deployment (policy + human takeover via DAgger)
+## C. Deployment (run a policy on the robot)
+
+Deployment always needs **three processes on (usually) three machines**. Steps 1 and 2 are
+identical whether or not you record; only step 3 differs.
+
+```
+[robot]                        [workstation]                      [policy]
+run_robot_server dagger  ◀─portal─▶  deploy UI  ◀──websocket+msgpack──▶  yam_policy.serve
+  owns the arms,                     owns cameras,                       owns the network
+  takeover, homing, e-stop           builds obs, sends action chunks
+```
+
+The robot server is the **source of truth** for whether the policy is allowed to drive:
+the workstation only streams actions while the robot reports `policy_running` and not
+intervention / homing / e-stop. So a takeover or an e-stop stops the policy no matter what
+the UI is doing.
+
+**Why `dagger` and not `teleop` for the robot server** — the two modes differ in who drives
+the follower and what the leader is for:
+
+| | `run_robot_server teleop` | `run_robot_server dagger` |
+|---|---|---|
+| drives the follower | the human, through the leader (gello) arm | the **policy**, via `set_policy_action` from the workstation |
+| accepts policy actions | no | yes |
+| what the leader is | the **input device**; `bilateral_kp` gives force feedback | an **override handle**: mirrors the follower while the policy drives, goes free when you take over |
+| episode boundary | the engage gate (IDLE → ENGAGED → HOMING → IDLE) | a policy rollout (start/stop by button or UI) |
+| handle buttons | label the episode (success / fail / discard) | drive the rollout state machine (start/stop, takeover, keep/discard + home) |
+| used by | `yam-data record` | `yam-data deploy`, `yam-data bridge` |
+
+A `teleop` server ignores `set_policy_action` entirely, so deployment against it does
+nothing. (`wrapper` is a third mode: the follower tracks an external command with no leader
+at all — that is what replay uses.)
 
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
@@ -273,20 +318,79 @@ robot/yam dagger --mirror-kp 0.2
 # 2. [policy]   serve your policy (own env; openpi-compatible websocket)
 #               see policy_serving/README.md
 python -m yam_policy.serve --policy <module>:<Class> --config k=v     # :8000
+```
 
-# 3. [workstation]  deploy UI: robot (portal) <-> policy (websocket) + DAgger recording
+```bash
+# 3. [workstation]
 workstation/yam-data deploy \
     --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
     --serials <wrist_left_sn>,<wrist_right_sn>,<agentview_sn> \
     --repo-id user/yam_pick --prompt "pick up the cube"
-# UI or handle buttons can start/stop rollout, toggle intervention, keep/discard + home.
 ```
 
-`workstation/yam-data bridge` is still available as a headless/debug bridge. For
-normal DAgger collection, use `deploy` so the policy bridge, recorder, live stats,
-and safety controls share one operator UI.
+### Two choices in the UI
 
-This closes the loop: train → deploy UI → intervene → collect → retrain.
+Everything else is on the setup page, so plain `yam-data deploy` is enough. A run has two
+**independent** axes — recording a deployment is not the same thing as doing DAgger:
+
+**mode** — what you are here to do. This is what decides *leader mirroring*:
+
+* `deploy` — watch the policy work. The leader hangs **free**, so the handles do not fly
+  around while the arm moves.
+* `dagger` — correct the policy. The leader **mirrors** the follower, so grabbing a handle
+  to take over starts from the arm's current pose.
+
+**record** — whether this run lands in a dataset. Off hides the dataset fields entirely;
+no dataset is created, opened, or resumed and no frames are buffered.
+
+| mode | record | source | what it is |
+|---|---|---|---|
+| deploy | off | `deploy` | just run a checkpoint and watch |
+| deploy | on | `eval` | log the run — Start/Stop collection bounds one episode |
+| dagger | on | `dagger` | one episode per rollout, ended with keep/discard |
+| dagger | off | `deploy` | practise takeovers, save nothing |
+
+Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
+(it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /
+`--no-leader-mirror` only set the initial values; `robot/yam dagger --mirror-kp 0` makes
+"no mirroring" the robot's own default. The mirror setting is latched workstation-side and
+re-applied on reconnect, so the robot never silently reverts mid-session.
+
+> **The trade-off is on takeover.** Mirroring exists so the leader is already where the
+> follower is. With it off, the moment you take over, the follower travels — rate-limited
+> by the smoother, not instantly — to wherever the leader happens to be. Park the handles
+> near the arm pose before intervening, or switch to `dagger` mode first.
+
+### If you started the wrong robot server
+
+The robot modes are mutually exclusive and launched separately, and a mismatch used to fail
+*silently* — a `teleop` server just ignores policy actions, so the policy looks connected
+and the arms never move. Both GUIs now check the mode the robot reports and refuse to start:
+
+```
+The robot server at 10.0.0.5:11331 is running in 'teleop' mode, but this needs 'dagger'.
+
+On the robot machine, restart it with:  robot/yam dagger
+```
+
+### Operating it
+
+| | UI button | handle button |
+|---|---|---|
+| start/stop the rollout | Start/Stop Policy | left upper |
+| human takeover on/off | Human Intervention | left lower |
+| end the run + home | Keep + Home / Discard + Home (recording), Stop + Home (not) | right lower / right upper |
+| fine-grained control | — | left upper, while intervening |
+
+The prompt sent to the policy is the **task** field, so switching task in the UI switches
+the instruction the policy is conditioned on.
+
+`workstation/yam-data bridge` remains as a headless/debug bridge — no GUI, no start/stop,
+and it opens the cameras itself, so do not run it alongside the deploy UI (they fight over
+the RealSense devices). Prefer `deploy` / `deploy --no-record`.
+
+This closes the loop: train → deploy (`--no-record`) to sanity-check → DAgger to collect
+where it fails → retrain.
 
 ## D. Replay a dataset onto the robot
 

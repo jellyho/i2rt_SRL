@@ -47,7 +47,7 @@ recorder:
 """
     )
     record_cfg = build_config(["--config", str(config), "--mock"])
-    deploy_cfg, _ = build_deploy_configs(["--config", str(config), "--mock"])
+    deploy_cfg, *_ = build_deploy_configs(["--config", str(config), "--mock"])
 
     for cfg in (record_cfg, deploy_cfg):
         assert cfg.encoding_backend == "pyav"

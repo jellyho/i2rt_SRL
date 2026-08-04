@@ -12,7 +12,7 @@
 #   workstation/yam-data mark-homing     # auto-annotate homing tails (control_mode=homing) from the gripper
 #   workstation/yam-data check-videos    # verify videos really hold the frames meta/ claims (--fix repairs)
 #   workstation/yam-data bridge [args]   # policy bridge (portal robot <-> websocket policy)
-#   workstation/yam-data deploy [args]   # GUI DAgger deployment + policy bridge
+#   workstation/yam-data deploy [args]   # GUI policy deployment (record + leader-mirror are UI toggles)
 #   workstation/yam-data cams            # list connected RealSense serials
 #   workstation/yam-data tune [args]     # GUI exposure/brightness tuner (match cameras)
 #   workstation/yam-data doctor [args]   # dataset stats / validation

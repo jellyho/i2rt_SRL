@@ -132,7 +132,17 @@ class RecorderConfig:
     #   "teleop" -> gate on teleop_state (ENGAGED..IDLE), action = applied command
     #   "dagger" -> gate on the complete policy rollout, action = executed command;
     #               observation.control_mode marks policy vs human intervention
+    #   "eval"   -> one continuous rollout from arm to disarm, action = executed command
+    #   "deploy" -> run the policy WITHOUT recording: no dataset is created or opened and
+    #               no frames are buffered. Everything else (cameras, robot link, live
+    #               view, e-stop, human takeover) behaves exactly as in the other modes,
+    #               so a rollout can be watched and interrupted without producing data.
     record_source: str = "teleop"
+    # Which robot-server controller this tool needs ("teleop" / "dagger"); "" skips the
+    # check. The robot modes are mutually exclusive and started separately on the robot
+    # machine, so a mismatch otherwise fails *silently* — a teleop server simply ignores
+    # policy actions, and a dagger server never reports the teleop engage gate.
+    expected_robot_mode: str = ""
     resume: bool = False  # append to an existing dataset at `root` instead of creating a new one
     min_free_gb: float = 1.0  # refuse to save an episode when free disk drops below this
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)

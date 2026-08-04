@@ -480,3 +480,123 @@ def test_dagger_recorder_events_do_not_use_expert_button_map():
     assert rec._btn_outcome == "keep"
     rec._scan_dagger_event({"last_dagger_event": {"seq": 2, "action": "discard"}})
     assert rec._btn_outcome == "discard"
+
+
+# --------------------------------------------------------------- deploy (no recording)
+def test_deploy_source_opens_no_dataset(tmp_path):
+    """`deploy` runs the policy but must not create a dataset anywhere on disk."""
+    cfg = RecorderConfig(repo_id="test/deployonly", root=str(tmp_path), fps=60, mock=True,
+                         record_source="deploy")
+    rec = Recorder(cfg)
+    rec.start()
+    time.sleep(0.5)  # let the loop run — in dagger/eval this would be buffering frames
+    st = rec.get_status()
+    rec.shutdown()
+
+    assert rec.writer is None  # no writer was ever opened
+    assert not (tmp_path / "deployonly").exists()  # and nothing was written to disk
+    assert st["frames"] == 0 and st["recording"] is False and st["armed"] is False
+    assert st["robot_ok"] is True  # the robot link is live all the same
+
+
+def test_deploy_source_ignores_arm_and_save(tmp_path):
+    """Arming/saving are meaningless without a dataset; they must be safe no-ops, not crashes."""
+    cfg = RecorderConfig(repo_id="test/deploynoop", root=str(tmp_path), fps=60, mock=True,
+                         record_source="deploy")
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(0.4)
+    armed = rec.get_status()["armed"]
+    rec.save_dataset()  # would raise/AttributeError if it reached the writer
+    rec.disarm()
+    rec.shutdown()
+
+    assert armed is False  # arm() did not arm anything
+    assert rec.writer is None
+    assert not (tmp_path / "deploynoop").exists()
+
+
+def test_deploy_source_still_reports_rollout_state(tmp_path):
+    """The UI needs policy/intervention state in deploy mode — that is the whole point."""
+    cfg = RecorderConfig(repo_id="test/deploystate", root=str(tmp_path), fps=60, mock=True,
+                         record_source="deploy")
+    rec = Recorder(cfg)
+    snap = {
+        "teleop_state": "IDLE", "state": np.zeros(4), "action": np.zeros(4),
+        "policy_running": True, "intervention": True, "dagger_state": "intervention",
+        "fine_grained": False, "leader_recentering": False, "recenter_fault": False,
+        "homing": False, "estop": False, "buttons": {},
+    }
+    rec._step({}, snap)
+    st = rec.get_status()
+    assert st["policy_running"] is True
+    assert st["intervention"] is True
+    assert st["dagger_state"] == "intervention"
+    assert st["frames"] == 0  # ...but still nothing buffered
+
+
+def test_deploy_source_does_not_use_expert_button_map():
+    """Handle buttons drive the robot's rollout state machine here, not outcome labels."""
+    cfg = RecorderConfig(record_source="deploy", mock=False, button_map={"left.0": "discard"})
+    rec = Recorder(cfg)
+    rec._scan_buttons({"buttons": {"left": [1]}})
+    assert rec._btn_outcome is None
+
+
+# ------------------------------------------------------- robot-server mode mismatch
+def test_wrong_robot_mode_refuses_to_start_with_an_actionable_message(tmp_path, monkeypatch):
+    """A crossed robot server otherwise fails SILENTLY (a teleop server just ignores
+    policy actions), so starting must refuse and name the command to run."""
+    cfg = RecorderConfig(repo_id="test/mode", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="dagger")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "teleop"))
+
+    try:
+        rec.start()
+    except RuntimeError as exc:
+        assert "'teleop'" in str(exc) and "'dagger'" in str(exc)
+        assert "robot/yam dagger" in str(exc)
+    else:
+        raise AssertionError("a teleop server must not satisfy a deployment session")
+
+
+def test_matching_robot_mode_starts_normally(tmp_path, monkeypatch):
+    cfg = RecorderConfig(repo_id="test/modeok", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="dagger")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "dagger"))
+    rec.start()
+    rec.shutdown()
+    assert rec.writer is None  # deploy source: still no dataset
+
+
+def test_unknown_robot_mode_does_not_block_startup(tmp_path, monkeypatch):
+    """An older server that reports no mode must not become un-startable."""
+    cfg = RecorderConfig(repo_id="test/modenone", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="dagger")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: None))
+    rec._check_robot_mode(timeout=0.1)  # warns, does not raise
+    rec.shutdown()
+
+
+def test_mock_sessions_skip_the_mode_check(tmp_path):
+    cfg = RecorderConfig(repo_id="test/modemock", root=str(tmp_path), mock=True,
+                         record_source="deploy", expected_robot_mode="dagger")
+    rec = Recorder(cfg)
+    rec.start()  # mock has no robot at all — the check must not fire
+    rec.shutdown()
