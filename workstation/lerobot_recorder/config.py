@@ -153,3 +153,7 @@ class RecorderConfig:
     # lower=1). Left upper is reserved for fine-grained control; right upper discards.
     button_map: dict = field(default_factory=lambda: dict(DEFAULT_TELEOP_BUTTON_OUTCOMES))
     review_downscale: int = 4  # spatial stride for the review preview (640x480 -> 160x120)
+    # Operator-preview blend when a past dataset episode is selected.  1.0 is
+    # live cameras only; 0.0 is the reference episode only.  This never changes
+    # recorded images or policy inputs.
+    reference_live_alpha: float = 0.5

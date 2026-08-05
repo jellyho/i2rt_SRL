@@ -139,6 +139,9 @@ def build_configs(
     recorder_cfg.streaming_encoding = bool(
         rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
     )
+    recorder_cfg.reference_live_alpha = min(
+        max(float(rec_section.get("reference_live_alpha", recorder_cfg.reference_live_alpha)), 0.0), 1.0
+    )
     recorder_cfg.expected_robot_mode = "deploy"  # only that controller accepts policy actions
 
     bridge_cfg = BridgeConfig(

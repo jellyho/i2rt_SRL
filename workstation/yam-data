@@ -8,7 +8,6 @@
 #
 #   workstation/yam-data record [args]   # GUI recorder (teleop-gated LeRobot capture)
 #   workstation/yam-data replay [args]   # GUI replay (drive the robot from a dataset)
-#   workstation/yam-data edit [args]     # GUI viewer/editor (browse + relabel/retask/delete episodes)
 #   workstation/yam-data mark-homing     # auto-annotate homing tails (control_mode=homing) from the gripper
 #   workstation/yam-data check-videos    # verify videos really hold the frames meta/ claims (--fix repairs)
 #   workstation/yam-data deploy [args]   # policy deployment (mode + record are UI toggles; --headless for no GUI)
@@ -50,7 +49,6 @@ shift || true
 case "$cmd" in
     record) exec python -m workstation.lerobot_recorder "$@" ;;
     replay) exec python -m workstation.lerobot_recorder.replay_main "$@" ;;
-    edit)   exec python -m workstation.lerobot_recorder.editor_main "$@" ;;
     mark-homing) exec python -m workstation.lerobot_recorder.mark_homing "$@" ;;
     check-videos) exec python -m workstation.lerobot_recorder.check_videos "$@" ;;
     bridge)
@@ -61,7 +59,7 @@ case "$cmd" in
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|edit|mark-homing|check-videos|deploy|cams|tune|doctor} [args]" >&2
+        echo "usage: yam-data {record|replay|mark-homing|check-videos|deploy|cams|tune|doctor} [args]" >&2
         exit 2
         ;;
 esac
