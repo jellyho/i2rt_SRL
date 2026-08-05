@@ -53,8 +53,24 @@ def is_chunked(results: Dict) -> bool:
     return isinstance(actions, np.ndarray) and actions.ndim > 1
 
 
+def _warn_ignored_horizon(action_horizon: Optional[int]) -> None:
+    """Accept — and ignore — a caller-supplied horizon.
+
+    Older call sites (and the exploratory RTC branch) pass ``action_horizon=``. Raising a
+    TypeError on them would only force a flag-day rename; the number is simply not used
+    any more, because the chunk decides its own length. Say so once instead of silently
+    accepting an argument that no longer means anything."""
+    if action_horizon is not None:
+        logger.warning(
+            "ActionChunkBroker: action_horizon=%s is ignored — the chunk size now comes from "
+            "the policy's response, so it cannot disagree with the checkpoint.",
+            action_horizon,
+        )
+
+
 class ActionChunkBroker(BasePolicy):
-    def __init__(self, policy: BasePolicy) -> None:
+    def __init__(self, policy: BasePolicy, action_horizon: Optional[int] = None) -> None:
+        _warn_ignored_horizon(action_horizon)
         self._policy = policy
         self._cur_step = 0
         self._chunk = 0  # length of the chunk in hand; 0 = nothing cached
@@ -100,8 +116,20 @@ class AsyncActionChunkBroker(BasePolicy):
     policy's chunk size like the synchronous broker does.
     """
 
-    def __init__(self, policy: BasePolicy, prefetch_lead: int = 2) -> None:
+    def __init__(
+        self,
+        policy: BasePolicy,
+        action_horizon: Optional[int] = None,
+        prefetch_at: Optional[int] = None,
+        prefetch_lead: int = 2,
+    ) -> None:
+        _warn_ignored_horizon(action_horizon)
         self._policy = policy
+        # `prefetch_at` was an absolute step index into a fixed-length chunk, which cannot
+        # survive a chunk whose length is only known on arrival. Translate it to the same
+        # distance from the end when the old pair is supplied together.
+        if prefetch_at is not None and action_horizon:
+            prefetch_lead = max(1, int(action_horizon) - int(prefetch_at))
         self._lead = max(1, int(prefetch_lead))
         self._exec = ThreadPoolExecutor(max_workers=1)  # serializes inference calls
         self._cur: Dict | None = None

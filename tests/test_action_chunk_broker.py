@@ -150,3 +150,41 @@ def test_reset_drops_the_cached_chunk():
     broker.reset()
     broker.infer({})
     assert p.calls == 2
+
+
+# ------------------------------------------------- back-compat with older call sites
+def test_action_horizon_argument_is_accepted_and_ignored(caplog):
+    """Older call sites pass action_horizon=. They must keep working — and must get the
+    adaptive behaviour anyway, not the number they asked for."""
+    p = FakePolicy(30)
+    with caplog.at_level("WARNING"):
+        broker = ActionChunkBroker(p, action_horizon=16)  # the stale default
+    for _ in range(30):
+        broker.infer({})
+    assert p.calls == 1  # followed the policy's 30, not the requested 16
+    assert broker.action_horizon == 30
+    assert "ignored" in caplog.text
+
+
+def test_async_accepts_the_old_positional_signature():
+    p = FakePolicy(30)
+    broker = AsyncActionChunkBroker(p, 16)  # positional, as the old API took it
+    try:
+        for _ in range(30):
+            broker.infer({})
+        assert broker.action_horizon == 30
+    finally:
+        broker.close()
+
+
+def test_prefetch_at_is_translated_to_a_lead():
+    """`prefetch_at` indexed into a fixed chunk; keep its meaning as a distance from the end."""
+    p = FakePolicy(10)
+    broker = AsyncActionChunkBroker(p, action_horizon=10, prefetch_at=8)
+    try:
+        assert broker._lead == 2
+        for _ in range(8):
+            broker.infer({})
+        assert p.calls == 2  # prefetch fired at the same point as before
+    finally:
+        broker.close()
