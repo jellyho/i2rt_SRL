@@ -1,6 +1,9 @@
 """Safe in-place editing of a recorded LeRobot **v3.0** dataset.
 
-The viewer/editor GUI (``editor_gui.py``) drives this backend. The heavy structural
+The viewer/editor GUI that used to drive this now lives in `hf-utils` (see the README).
+What remains here is what the *recorder* needs: the video/length consistency check run by
+``dataset_writer.finalize()`` and the homing-tail marking behind ``yam-data mark-homing``,
+both of which encode YAM specifics a general tool should not. The heavy structural
 operations (deleting episodes, changing tasks) go through LeRobot's official
 ``lerobot.datasets.dataset_tools`` so the parquet data, videos, and ``meta/`` stay
 consistent (episodes are re-indexed, ``info.json`` counts updated, etc.). Around

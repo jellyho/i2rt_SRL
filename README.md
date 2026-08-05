@@ -125,19 +125,25 @@ workstation/yam-data replay --repo-id user/yam_pick
 
 ### E · View & edit a recorded dataset (no robot)
 
+Use **[`jellyho/hf-utils`](https://github.com/jellyho/hf-utils)** — a local web app that
+replaced the PyQt editor that used to live here. It works on *any* LeRobot v3.0 dataset, not
+only YAM recordings, so it is a separate tool rather than part of this repo. Nothing here
+imports it and nothing needs installing.
+
 ```bash
-# 💻 workstation — browse datasets, scrub every episode across all camera views, and edit
-workstation/yam-data edit
+git clone https://github.com/jellyho/hf-utils && cd hf-utils && ./run.sh
+# open http://127.0.0.1:8000 -> LeRobot tab -> point it at a dataset folder
 ```
 
-Pick a dataset, then per episode you can **scrub / play** the frames (all cameras
-side-by-side), **relabel** the outcome (success / fail / discard), **set the task**
-(language instruction), or **delete** the selected episode(s). A **control-mode
-timeline** under the scrubber shows the whole episode at a glance — where it's teleop
-vs the **homing** tail (click it to seek). Structural edits (delete / set-task)
-re-index the LeRobot dataset via its official `dataset_tools` and back the folder up
-first (`<name>.backup-…`); relabelling only touches the `outcomes.jsonl` sidecar.
-Reads the dataset off disk — no robot or cameras needed (`--mock` for a synthetic dataset).
+Per episode: **scrub / play** every camera in sync, plot `action` vs `observation.state`,
+**set the task**, **delete** episodes (with re-indexing), split, merge, render to MP4/GIF,
+and annotate subtasks. It reads this recorder's `outcomes.jsonl` when present, so
+success / fail / discard still show up per episode and survive a delete. Everything
+destructive backs up first.
+
+Two things stayed here because they encode YAM specifics a general tool should not have:
+**homing annotation** (below) and `yam-data check-videos`, which can re-encode an mp4 that
+the recorder's encoder truncated — hf-utils detects that but only repairs the metadata side.
 
 **Homing annotation** — every episode ends with the arms returning home and the
 gripper closing; that tail isn't useful for training. New recordings are tagged live
