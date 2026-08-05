@@ -71,7 +71,7 @@ class DeployGUI(RecorderGUI):
         self.copy_joint_pos_btn.clicked.connect(self._copy_joint_positions)
         self.button_legend = QtWidgets.QLabel(
             "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during intervention; "
-            "left lower = human intervention on/off, "
+            "left lower = return during policy / resume policy after the human handoff, "
             "right upper = discard + home, right lower = keep + home."
         )
         self.button_legend.setWordWrap(True)

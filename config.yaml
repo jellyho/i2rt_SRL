@@ -64,8 +64,8 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # Optional stricter per-joint clamp [lo, hi]; intersects the robot's native XML limits.
   # follower_joint_limits: [[-3.0, 3.0], [-2.0, 2.0]]
 
-# DAgger leader-handle actions. Change `return` back to
-# `intervention_toggle` to restore direct human-intervention toggling.
+# DAgger leader-handle actions. A `return` button starts recovery during policy
+# and resumes policy when pressed again after the human-control handoff.
 dagger:
   buttons:
     left.0: rollout_toggle

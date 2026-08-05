@@ -1269,7 +1269,13 @@ class DaggerController(BaseController):
         elif action == "intervention_toggle":
             self.set_intervention(not self._intervening)
         elif action == "return":
-            self.return_to_dagger_pose()
+            # A return ends in human intervention while keeping the rollout
+            # alive. Reuse the same physical button to hand control back to the
+            # policy; another return request cannot run during intervention.
+            if self._intervening:
+                self.set_intervention(False)
+            else:
+                self.return_to_dagger_pose()
         elif action == "keep_home":
             self.finish_dagger_run("keep")
         elif action == "discard_home":

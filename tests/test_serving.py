@@ -501,6 +501,50 @@ def test_dagger_button_map_can_request_return(monkeypatch):
         ctrl.close()
 
 
+def test_dagger_return_button_resumes_policy_after_human_handoff(monkeypatch):
+    relative = [0.0] * 14
+    relative[1] = 0.2
+    ctrl = DaggerController(
+        DaggerConfig(
+            sim=True,
+            rate=20.0,
+            home_speed=2.0,
+            return_mode="relative",
+            return_rel_pos=relative,
+            button_map={"left.1": "return"},
+        )
+    )
+    current = {"buttons": [0, 0]}
+
+    def fake_read_handle(leader):
+        return np.zeros(leader.num_dofs()), None, list(current["buttons"])
+
+    monkeypatch.setattr("i2rt.serving.controllers.read_handle", fake_read_handle)
+    try:
+        ctrl.step()  # initialize button edge state
+        ctrl.set_policy_running(True)
+        current["buttons"] = [0, 1]
+        ctrl.step()
+        assert ctrl.snapshot()["returning"] is True
+
+        # Releasing during the motion arms the next physical press.
+        current["buttons"] = [0, 0]
+        for _ in range(40):
+            ctrl.step()
+            if ctrl.snapshot()["intervention"]:
+                break
+        assert ctrl.snapshot()["dagger_state"] == "intervention"
+        assert ctrl.snapshot()["policy_running"] is True
+
+        current["buttons"] = [0, 1]
+        ctrl.step()
+        assert ctrl.snapshot()["intervention"] is False
+        assert ctrl.snapshot()["policy_running"] is True
+        assert ctrl.snapshot()["dagger_state"] == "policy"
+    finally:
+        ctrl.close()
+
+
 @pytest.mark.parametrize("policy_running", [False, True])
 def test_dagger_intervention_off_relocks_leader_to_held_follower(policy_running):
     ctrl = DaggerController(
