@@ -23,6 +23,11 @@ set -eo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 export PATH="$HOME/.local/bin:$PATH"
+# Run THIS checkout's i2rt. `uv run` already resolves the project from $REPO, but the
+# YAM_NO_UV path falls back to whatever `python` has installed — which, with several
+# worktrees of this repo, is whichever one last ran an editable install. See the same
+# note in workstation/yam-data.
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 run() {
     if [ -n "${YAM_NO_UV:-}" ] || ! command -v uv >/dev/null 2>&1; then

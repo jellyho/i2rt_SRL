@@ -23,6 +23,17 @@ set -eo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
+# Run THIS checkout's code, whichever one you launched.
+#
+# `uv pip install -e policy_serving` records an absolute path in the env's site-packages,
+# so with several worktrees of this repo the whole conda env follows whichever one ran that
+# command last — and it is per package, so `i2rt` can come from one checkout while
+# `yam_policy` comes from another. Nothing announces this: you edit a file here, run
+# yam-data, and the other worktree's copy executes. PYTHONPATH is searched before
+# site-packages, so pinning it to $REPO makes the launcher self-consistent by construction
+# and removes the need to re-run the editable install when switching worktrees.
+export PYTHONPATH="$REPO:$REPO/policy_serving${PYTHONPATH:+:$PYTHONPATH}"
+
 ENV="${YAM_WS_ENV:-yam_ws}"
 if command -v conda >/dev/null 2>&1; then
     CONDA_BASE="$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")"
