@@ -74,12 +74,23 @@ def select_encoding_backend(
     memory_query: Callable[[], GpuMemory | None] = query_primary_gpu_memory,
     torchcodec_available: Callable[[], bool] = torchcodec_encoder_available,
 ) -> EncodingBackendDecision:
-    """Resolve the requested backend at writer startup or just before encoding.
+    """Resolve the configured backend. Always PyAV, whatever was asked for.
 
-    ``torchcodec`` is the default/preferred backend, but it safely falls back to
-    PyAV when TorchCodec is unavailable, GPU memory cannot be measured, or the
-    primary GPU is already using at least ``max_used_vram_gb``.  An explicit
-    ``pyav`` request never probes or imports TorchCodec.
+    TorchCodec cannot run without staging every frame of every camera as a ~1.5 MB PNG. Its
+    *encoder* reads frames from memory -- which is what made the staging look like pure waste --
+    but lerobot 0.4.4 also computes each episode's image statistics by loading those same PNGs
+    back off disk (``compute_stats.sample_images`` -> ``load_image_as_numpy``), and offers no
+    streaming path for that. Suppressing the writes without the stats knowing gets you an
+    episode that dies at save time on a file nothing wrote:
+
+        FileNotFoundError: .../images/observation.images.agentview/episode-000000/frame-000000.png
+
+    So it is a few GB of PNGs per episode, or no TorchCodec. Only the PyAV streaming encoder
+    feeds both the encoder and the stats from memory, so it is the only backend here.
+
+    ``max_used_vram_gb``, ``memory_query`` and ``torchcodec_available`` are kept so the config
+    and the GPU probe stay callable, and so restoring TorchCodec is a local change here if
+    lerobot ever grows streaming stats.
     """
     requested = str(requested).strip().lower()
     if requested not in VALID_ENCODING_BACKENDS:
@@ -87,25 +98,8 @@ def select_encoding_backend(
         raise ValueError(f"encoding_backend must be one of {allowed}; got {requested!r}")
     if requested == "pyav":
         return EncodingBackendDecision(requested, "pyav", "explicitly configured")
-    if not torchcodec_available():
-        return EncodingBackendDecision(requested, "pyav", "TorchCodec encoder is unavailable")
-
-    memory = memory_query()
-    if memory is None:
-        return EncodingBackendDecision(requested, "pyav", "GPU memory could not be measured")
-    limit_mib = int(float(max_used_vram_gb) * 1024)
-    if memory.used_mib >= limit_mib:
-        return EncodingBackendDecision(
-            requested,
-            "pyav",
-            f"GPU already uses {memory.used_mib} MiB (limit {limit_mib} MiB)",
-            memory,
-        )
     return EncodingBackendDecision(
-        requested,
-        "torchcodec",
-        f"GPU uses {memory.used_mib} MiB (below {limit_mib} MiB limit)",
-        memory,
+        requested, "pyav", "TorchCodec needs per-frame PNG staging (lerobot builds image stats from it)"
     )
 
 

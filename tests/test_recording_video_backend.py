@@ -29,14 +29,23 @@ def test_pyav_is_honored_without_gpu_probe():
     assert decision.effective == "pyav"
 
 
-def test_torchcodec_is_preferred_below_five_gib_used():
+def test_torchcodec_is_never_selected_even_when_the_gpu_is_free():
+    """TorchCodec cannot run without staging every frame as a PNG.
+
+    Its encoder reads frames from memory -- which is what made the staging look like waste --
+    but lerobot 0.4.4 computes each episode's image stats by loading those same PNGs back off
+    disk, with no streaming equivalent. Suppressing the writes without the stats knowing kills
+    the episode at save time on a file nothing wrote. So it is gigabytes of PNGs per episode
+    or no TorchCodec, and this repo chose no TorchCodec.
+    """
     decision = select_encoding_backend(
         "torchcodec",
         max_used_vram_gb=5.0,
-        memory_query=lambda: GpuMemory(used_mib=5119, free_mib=20000, total_mib=25119),
+        memory_query=lambda: GpuMemory(used_mib=0, free_mib=25119, total_mib=25119),
         torchcodec_available=lambda: True,
     )
-    assert decision.effective == "torchcodec"
+    assert decision.effective == "pyav"
+    assert "PNG" in decision.reason
 
 
 @pytest.mark.parametrize(
@@ -221,3 +230,47 @@ def test_pyav_without_streaming_refuses_rather_than_writing_pngs(monkeypatch):
         w._suppress_image_staging()
     w._ds._save_image(object(), "/tmp/x.png")
     assert w._ds.saved == ["/tmp/x.png"]  # untouched: it refused instead of half-patching
+
+
+@pytest.mark.parametrize("configured_backend", ["torchcodec", "pyav"])
+def test_a_real_episode_writes_no_png_whatever_the_config_says(tmp_path, configured_backend):
+    """End to end, on disk: record an episode and look for PNGs.
+
+    Every earlier attempt at this checked an intermediate -- that a kwarg was passed, that
+    `_save_image` was patched -- and each time something downstream still staged frames. The
+    last one suppressed the writes but left lerobot recording the paths, so episodes died at
+    save time on files nothing had written. The only check worth keeping asks the filesystem.
+    """
+    import json
+
+    import numpy as np
+
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    cams = {"agentview": (64, 64, 3), "wrist_left": (64, 64, 3)}
+
+    def frame(i):
+        return {
+            "state": np.zeros(42, np.float32),
+            "action": np.zeros(14, np.float32),
+            "leader": np.zeros(12, np.float32),
+            "eef": np.zeros(14, np.float32),
+            "images": {k: np.full(shape, i % 255, np.uint8) for k, shape in cams.items()},
+            "task": "t",
+        }
+
+    cfg = RecorderConfig(repo_id="t/nopng", root=str(tmp_path), mock=False, fps=30,
+                         use_videos=True, encoding_backend=configured_backend)
+    writer = AsyncDatasetWriter(cfg, list(cams), cams)
+    writer.open(frame(0))
+    writer.submit([frame(i) for i in range(15)], "t", "success")
+    writer.finalize()
+
+    dataset = tmp_path / "nopng"
+    assert list(dataset.rglob("*.png")) == []
+    assert not (dataset / "images").exists()
+    # ...and the episode actually saved, rather than "no PNGs" because nothing was written
+    assert len(list(dataset.rglob("*.mp4"))) == len(cams)
+    info = json.loads((dataset / "meta" / "info.json").read_text())
+    assert info["total_episodes"] == 1 and info["total_frames"] == 15
