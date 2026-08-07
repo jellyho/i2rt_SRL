@@ -243,3 +243,58 @@ def test_losing_the_policy_is_reported_once_not_twice():
     lines = _capture(runner, 4.0)
     assert sum("DISCONNECTED" in x for x in lines) == 1, lines
     assert sum("NOT CONNECTED" in x for x in lines) == 0, lines
+
+
+# --------------------------------------------------------------------------------------- #
+# Reachability probe
+# --------------------------------------------------------------------------------------- #
+def _http_server(status=200):
+    """A throwaway HTTP server; returns (port, shutdown)."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(b"OK\n")
+
+        def log_message(self, *_args):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd.server_address[1], httpd.shutdown
+
+
+def test_probe_asks_over_http_so_the_server_logs_no_handshake_failure():
+    """The probe must not look like a broken client to a websocket server.
+
+    Opening a bare TCP connection and closing it reports reachability correctly, but the
+    policy server is a websocket server: a socket that says nothing is a failed opening
+    handshake, and it logs one with a full traceback right before the real connection
+    succeeds -- indistinguishable from a genuine fault. openpi answers /healthz for this.
+    """
+    port, shutdown = _http_server()
+    try:
+        assert _idle_runner(policy_port=port)._policy_port_open() is True
+    finally:
+        shutdown()
+
+
+def test_probe_counts_any_http_answer_as_up():
+    """A server without the /healthz route is still a server."""
+    port, shutdown = _http_server(status=404)
+    try:
+        assert _idle_runner(policy_port=port)._policy_port_open() is True
+    finally:
+        shutdown()
+
+
+def test_probe_reports_down_when_nothing_is_listening():
+    import socket
+
+    with socket.socket() as s:  # bind and close to get a port nothing holds
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    assert _idle_runner(policy_port=port)._policy_port_open() is False

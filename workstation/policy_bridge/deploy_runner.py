@@ -9,9 +9,10 @@ of truth; this runner only sends policy actions while the robot snapshot reports
 from __future__ import annotations
 
 import logging
-import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Callable, Dict, Optional
 
 import numpy as np
@@ -107,9 +108,32 @@ class DeploymentPolicyRunner:
         self._set(robot_connected=True)
 
     def _policy_port_open(self) -> bool:
+        """Is the policy server up? Asked over HTTP, because the alternative is noisy.
+
+        This check has to exist at all because `WebsocketClientPolicy` retries a refused
+        connection forever, five seconds at a time -- calling it against a server that is not
+        up would wedge the control loop instead of reporting the state.
+
+        It used to open a bare TCP connection and close it. That works, but the server is a
+        websocket server: a socket that connects and says nothing is a failed opening
+        handshake, and it logs one with a full traceback --
+
+            ERROR:websockets.server:opening handshake failed
+            EOFError: stream ends after 0 bytes, before end of line
+
+        -- immediately before the real connection succeeds. An operator watching the server
+        cannot tell that apart from a genuine fault. openpi's server answers `/healthz` for
+        exactly this, so ask it properly.
+
+        Any HTTP answer means something is listening and speaking HTTP, so a non-200 (an older
+        server without the route) still counts as up; only a connection-level failure is down.
+        """
+        url = f"http://{self.cfg.policy_host}:{self.cfg.policy_port}/healthz"
         try:
-            with socket.create_connection((self.cfg.policy_host, self.cfg.policy_port), timeout=0.5):
+            with urllib.request.urlopen(url, timeout=1.0):
                 return True
+        except urllib.error.HTTPError:
+            return True
         except OSError:
             return False
 
