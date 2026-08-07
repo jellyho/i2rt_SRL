@@ -38,6 +38,7 @@ class DeploymentPolicyRunner:
         # Seconds between idle reachability probes -- see _probe_policy.
         self._PROBE_PERIOD_S = 2.0
         self._last_probe = -1e9
+        self._last_probe_error = ""
         self._status = {
             "robot_connected": False,
             "policy_connected": False,
@@ -70,8 +71,31 @@ class DeploymentPolicyRunner:
             return dict(self._status)
 
     def _set(self, **kw: object) -> None:
+        """Update the status, announcing the link transitions on the way through.
+
+        Every client -- the GUI, ``--headless``, the sim harness -- watches this same dict, so
+        saying it here says it once for all of them. A periodic status line cannot: it prints
+        "policy idle", which means connected-but-not-running and not-connected-at-all equally
+        well. What an operator needs is the moment it changes.
+        """
         with self._lock:
+            transitions = [
+                (key, was, kw[key])
+                for key, was in ((k, self._status.get(k)) for k in ("robot_connected", "policy_connected"))
+                if key in kw and bool(kw[key]) is not bool(was)
+            ]
             self._status.update(kw)
+            error = str(kw.get("last_error", self._status.get("last_error", "")))
+
+        for key, _was, now in transitions:
+            link = "policy" if key == "policy_connected" else "robot"
+            host, port = ((self.cfg.policy_host, self.cfg.policy_port) if link == "policy"
+                          else (self.cfg.robot_host, self.cfg.robot_port))
+            if now:
+                logger.info("%s CONNECTED at %s:%s", link, host, port)
+            else:
+                logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port,
+                               f" ({error})" if error else "")
 
     def _connect_robot(self) -> None:
         if self.recorder_cfg.mock or self._robot is not None:
@@ -196,8 +220,22 @@ class DeploymentPolicyRunner:
         try:
             self._connect_policy()
             self._set(last_error="")
+            self._last_probe_error = ""
         except Exception as e:
-            self._set(policy_connected=False, last_error=f"{type(e).__name__}: {e}")
+            reason = f"{type(e).__name__}: {e}"
+            # _set only announces a *transition*, and a policy that was never up does not
+            # transition -- so starting with no server at all would say nothing whatsoever.
+            # Report each distinct reason once: enough to see why, without a line every probe.
+            # Stay quiet when _set is about to announce the drop itself, or losing a live
+            # policy would report the same event twice.
+            was_connected = bool(self.get_status().get("policy_connected"))
+            if reason != self._last_probe_error and not was_connected:
+                self._last_probe_error = reason
+                logger.warning(
+                    "policy NOT CONNECTED at %s:%s (%s) — retrying every %.0fs",
+                    self.cfg.policy_host, self.cfg.policy_port, reason, self._PROBE_PERIOD_S,
+                )
+            self._set(policy_connected=False, last_error=reason)
 
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:

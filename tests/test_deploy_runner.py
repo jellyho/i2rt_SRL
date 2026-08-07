@@ -180,3 +180,66 @@ def test_idle_probe_is_throttled():
 
     # 50 Hz for 3 s is ~150 ticks; a 2 s probe period should be 1-3 attempts.
     assert 1 <= len(attempts) <= 3, len(attempts)
+
+
+def _capture(runner, seconds, level="INFO"):
+    """Run the loop for a while, returning the deploy_runner log lines it emitted."""
+    import logging, time
+
+    records = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(f"{record.levelname} {record.getMessage()}")
+
+    log = logging.getLogger("workstation.policy_bridge.deploy_runner")
+    handler, old = Grab(), log.level
+    log.addHandler(handler)
+    log.setLevel(level)
+    try:
+        runner.start()
+        time.sleep(seconds)
+    finally:
+        runner.shutdown()
+        log.removeHandler(handler)
+        log.setLevel(old)
+    return records
+
+
+def test_client_says_it_cannot_reach_the_policy_at_startup():
+    """Silence is the wrong answer to "did I connect?".
+
+    Transitions alone cannot cover this: a policy that was never up never transitions, so a
+    client started before its server would print nothing at all about the link.
+    """
+    lines = [x for x in _capture(_idle_runner(), 3.0) if "policy" in x]
+    assert any("NOT CONNECTED" in x and "59998" in x for x in lines), lines
+    # ...and does not repeat the same reason on every probe
+    assert sum("NOT CONNECTED" in x for x in lines) == 1, lines
+
+
+def test_client_announces_the_policy_link_coming_up():
+    runner = _idle_runner()
+    runner._connect_policy = lambda: (setattr(runner, "_policy", object()),
+                                      runner._set(policy_connected=True))
+    lines = _capture(runner, 1.0)
+    assert any("policy CONNECTED" in x and "59998" in x for x in lines), lines
+
+
+def test_losing_the_policy_is_reported_once_not_twice():
+    """The probe and the transition describe the same event; only one should speak."""
+    import time
+
+    runner = _idle_runner()
+    runner._connect_policy = lambda: (setattr(runner, "_policy", object()),
+                                      runner._set(policy_connected=True))
+
+    def drop():
+        runner._policy = None
+        runner._connect_policy = lambda: (_ for _ in ()).throw(ConnectionError("gone"))
+
+    import threading
+    threading.Timer(1.0, drop).start()
+    lines = _capture(runner, 4.0)
+    assert sum("DISCONNECTED" in x for x in lines) == 1, lines
+    assert sum("NOT CONNECTED" in x for x in lines) == 0, lines

@@ -96,7 +96,10 @@ def run_headless(
                 logger.info(
                     "state=%s policy=%s%s robot=%s cameras=%s%s",
                     st.get("dagger_state", "?"),
-                    "streaming" if rs.get("streaming") else "idle",
+                    # "idle" alone cannot tell connected-but-not-running from unreachable,
+                    # which is the one thing you check before starting a rollout.
+                    "streaming" if rs.get("streaming")
+                    else ("connected/idle" if rs.get("policy_connected") else "NOT CONNECTED"),
                     " (intervention)" if st.get("intervention") else "",
                     "up" if st.get("robot_ok") else "DOWN",
                     "ok" if st.get("cam_ok") else "FAULT",
