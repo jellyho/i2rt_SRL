@@ -145,6 +145,12 @@ class RecorderConfig:
     expected_robot_mode: str = ""
     resume: bool = False  # append to an existing dataset at `root` instead of creating a new one
     min_free_gb: float = 1.0  # refuse to save an episode when free disk drops below this
+    # An episode is buffered whole in RAM before it is handed to the writer, and at
+    # 640x480x3 on three cameras that is ~2.8 MB per frame -- roughly 7 GB for a 40 s
+    # episode. Past this much free memory the recorder ENDS the episode and saves it,
+    # because the alternative is the OOM killer taking the process mid-write and leaving
+    # a dataset that will not open. 0 disables the check.
+    min_free_ram_gb: float = 3.0
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)
     review_before_save: bool = True  # hold each episode for Keep/Delete instead of auto-saving
     auto_arm: bool = False  # arm collection automatically on Start (record on the next teleop engage)

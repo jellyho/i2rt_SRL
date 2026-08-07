@@ -84,6 +84,7 @@ class Recorder:
             "recenter_fault": False,
             "homing": False,
             "estop": False,
+            "low_ram": False,
         }
         self._last_images: dict = {}
         self._pending = False
@@ -106,6 +107,8 @@ class Recorder:
         # and no frames are buffered. Cameras, robot link, live view, e-stop and human
         # takeover are unchanged, so this is the recorder minus the dataset.
         self._deploy = cfg.record_source == "deploy"
+        self._ram_check_countdown = 0
+        self._ram_stopped = False
 
     # ------------------------------------------------------------------ control
     def start(self) -> None:
@@ -403,6 +406,71 @@ class Recorder:
         with self._lock:
             return list(self._preview)
 
+
+    # ------------------------------------------------------------------ memory guard
+    @staticmethod
+    def available_ram_gb() -> float:
+        """MemAvailable from /proc, i.e. what can be allocated without swapping hard.
+
+        Deliberately not psutil: this runs inside the record loop and must not add a
+        dependency or a surprise import cost. inf when the file is unreadable, so a
+        platform without it simply keeps the old behaviour."""
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1e6  # kB -> GB
+        except Exception:
+            pass
+        return float("inf")
+
+    def _ram_ok(self) -> bool:
+        """Check free memory every ~1 s of recording; True while there is room to continue.
+
+        The buffered episode is the biggest allocation in the process, so it is the thing
+        that gets the recorder OOM-killed -- and being killed mid-write is what leaves a
+        half-written parquet the dataset cannot open. Ending the episode early keeps the
+        frames recorded so far."""
+        limit = float(getattr(self.cfg, "min_free_ram_gb", 0.0) or 0.0)
+        if limit <= 0:
+            return True
+        self._ram_check_countdown -= 1
+        if self._ram_check_countdown > 0:
+            return True
+        self._ram_check_countdown = max(1, int(self.cfg.fps))
+        free = self.available_ram_gb()
+        if free >= limit:
+            return True
+        logger.error(
+            "LOW MEMORY: %.1f GB available (< %.1f GB) after %d frames (~%.1f GB buffered) — "
+            "ending this episode now and saving it. The OOM killer would otherwise stop the "
+            "recorder mid-write and leave a dataset that cannot be opened. Record shorter "
+            "episodes, or raise recorder.min_free_ram_gb if this is too eager.",
+            free, limit, len(self._episode), self._buffered_gb(),
+        )
+        return False
+
+    def _buffered_gb(self) -> float:
+        """Rough size of the in-RAM episode, for the log line that explains the stop."""
+        if not self._episode:
+            return 0.0
+        first = self._episode[0]
+        per_frame = sum(getattr(v, "nbytes", 0) for v in first.get("images", {}).values())
+        per_frame += sum(getattr(v, "nbytes", 0) for k, v in first.items() if k != "images")
+        return len(self._episode) * per_frame / 1e9
+
+    def _stop_for_memory(self) -> None:
+        """End the in-flight episode the same way a normal stop would, and disarm."""
+        self._ram_stopped = True
+        with self._lock:
+            self._status["low_ram"] = True
+        if self._episode:
+            self._submit(self._btn_outcome)
+        else:
+            self._discard_episode()
+        self.gate.disarm()
+        self._set(armed=False, recording=False, pending=False)
+
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
         # cameras.read() is now non-blocking (the CameraManager grabs on its own thread),
@@ -480,6 +548,9 @@ class Recorder:
             ):
                 self._episode.append(self._frame(images, snap))
                 self._buffer_preview(images)
+                if not self._ram_ok():
+                    self._stop_for_memory()
+                    return
             self._set(
                 armed=self.gate.armed,
                 recording=self.gate.armed and not recording_paused,
@@ -526,6 +597,9 @@ class Recorder:
             ):
                 self._episode.append(self._frame(images, snap))
                 self._buffer_preview(images)
+                if not self._ram_ok():
+                    self._stop_for_memory()
+                    return
 
         if event == eg.EV_STOP:
             if not self._episode:

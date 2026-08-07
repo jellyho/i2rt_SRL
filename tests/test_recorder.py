@@ -615,3 +615,58 @@ def test_older_robot_reporting_the_pre_rename_mode_is_accepted(tmp_path, monkeyp
     monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "dagger"))
     rec.start()  # must not raise
     rec.shutdown()
+
+
+# --------------------------------------------------------------- memory guard
+def test_low_memory_ends_the_episode_and_saves_it(tmp_path, monkeypatch):
+    """Being OOM-killed mid-write is what leaves a half-written parquet the dataset cannot
+    open, so the recorder has to stop itself first -- keeping the frames recorded so far."""
+    cfg = RecorderConfig(repo_id="test/ram", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False, min_free_ram_gb=1000.0)
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    t0 = time.time()
+    while time.time() - t0 < 10 and not rec.get_status().get("low_ram"):
+        time.sleep(0.05)
+    st = rec.get_status()
+    rec.shutdown()
+
+    assert st["low_ram"] is True, "the guard never fired"
+    assert st["armed"] is False and st["recording"] is False
+    assert rec.writer.num_episodes >= 1, "the buffered frames must be saved, not dropped"
+    assert (tmp_path / "ram" / "outcomes.jsonl").exists()
+
+
+def test_guard_is_off_when_the_threshold_is_zero(tmp_path):
+    cfg = RecorderConfig(repo_id="test/ramoff", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False, min_free_ram_gb=0.0)
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(0.6)
+    st = rec.get_status()
+    rec.disarm()
+    rec.shutdown()
+    assert st["low_ram"] is False and st["recording"] is True
+
+
+def test_available_ram_is_read_from_proc(tmp_path):
+    """A plausible number, and inf rather than a crash where /proc/meminfo is absent."""
+    free = Recorder.available_ram_gb()
+    assert free > 0
+    if free != float("inf"):
+        assert free < 10_000
+
+
+def test_guard_does_not_fire_with_ample_memory(tmp_path):
+    cfg = RecorderConfig(repo_id="test/ramok", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False, min_free_ram_gb=0.001)
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(0.6)
+    st = rec.get_status()
+    rec.disarm()
+    rec.shutdown()
+    assert st["low_ram"] is False

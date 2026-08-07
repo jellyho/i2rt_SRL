@@ -147,3 +147,59 @@ def test_torchcodec_encoder_writes_decodable_video(tmp_path):
 
     with av.open(str(output)) as container:
         assert sum(1 for _ in container.decode(video=0)) == len(frames)
+
+
+# ------------------------------------------------------------- PNG staging removal
+class _StubDataset:
+    """Enough of LeRobotDataset for the staging check."""
+
+    def __init__(self, streaming=False):
+        self._streaming_encoder = object() if streaming else None
+        self.saved = []
+
+    def _save_image(self, img, path, compress_level=1):
+        self.saved.append(path)
+
+
+def _writer(monkeypatch, backend: str, streaming: bool):
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+    from workstation.lerobot_recorder import dataset_writer as dw
+    from workstation.lerobot_recorder.video_encoding import EncodingBackendDecision
+
+    monkeypatch.setattr(
+        dw, "select_encoding_backend",
+        lambda *a, **k: EncodingBackendDecision("torchcodec", backend, "test"),
+    )
+    cfg = RecorderConfig(mock=False, streaming_encoding=streaming)
+    w = AsyncDatasetWriter(cfg, ["cam"], {"cam": (480, 640, 3)})
+    w._ds = _StubDataset(streaming=streaming)
+    return w
+
+
+def test_torchcodec_writes_no_pngs(monkeypatch):
+    """TorchCodec reads frames from memory, so staging them is pure waste -- 3.4 GB an
+    episode of files nothing opens."""
+    w = _writer(monkeypatch, "torchcodec", streaming=False)
+    w._suppress_image_staging()
+    w._ds._save_image(object(), "/tmp/x.png")
+    assert w._ds.saved == []
+    assert w._skipped_images == 1
+
+
+def test_streaming_pyav_writes_no_pngs(monkeypatch):
+    w = _writer(monkeypatch, "pyav", streaming=True)
+    w._suppress_image_staging()
+    w._ds._save_image(object(), "/tmp/x.png")
+    assert w._ds.saved == []
+
+
+def test_pyav_without_streaming_keeps_staging_and_says_why(monkeypatch, caplog):
+    """That encoder reads the PNGs off disk, so removing them would break encoding --
+    leave them and explain, rather than silently produce empty videos."""
+    w = _writer(monkeypatch, "pyav", streaming=False)
+    with caplog.at_level("ERROR"):
+        w._suppress_image_staging()
+    w._ds._save_image(object(), "/tmp/x.png")
+    assert w._ds.saved == ["/tmp/x.png"]
+    assert "streaming_encoding" in caplog.text

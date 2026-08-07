@@ -280,6 +280,52 @@ class AsyncDatasetWriter:
 
         self._ds._encode_temporary_episode_video = MethodType(encode_episode, self._ds)
 
+    def _suppress_image_staging(self) -> None:
+        """Stop LeRobot staging every video frame to disk as a PNG.
+
+        `add_frame` writes one PNG per frame per camera unless a streaming encoder is
+        installed — ~1.5 MB a frame, so a 2300-frame episode wrote 9741 files and 3.4 GB in
+        the middle of the record loop. Neither encoder we actually run reads them:
+
+          * TorchCodec is batch-only, so `streaming_encoding` is not passed to LeRobot and
+            the frames come from `_active_episode_frames` in memory instead;
+          * PyAV with `streaming_encoding` feeds the encoder directly as frames arrive.
+
+        The one path that genuinely needs the PNGs is PyAV with streaming *off*, whose
+        encoder reads the staging directory. That is no longer a configuration worth
+        supporting silently: `StreamingVideoEncoder` ships in stock lerobot 0.4.4, so
+        streaming is always available. If we somehow land there, staging is left alone and
+        the reason is logged, rather than quietly writing gigabytes.
+
+        Safe elsewhere because neither place LeRobot removes the directory needs it to
+        exist: the rmtree after encoding lives inside the PyAV encoder (not called under
+        TorchCodec, and not reached when streaming), and `clear_episode_buffer` guards its
+        own with `is_dir()`.
+        """
+        ds = self._ds
+        if ds is None or not hasattr(ds, "_save_image"):
+            return
+        streaming = getattr(ds, "_streaming_encoder", None) is not None
+        torchcodec = self._encoding_decision.effective == "torchcodec"
+        if not (streaming or torchcodec):
+            logger.error(
+                "PyAV without streaming_encoding: LeRobot will stage every frame as a PNG "
+                "(~1.5 MB each) because that encoder reads them off disk. Set "
+                "recorder.streaming_encoding: true to avoid it."
+            )
+            return
+
+        self._skipped_images = 0
+
+        def _skip(_self, *_args, **_kwargs) -> None:
+            self._skipped_images += 1
+
+        ds._save_image = MethodType(_skip, ds)
+        logger.info(
+            "per-frame PNG staging disabled (%s reads frames directly)",
+            "TorchCodec" if torchcodec else "the streaming encoder",
+        )
+
     def _encode_torchcodec_episode(self, video_key: str, episode_index: int) -> Path:
         frames = self._active_episode_frames
         if frames is None:
@@ -581,6 +627,7 @@ class AsyncDatasetWriter:
                     self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
             self._configure_torchcodec_encoder()
+            self._suppress_image_staging()
         else:
             if self.cfg.resume:
                 self._n_episodes = self._existing_outcome_count()
