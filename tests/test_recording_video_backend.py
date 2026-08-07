@@ -72,7 +72,6 @@ def test_torchcodec_disables_streaming_and_batching(monkeypatch, tmp_path):
         root=str(tmp_path),
         mock=False,
         encoding_backend="torchcodec",
-        streaming_encoding=True,
         batch_encoding_size=4,
     )
     writer = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (8, 8, 3)})
@@ -93,7 +92,6 @@ def test_vram_fallback_uses_cpu_h264_for_auto_codec(monkeypatch, tmp_path):
         mock=False,
         encoding_backend="torchcodec",
         vcodec="auto",
-        streaming_encoding=True,
     )
     writer = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (8, 8, 3)})
     kwargs = writer._dataset_encoding_kwargs()
@@ -171,7 +169,7 @@ def _writer(monkeypatch, backend: str, streaming: bool):
         dw, "select_encoding_backend",
         lambda *a, **k: EncodingBackendDecision("torchcodec", backend, "test"),
     )
-    cfg = RecorderConfig(mock=False, streaming_encoding=streaming)
+    cfg = RecorderConfig(mock=False)
     w = AsyncDatasetWriter(cfg, ["cam"], {"cam": (480, 640, 3)})
     w._ds = _StubDataset(streaming=streaming)
     return w
@@ -194,12 +192,32 @@ def test_streaming_pyav_writes_no_pngs(monkeypatch):
     assert w._ds.saved == []
 
 
-def test_pyav_without_streaming_keeps_staging_and_says_why(monkeypatch, caplog):
-    """That encoder reads the PNGs off disk, so removing them would break encoding --
-    leave them and explain, rather than silently produce empty videos."""
+def test_pyav_always_streams_so_png_staging_cannot_be_configured(monkeypatch, tmp_path):
+    """The PNG path is not a setting any more.
+
+    Staging every frame of every camera as a ~1.5 MB PNG used to be one config key away
+    (recorder.streaming_encoding, defaulting to OFF), and a deploy run that landed there left
+    7926 files and 2.7 GB behind. PyAV now always gets streaming_encoding."""
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+    from workstation.lerobot_recorder import dataset_writer as dw
+    from workstation.lerobot_recorder.video_encoding import EncodingBackendDecision
+
+    assert not hasattr(RecorderConfig(), "streaming_encoding"), "the knob is gone on purpose"
+    monkeypatch.setattr(
+        dw, "select_encoding_backend",
+        lambda *a, **k: EncodingBackendDecision("pyav", "pyav", "test"),
+    )
+    cfg = RecorderConfig(mock=False, repo_id="t/x", root=str(tmp_path))
+    w = AsyncDatasetWriter(cfg, ["cam"], {"cam": (480, 640, 3)})
+    assert w._dataset_encoding_kwargs()["streaming_encoding"] is True
+
+
+def test_pyav_without_streaming_refuses_rather_than_writing_pngs(monkeypatch):
+    """Unreachable via config now, so reaching it means lerobot dropped the kwarg. Filling
+    the disk mid-episode is worse than refusing to start."""
     w = _writer(monkeypatch, "pyav", streaming=False)
-    with caplog.at_level("ERROR"):
+    with pytest.raises(RuntimeError, match="PNG"):
         w._suppress_image_staging()
     w._ds._save_image(object(), "/tmp/x.png")
-    assert w._ds.saved == ["/tmp/x.png"]
-    assert "streaming_encoding" in caplog.text
+    assert w._ds.saved == ["/tmp/x.png"]  # untouched: it refused instead of half-patching

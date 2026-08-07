@@ -132,7 +132,6 @@ recorder:
   vcodec: auto               # auto = GPU h264_nvenc here (fastest) | h264 (CPU, reliable) | libsvtav1 (slow AV1)
   # PyAV can encode continuously during capture. TorchCodec 0.10 is batch-only, so
   # this is automatically disabled when TorchCodec is selected.
-  streaming_encoding: true
   # FALLBACK path only (streaming off / stock lerobot) — the knobs below are INERT
   # while streaming_encoding is true; they're kept at sensible values for the fallback:
   encoder_threads: 0         # CPU threads per encode; GPU nvenc ignores this (0 = codec default)

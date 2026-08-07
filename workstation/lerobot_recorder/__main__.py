@@ -13,7 +13,7 @@ import sys
 from typing import List, Optional
 
 from i2rt.serving.rig_config import Resolver, apply_camera_serials, load_rig, teleop_button_outcomes
-from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
+from workstation.lerobot_recorder.config import RecorderConfig, apply_recorder_section, default_cameras
 
 
 def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
@@ -96,28 +96,7 @@ def build_config(argv: Optional[List[str]] = None) -> RecorderConfig:
     )
     cfg.button_map = teleop_button_outcomes(rig)
     cfg.expected_robot_mode = "teleop"  # the engage gate only exists in the teleop controller
-    # output format: "lerobot" (default) or "abcdl" (abcdl MP4+binary training cache)
-    cfg.record_format = str(rec_section.get("format", rec_section.get("record_format", cfg.record_format)))
-    cfg.abcdl_size = int(rec_section.get("abcdl_size", cfg.abcdl_size))
-    # per-frame RL signals (success / reward / mc_return)
-    cfg.rl_features = bool(rec_section.get("rl_features", cfg.rl_features))
-    cfg.reward_mode = str(rec_section.get("reward_mode", cfg.reward_mode))
-    cfg.discount_factor = float(rec_section.get("discount_factor", cfg.discount_factor))
-    # video-encoding knobs (saving speed): config.yaml recorder.* overrides the defaults
-    cfg.use_videos = bool(rec_section.get("use_videos", cfg.use_videos))
-    cfg.vcodec = str(rec_section.get("vcodec", cfg.vcodec))
-    cfg.encoding_backend = str(rec_section.get("encoding_backend", cfg.encoding_backend))
-    cfg.torchcodec_max_used_vram_gb = float(
-        rec_section.get("torchcodec_max_used_vram_gb", cfg.torchcodec_max_used_vram_gb)
-    )
-    cfg.encoder_threads = int(rec_section.get("encoder_threads", cfg.encoder_threads))
-    cfg.batch_encoding_size = int(rec_section.get("batch_encoding_size", cfg.batch_encoding_size))
-    cfg.image_writer_threads = int(rec_section.get("image_writer_threads", cfg.image_writer_threads))
-    cfg.image_writer_processes = int(rec_section.get("image_writer_processes", cfg.image_writer_processes))
-    cfg.streaming_encoding = bool(rec_section.get("streaming_encoding", cfg.streaming_encoding))
-    cfg.reference_live_alpha = min(
-        max(float(rec_section.get("reference_live_alpha", cfg.reference_live_alpha)), 0.0), 1.0
-    )
+    apply_recorder_section(cfg, rec_section)
     return cfg
 
 

@@ -18,7 +18,7 @@ import sys
 from typing import List, Optional, Tuple
 
 from i2rt.serving.rig_config import Resolver, apply_camera_serials, load_rig
-from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
+from workstation.lerobot_recorder.config import RecorderConfig, apply_recorder_section, default_cameras
 from workstation.lerobot_recorder.deploy_gui import DeployGUI
 from workstation.policy_bridge.config import BridgeConfig
 
@@ -124,24 +124,7 @@ def build_configs(
         review_before_save=review_before_save,
         auto_arm=auto_arm,
     )
-    recorder_cfg.use_videos = bool(rec_section.get("use_videos", recorder_cfg.use_videos))
-    recorder_cfg.vcodec = str(rec_section.get("vcodec", recorder_cfg.vcodec))
-    recorder_cfg.encoding_backend = str(rec_section.get("encoding_backend", recorder_cfg.encoding_backend))
-    recorder_cfg.torchcodec_max_used_vram_gb = float(
-        rec_section.get("torchcodec_max_used_vram_gb", recorder_cfg.torchcodec_max_used_vram_gb)
-    )
-    recorder_cfg.encoder_threads = int(rec_section.get("encoder_threads", recorder_cfg.encoder_threads))
-    recorder_cfg.batch_encoding_size = int(rec_section.get("batch_encoding_size", recorder_cfg.batch_encoding_size))
-    recorder_cfg.image_writer_threads = int(rec_section.get("image_writer_threads", recorder_cfg.image_writer_threads))
-    recorder_cfg.image_writer_processes = int(
-        rec_section.get("image_writer_processes", recorder_cfg.image_writer_processes)
-    )
-    recorder_cfg.streaming_encoding = bool(
-        rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
-    )
-    recorder_cfg.reference_live_alpha = min(
-        max(float(rec_section.get("reference_live_alpha", recorder_cfg.reference_live_alpha)), 0.0), 1.0
-    )
+    apply_recorder_section(recorder_cfg, rec_section)
     recorder_cfg.expected_robot_mode = "deploy"  # only that controller accepts policy actions
 
     bridge_cfg = BridgeConfig(

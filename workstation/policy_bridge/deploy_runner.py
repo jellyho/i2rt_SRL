@@ -35,11 +35,16 @@ class DeploymentPolicyRunner:
         self._image_shape = (cfg.image_size, cfg.image_size)
         self._was_streaming = False
         self._lock = threading.Lock()
+        # Seconds between idle reachability probes -- see _probe_policy.
+        self._PROBE_PERIOD_S = 2.0
+        self._last_probe = -1e9
         self._status = {
             "robot_connected": False,
             "policy_connected": False,
             "streaming": False,
-            "last_error": "",
+            # Not "" -- an empty error next to a red dot reads as "no problem", when what it
+            # really means is that nothing has been tried yet.
+            "last_error": "connecting…",
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
@@ -149,8 +154,9 @@ class DeploymentPolicyRunner:
                     else:
                         if self._was_streaming:
                             self._reset_policy_chunk()
-                        self._set(streaming=False, last_error="")
+                        self._set(streaming=False)
                         self._was_streaming = False
+                        self._probe_policy()
             except Exception as e:
                 self._set(streaming=False, last_error=f"{type(e).__name__}: {e}")
                 self._was_streaming = False
@@ -166,6 +172,32 @@ class DeploymentPolicyRunner:
             remaining = period - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
+
+    def _probe_policy(self) -> None:
+        """Connect to the policy while idle, so the UI can say whether it is there.
+
+        The connection used to be made only inside the streaming branch, which needs the robot
+        to already be running a rollout. Before that, `policy_connected` sat at its initial
+        False with `last_error` at its initial "" -- a red dot next to "policy idle" and no
+        reason given. Worse, the GUI refuses to start a rollout unless the policy is connected,
+        so nothing could ever connect it: the only path to connected ran through a rollout that
+        could not be started. Probing while idle is what breaks that circle.
+
+        Throttled, because the probe is a real websocket round-trip (`get_server_metadata`) and
+        the loop runs at the control rate -- retrying every tick would hammer a server that is
+        still loading its checkpoint.
+        """
+        if self._policy is not None:
+            return
+        now = time.monotonic()
+        if now - self._last_probe < self._PROBE_PERIOD_S:
+            return
+        self._last_probe = now
+        try:
+            self._connect_policy()
+            self._set(last_error="")
+        except Exception as e:
+            self._set(policy_connected=False, last_error=f"{type(e).__name__}: {e}")
 
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:

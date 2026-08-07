@@ -205,18 +205,14 @@ def test_status_reports_dataset_outcome_totals_across_sessions(tmp_path):
         rec2.shutdown()
 
 
-def test_streaming_encoding_kwarg_flows_to_writer(tmp_path):
+def test_streaming_encoding_reaches_the_writer_without_being_asked_for(tmp_path):
+    """Both the create and the resume path stream, with nothing set in the config."""
     from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
 
-    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=True, streaming_encoding=True)
+    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=True)
     w = AsyncDatasetWriter(cfg, [], {})
     assert w._create_encoding_kwargs().get("streaming_encoding") is True
     assert w._dataset_encoding_kwargs().get("streaming_encoding") is True  # resume path too
-
-    cfg_off = RecorderConfig(repo_id="t/nostream", root=str(tmp_path), mock=True)
-    w_off = AsyncDatasetWriter(cfg_off, [], {})
-    # omitted when disabled so stock lerobot builds (without the kwarg) keep working
-    assert "streaming_encoding" not in w_off._create_encoding_kwargs()
 
 
 def test_control_mode_in_frame():

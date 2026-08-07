@@ -95,3 +95,88 @@ def test_image_keys_from_server_metadata_win():
     runner.cfg.image_keys = {"agentview": "observation/exterior_image_1_left"}
     obs = runner._build_obs(_robot_obs(), {"agentview": np.ones((240, 320, 3), np.uint8)})
     assert "observation/exterior_image_1_left" in obs
+
+
+# --------------------------------------------------------------------------------------- #
+# Reporting whether the policy is reachable, before anything is running
+# --------------------------------------------------------------------------------------- #
+def _idle_runner(policy_port=59998):
+    """A runner whose robot is up and idle: connected, but not running a rollout."""
+    import types
+
+    cfg = BridgeConfig(robot_host="127.0.0.1", robot_port=59999,
+                       policy_host="127.0.0.1", policy_port=policy_port, rate_hz=50)
+    rec = RecorderConfig(mock=False)
+    runner = DeploymentPolicyRunner(cfg, rec, lambda: {})
+    runner._connect_robot = lambda: runner._set(robot_connected=True)
+    runner._robot = types.SimpleNamespace(get_observation=lambda: {
+        "policy_running": False, "intervention": False, "homing": False, "estop": False})
+    return runner
+
+
+def test_idle_status_says_connecting_not_nothing():
+    """A red dot with an empty reason reads as 'fine', when it means 'not tried yet'."""
+    assert _idle_runner().get_status()["last_error"] == "connecting…"
+
+
+def test_policy_state_is_reported_without_starting_a_rollout():
+    """The reason a policy is unreachable has to show up while idle.
+
+    The connection used to be attempted only inside the streaming branch, which needs a
+    rollout already running. So before starting one the UI showed a red dot next to
+    "policy idle" with no message at all -- and since the GUI refuses to start a rollout
+    unless the policy is connected, the only path to connected ran through a rollout that
+    could not be started.
+    """
+    import time
+
+    runner = _idle_runner()
+    runner.start()
+    try:
+        time.sleep(2.5)  # one probe period plus slack
+        status = runner.get_status()
+    finally:
+        runner.shutdown()
+
+    assert status["policy_connected"] is False
+    assert status["streaming"] is False
+    assert "59998" in status["last_error"], status["last_error"]
+
+
+def test_idle_probe_connects_so_the_gui_guard_can_pass():
+    import time
+
+    runner = _idle_runner()
+    runner._connect_policy = lambda: (setattr(runner, "_policy", object()),
+                                      runner._set(policy_connected=True))
+    runner.start()
+    try:
+        time.sleep(1.0)
+        status = runner.get_status()
+    finally:
+        runner.shutdown()
+
+    assert status["policy_connected"] is True
+    assert status["last_error"] == ""
+
+
+def test_idle_probe_is_throttled():
+    """The probe is a real websocket round-trip, and the loop runs at the control rate."""
+    import time
+
+    runner = _idle_runner()
+    attempts = []
+
+    def fail():
+        attempts.append(time.monotonic())
+        raise ConnectionError("offline")
+
+    runner._connect_policy = fail
+    runner.start()
+    try:
+        time.sleep(3.0)
+    finally:
+        runner.shutdown()
+
+    # 50 Hz for 3 s is ~150 ticks; a 2 s probe period should be 1-3 attempts.
+    assert 1 <= len(attempts) <= 3, len(attempts)

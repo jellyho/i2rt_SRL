@@ -146,6 +146,8 @@ def test_async_writer_resume_preserves_encoding_kwargs(tmp_path, monkeypatch):
                 "vcodec": "auto",
                 "batch_encoding_size": 4,
                 "encoder_threads": 2,
+                # Always, under PyAV: the alternative stages every frame as a PNG.
+                "streaming_encoding": True,
             },
         )
     ]

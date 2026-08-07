@@ -250,9 +250,14 @@ class AsyncDatasetWriter:
         }
         if int(self.cfg.encoder_threads) > 0:
             enc["encoder_threads"] = int(self.cfg.encoder_threads)
-        # Direct-to-encoder streaming (no temp-PNG round-trip). Only passed when
-        # enabled so stock lerobot builds without the kwarg keep working.
-        if bool(getattr(self.cfg, "streaming_encoding", False)) and not torchcodec:
+        # Direct-to-encoder streaming, always, whenever PyAV is the encoder. This used to be
+        # opt-in via recorder.streaming_encoding, defaulting to off -- and off is the one
+        # configuration where LeRobot stages every frame of every camera as a ~1.5 MB PNG,
+        # because that is how the non-streaming PyAV encoder gets its input. One deploy run
+        # left 7926 PNGs and 2.7 GB behind that way. There is no reason to let a config key
+        # choose that: StreamingVideoEncoder ships in stock lerobot 0.4.4, so the fast path
+        # is always available, and _suppress_image_staging can then hold unconditionally.
+        if not torchcodec:
             enc["streaming_encoding"] = True
         return enc
 
@@ -292,10 +297,10 @@ class AsyncDatasetWriter:
           * PyAV with `streaming_encoding` feeds the encoder directly as frames arrive.
 
         The one path that genuinely needs the PNGs is PyAV with streaming *off*, whose
-        encoder reads the staging directory. That is no longer a configuration worth
-        supporting silently: `StreamingVideoEncoder` ships in stock lerobot 0.4.4, so
-        streaming is always available. If we somehow land there, staging is left alone and
-        the reason is logged, rather than quietly writing gigabytes.
+        encoder reads the staging directory. `_dataset_encoding_kwargs` no longer produces
+        that combination -- streaming is forced on whenever PyAV is the encoder -- so this
+        raises instead of proceeding. Reaching it would mean LeRobot silently dropped the
+        kwarg, and writing gigabytes of PNGs mid-episode is worse than refusing to start.
 
         Safe elsewhere because neither place LeRobot removes the directory needs it to
         exist: the rmtree after encoding lives inside the PyAV encoder (not called under
@@ -308,12 +313,12 @@ class AsyncDatasetWriter:
         streaming = getattr(ds, "_streaming_encoder", None) is not None
         torchcodec = self._encoding_decision.effective == "torchcodec"
         if not (streaming or torchcodec):
-            logger.error(
-                "PyAV without streaming_encoding: LeRobot will stage every frame as a PNG "
-                "(~1.5 MB each) because that encoder reads them off disk. Set "
-                "recorder.streaming_encoding: true to avoid it."
+            raise RuntimeError(
+                "PyAV encoder has no streaming encoder installed, so LeRobot would stage every "
+                "frame of every camera as a ~1.5 MB PNG. This build passes streaming_encoding "
+                "unconditionally under PyAV, so reaching here means lerobot ignored it — refusing "
+                "to record rather than filling the disk mid-episode."
             )
-            return
 
         self._skipped_images = 0
 
@@ -518,10 +523,6 @@ class AsyncDatasetWriter:
             self._effective_vcodec,
             self._encoding_decision.reason,
         )
-        if self._encoding_decision.effective == "torchcodec" and bool(
-            getattr(self.cfg, "streaming_encoding", False)
-        ):
-            logger.warning("TorchCodec 0.10 is batch-only; recorder.streaming_encoding is disabled")
         if self._abcdl:
             os.makedirs(self._root, exist_ok=True)
             if self.cfg.resume and os.path.isdir(self._root):
@@ -944,13 +945,10 @@ class AsyncDatasetWriter:
     def _encoder_remedy(self) -> str:
         """What to change in config.yaml when an encoder keeps dropping frames.
 
-        The advice depends on which backend actually encoded: telling someone to turn off
-        ``streaming_encoding`` is useless under TorchCodec, which is batch-only and already
-        disables it."""
+        The advice depends on which backend actually encoded. It never suggests turning
+        streaming off: that is the PNG-staging path, which no longer exists."""
         if self._encoding_decision.effective == "torchcodec":
             return "try recorder.encoding_backend: pyav in config.yaml."
-        if bool(getattr(self.cfg, "streaming_encoding", False)):
-            return "set recorder.streaming_encoding: false or recorder.vcodec: h264 in config.yaml."
         return "set recorder.vcodec: h264 in config.yaml (CPU encode; slower but reliable)."
 
     def _save_episode_abcdl(self, frames: List[dict], task: str, ep_index: int,
