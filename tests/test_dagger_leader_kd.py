@@ -315,3 +315,100 @@ def test_mirror_state_defaults_from_mirror_kp_and_is_reported(monkeypatch):
                        base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
     assert ctl.DeployController(ctl.DeployConfig(mirror_kp=0.0))._leader_mirror is False
+
+
+# --------------------------------------------------- gripper closed before a rollout
+def _stateful(dc, gripper=0.6):
+    """Make the stub followers remember what they were commanded.
+
+    The default StubFollower always reports zeros, i.e. a gripper that is already shut --
+    which would make every assertion below pass for the wrong reason.
+    """
+    for pair in dc.pairs.values():
+        f = pair.follower
+        f._q = np.zeros(f.n)
+        f._q[-1] = gripper
+        f.get_joint_pos = lambda _f=f: _f._q.copy()
+        f.command_joint_pos = lambda pos, _f=f: _f._q.__setitem__(slice(None), np.asarray(pos, float))
+    return dc
+
+
+def test_rollout_waits_for_the_gripper_to_close(monkeypatch):
+    """Every recorded episode starts with the gripper shut, so a rollout that begins on an
+    open one hands the policy a first observation it never saw in training."""
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+
+    dc.set_policy_running(True)
+    assert dc._closing_grip is True
+    assert dc._policy_running is False, "the policy must not drive until the gripper is shut"
+
+    for _ in range(500):
+        dc.step()
+        if not dc._closing_grip:
+            break
+    assert dc._closing_grip is False
+    assert dc._policy_running is True
+    for pair in dc.pairs.values():
+        assert abs(float(pair.follower.get_joint_pos()[-1]) - dc.home_grip) < 0.05
+
+
+def test_already_closed_gripper_starts_immediately(monkeypatch):
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.0)
+    dc.set_policy_running(True)
+    assert dc._closing_grip is False
+    assert dc._policy_running is True
+
+
+def test_closing_only_moves_the_gripper(monkeypatch):
+    """The arm must not swing while the gripper shuts."""
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    for pair in dc.pairs.values():  # put the arm somewhere non-zero
+        pair.follower._q[:-1] = np.linspace(0.1, 0.6, pair.follower.n - 1)
+    before = {s: p.follower.get_joint_pos()[:-1].copy() for s, p in dc.pairs.items()}
+
+    dc.set_policy_running(True)
+    for _ in range(500):
+        dc.step()
+        if not dc._closing_grip:
+            break
+    for side, pair in dc.pairs.items():
+        np.testing.assert_allclose(pair.follower.get_joint_pos()[:-1], before[side], atol=1e-6)
+
+
+def test_reported_state_says_it_is_closing(monkeypatch):
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    dc.set_policy_running(True)
+    dc.step()
+    assert dc.snapshot()["dagger_state"] == "closing_gripper"
+
+
+def test_stop_cancels_a_pending_close(monkeypatch):
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    dc.set_policy_running(True)
+    assert dc._closing_grip is True
+    dc.set_policy_running(False)
+    assert dc._closing_grip is False
+    assert dc._policy_running is False
+
+
+def test_blocked_gripper_starts_anyway_after_the_timeout(monkeypatch):
+    """A gripper on an object never reaches home; refusing to start would leave the
+    operator pressing a button that does nothing."""
+    from i2rt.serving import controllers as ctl
+
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    dc.set_policy_running(True)
+    assert dc._closing_grip is True
+
+    monkeypatch.setattr(ctl, "_GRIP_CLOSE_TIMEOUT", 0.0)
+    for pair in dc.pairs.values():  # gripper physically cannot move
+        pair.follower.command_joint_pos = lambda pos, _f=pair.follower: None
+    dc.step()
+    assert dc._closing_grip is False
+    assert dc._policy_running is True

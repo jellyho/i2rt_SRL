@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 _HOME_TOL = 0.05  # rad; homing considered done when the ramp is within this of home
 _LEADER_HOME_TOL = 0.1  # rad; the PHYSICAL leader must also be this close (weak home_kp lags)
+# Gripper command units (0 closed .. 1 open). Recorded episodes start at ~0.003, so this is
+# loose enough to accept "already shut" without waiting on the last fraction of travel.
+_GRIP_CLOSED_TOL = 0.02
+_GRIP_CLOSE_TIMEOUT = 4.0  # s; give up waiting and start anyway (loudly)
 
 
 def _side_state(robot: Any, kin: Optional[ArmKinematics] = None) -> Dict[str, list]:
@@ -745,6 +749,10 @@ class DeployController(BaseController):
         # the follower travels — rate-limited — to wherever the leader happens to be when
         # intervention starts. Launch default comes from mirror_kp; togglable at runtime.
         self._leader_mirror = cfg.mirror_kp > 0.0
+        # Set while the followers close their grippers at the start of a rollout; the
+        # policy does not drive until it clears (see set_policy_running).
+        self._closing_grip = False
+        self._closing_grip_t0 = 0.0
         self.feedback_kp = cfg.feedback_kp
         self.home_kp = cfg.home_kp
         self.fine_grained_button = str(cfg.fine_grained_button).lower()
@@ -889,15 +897,46 @@ class DeployController(BaseController):
     def set_policy_running(self, flag: bool) -> None:
         if self._homing:
             return
-        flag = bool(flag)
-        if flag and not self._policy_running and not self._intervening:
+        requested = bool(flag)
+        driving = requested  # whether the policy gets control *this call*
+        if requested and not self._policy_running and not self._intervening:
             for side, pair in self.pairs.items():
                 self._leader_smooth[side].reset(
                     np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
                 )
-        self._policy_running = flag
-        if not self._policy_running:
+            # Every recorded episode begins with the gripper shut (it is what the homing
+            # tail leaves behind), so a rollout that starts on an open gripper hands the
+            # policy a first observation it never saw in training. Close it first; step()
+            # flips _policy_running once it is closed.
+            if self._has_grip and self._grip_open():
+                self._closing_grip = True
+                self._closing_grip_t0 = time.monotonic()
+                driving = False
+                # Seed the ramp from where the arm ACTUALLY is. The smoother holds what this
+                # controller last commanded, which is not the same thing after a rollout was
+                # stopped and the arm moved by hand — closing from a stale target would drag
+                # the arm there instead of only shutting the gripper.
+                for side, pair in self.pairs.items():
+                    self._smooth[side].reset(
+                        np.asarray(pair.follower.get_joint_pos(), dtype=float)
+                    )
+                logger.info("closing the gripper before starting the rollout")
+        self._policy_running = driving
+        if not requested:
+            # An actual stop request, not the deferral above, cancels a pending close.
+            self._closing_grip = False
             self.set_intervention(False)
+
+    def _grip_open(self, tol: float = _GRIP_CLOSED_TOL) -> bool:
+        """True if either follower's gripper is meaningfully away from the home value."""
+        for pair in self.pairs.values():
+            try:
+                grip = float(np.asarray(pair.follower.get_joint_pos(), dtype=float)[-1])
+            except Exception:
+                continue
+            if abs(grip - self.home_grip) > tol:
+                return True
+        return False
 
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
@@ -908,6 +947,7 @@ class DeployController(BaseController):
         self._last_event = {"seq": self._event_seq, "action": action}
         self._policy_running = False
         self._intervening = False
+        self._closing_grip = False
         self._reset_fine_grained()
         self._homing = True
         for side, pair in self.pairs.items():
@@ -1097,6 +1137,12 @@ class DeployController(BaseController):
                             # feedback_kp=0: fully free leader — grav-comp idle with ZERO
                             # damping (grav_comp_kd off), not a stale PD hold from mirroring.
                             self._free_leader(pair)
+                elif self._closing_grip:
+                    # Shut the gripper before the policy gets control, holding the arm where
+                    # it is. Only the last DOF moves, so this cannot swing the arm.
+                    smoother.max_step = self._run_step
+                    desired = smoother.cur.copy()
+                    desired[-1] = self.home_grip
                 elif self._policy_running:
                     smoother.max_step = self._run_step
                     act = self._policy_action[side]
@@ -1145,6 +1191,23 @@ class DeployController(BaseController):
         if self._homing and self._homing_done():
             self._homing = False
 
+        if self._closing_grip:
+            if not self._grip_open():
+                self._closing_grip = False
+                self._policy_running = True
+                logger.info("gripper closed — policy rollout starting")
+            elif time.monotonic() - self._closing_grip_t0 > _GRIP_CLOSE_TIMEOUT:
+                # Something is between the fingers. Start anyway rather than leaving the
+                # operator staring at a button that did nothing, but say so: the policy is
+                # about to see a first observation it was not trained on.
+                self._closing_grip = False
+                self._policy_running = True
+                logger.warning(
+                    "gripper did not close within %.0fs — starting the policy on an OPEN "
+                    "gripper, which is outside its training distribution",
+                    _GRIP_CLOSE_TIMEOUT,
+                )
+
         dagger_state = self._state_name()
         with self._lock:
             self._snap = {
@@ -1170,6 +1233,8 @@ class DeployController(BaseController):
             return "homing"
         if self._intervening:
             return "intervention"
+        if self._closing_grip:
+            return "closing_gripper"
         if self._policy_running:
             return "policy"
         return "stopped"
