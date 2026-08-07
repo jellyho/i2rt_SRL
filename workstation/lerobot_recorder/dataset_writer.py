@@ -518,6 +518,12 @@ class AsyncDatasetWriter:
                     resume_local = False
 
             if resume_local:
+                # A previous run that died mid-episode leaves files the metadata never
+                # learned about, and a half-written data parquet has no footer. LeRobot
+                # globs data/ rather than reading the file list from the metadata, so that
+                # one file makes the whole dataset -- including every good episode --
+                # refuse to open. Clear the orphans before trying.
+                self._recover_from_crash()
                 LeRobotDataset = _import_lerobot_dataset()
                 enc = self._dataset_encoding_kwargs()
                 try:
@@ -584,6 +590,31 @@ class AsyncDatasetWriter:
         self._outcome_totals = self._read_outcome_totals()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+
+    def _recover_from_crash(self) -> None:
+        """Quarantine anything a previous crash left behind, before opening the dataset.
+
+        Best-effort: if recovery itself fails we still try to open, so a bug here can only
+        cost the clear error message, never the session."""
+        try:
+            from workstation.lerobot_recorder.crash_recovery import describe, recover
+
+            summary = describe(self._root)
+            if summary == "no crash leftovers":
+                return
+            logger.warning(
+                "found leftovers from an interrupted recording — a truncated data file "
+                "would stop this dataset opening at all, so they are being moved aside:\n%s",
+                summary,
+            )
+            result = recover(self._root)
+            if result["moved"]:
+                logger.warning(
+                    "moved %d item(s) to %s — committed episodes are untouched",
+                    len(result["moved"]), result["quarantine"],
+                )
+        except Exception as e:
+            logger.error("crash recovery skipped: %s", e)
 
     def _cleanup_interrupted_image_dirs(self, episode_index: int) -> None:
         """Remove temp PNG directories for the next, not-yet-committed episode.
