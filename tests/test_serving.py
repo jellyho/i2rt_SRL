@@ -167,3 +167,91 @@ def test_portal_roundtrip_and_estop():
 
     client.set_estop(False)
     srv.close()
+
+
+def test_homing_puts_the_object_down_before_travelling():
+    """finish -> open (arm still) -> travel home with the gripper open -> close at home.
+
+    Homing used to ramp straight to the shut home pose, so an episode that ended mid-grasp
+    carried the object across the workspace and kept holding it at home. Releasing first
+    drops it where it was being worked on -- which only holds if the arm does not move
+    during the release, or "put it down here" becomes "put it down somewhere on the way".
+    """
+    dc = DaggerController(DaggerConfig(sim=True, max_joint_speed=10.0, home_speed=1.0))
+    dc.step()
+    if not dc._has_grip:
+        pytest.skip("rig has no gripper")
+
+    # The travel target keeps the gripper open; only the tail after it shuts.
+    assert dc.home_full_released[-1] == dc.release_grip
+    assert dc.release_grip != dc.home_grip
+
+    # End a rollout away from home, mid-grasp.
+    for pair in dc.pairs.values():
+        pos = np.asarray(pair.follower.get_joint_pos(), dtype=float).copy()
+        pos[: dc.home_arm.size] += 0.4
+        pos[-1] = (dc.home_grip + dc.release_grip) / 2.0  # half open == still gripping
+        pair.follower.command_joint_pos(pos)
+    for _ in range(40):
+        dc.step()
+    arm_at_finish = {
+        side: np.asarray(p.follower.get_joint_pos(), dtype=float)[: dc.home_arm.size].copy()
+        for side, p in dc.pairs.items()
+    }
+
+    dc.finish_dagger_run("keep")
+    dc.step()  # the snapshot is rebuilt by step(), not by the command
+    assert dc.snapshot()["dagger_state"] == "releasing_gripper"
+    assert dc.snapshot()["homing"] is True, "the whole routine must read as homing"
+
+    seen = []
+    arm_drift_while_releasing = 0.0
+    grip_while_homing = []
+    for _ in range(2000):
+        state = dc.snapshot()["dagger_state"]
+        if not seen or seen[-1] != state:
+            seen.append(state)
+        for side, pair in dc.pairs.items():
+            q = np.asarray(pair.follower.get_joint_pos(), dtype=float)
+            if state == "releasing_gripper":
+                arm_drift_while_releasing = max(
+                    arm_drift_while_releasing,
+                    float(np.max(np.abs(q[: dc.home_arm.size] - arm_at_finish[side]))),
+                )
+            elif state == "homing":
+                grip_while_homing.append(float(q[-1]))
+        dc.step()
+        if state == "stopped" and len(seen) > 1:
+            break
+
+    assert seen[0] == "releasing_gripper", seen
+    assert seen[-1] == "stopped", seen
+    assert "closing_gripper" in seen, seen
+    assert seen.index("closing_gripper") > seen.index("releasing_gripper"), seen
+    # The arm holds position while the gripper opens (a little PD sag is fine).
+    assert arm_drift_while_releasing < 0.05, arm_drift_while_releasing
+    # ...and it travels home OPEN, so the object is not re-gripped on the way.
+    assert grip_while_homing, "expected a travel phase after moving the arm off home"
+    assert min(grip_while_homing) > (dc.home_grip + dc.release_grip) / 2.0, min(grip_while_homing)
+
+
+def test_nothing_can_cut_into_the_homing_routine():
+    """Release and the closing tail are as protected as the travel itself."""
+    dc = DaggerController(DaggerConfig(sim=True, max_joint_speed=10.0, home_speed=10.0))
+    dc.step()
+    if not dc._has_grip:
+        pytest.skip("rig has no gripper")
+    for pair in dc.pairs.values():
+        pos = np.asarray(pair.follower.get_joint_pos(), dtype=float).copy()
+        pos[-1] = (dc.home_grip + dc.release_grip) / 2.0
+        pair.follower.command_joint_pos(pos)
+    for _ in range(30):
+        dc.step()
+
+    dc.finish_dagger_run("keep")
+    dc.step()
+    assert dc.snapshot()["dagger_state"] == "releasing_gripper"
+    dc.set_policy_running(True)
+    dc.set_intervention(True)
+    assert dc.snapshot()["policy_running"] is False
+    assert dc.snapshot()["intervention"] is False
