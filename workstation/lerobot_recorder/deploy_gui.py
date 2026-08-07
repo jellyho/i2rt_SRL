@@ -38,6 +38,8 @@ the robot-side controller, not by this UI.
 
 from __future__ import annotations
 
+import logging
+
 from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
@@ -45,6 +47,8 @@ from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.gui import PickerComboBox, RecorderGUI
 from workstation.policy_bridge.config import BridgeConfig
 from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
+
+logger = logging.getLogger(__name__)
 
 
 class DeployGUI(RecorderGUI):
@@ -265,11 +269,33 @@ class DeployGUI(RecorderGUI):
             self.runner = DeploymentPolicyRunner(self.bridge_cfg, self.cfg, self.recorder.get_last_images)
             self.runner.start()
 
+    @property
+    def policy_ready(self) -> bool:
+        """Whether the policy server is actually reachable.
+
+        Starting a rollout is what opens a DAgger episode, so without this the operator can
+        start one against a policy that is not there: the arms sit still, and a recording
+        session quietly fills up with episodes in which nothing ever acted."""
+        return bool(self.runner is not None and self.runner.get_status().get("policy_connected"))
+
     def _on_policy_toggle(self) -> None:
         if self.recorder is None:
             return
         st = self.recorder.get_status()
-        self.recorder.set_policy_running(not bool(st.get("policy_running")))
+        running = bool(st.get("policy_running"))
+        if not running and not self.policy_ready:
+            err = (self.runner.get_status().get("last_error") if self.runner else "") or "not connected yet"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No policy",
+                f"The policy server at {self.bridge_cfg.policy_host}:{self.bridge_cfg.policy_port} "
+                f"is not connected ({err}).\n\n"
+                "Starting now would open an episode that no policy ever drives — the arms "
+                "would sit still and the rollout would be recorded anyway.\n\n"
+                "Start the policy server first; this reconnects on its own.",
+            )
+            return
+        self.recorder.set_policy_running(not running)
 
     def _on_intervention_toggle(self) -> None:
         if self.recorder is None:
@@ -359,6 +385,23 @@ class DeployGUI(RecorderGUI):
             buttons.append(self.keep_home_btn)
         for btn in buttons:
             btn.setEnabled(not blocked)
+
+        ready = self.policy_ready
+        # Starting a rollout is what opens an episode, so without a policy it would record
+        # one in which nothing ever acted.
+        self.policy_btn.setEnabled(not blocked and (running or ready))
+        self.policy_btn.setToolTip(
+            "" if ready else f"no policy at {self.bridge_cfg.policy_host}:{self.bridge_cfg.policy_port}"
+        )
+        if running and not ready:
+            # The handle button starts rollouts too, and it does not go through this UI.
+            # Close it here rather than let the recording keep going: the operator asked
+            # for a policy rollout and there is no policy.
+            logger.warning(
+                "rollout is running with no policy connected (%s) — stopping it",
+                (self.runner.get_status().get("last_error") if self.runner else "") or "not connected",
+            )
+            self.recorder.set_policy_running(False)
         runner = self.runner.get_status() if self.runner is not None else {}
         # 0 until the first chunk arrives — the policy decides, we do not configure it.
         horizon = runner.get("action_horizon", 0)

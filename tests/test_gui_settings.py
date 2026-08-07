@@ -278,6 +278,7 @@ def test_leader_mirror_toggle_is_forwarded_to_the_robot(tmp_path, qapp, no_camer
         assert sent == [False, True]
     finally:
         gui.recorder = None
+        gui.runner = None
         gui.close()
 
 
@@ -349,4 +350,124 @@ def test_reference_dataset_picker_switches_between_root_subfolders(
         assert gui.reference_list.item(0).text().startswith("demonstration 0009")
         assert played[-1] == (9, True)
     finally:
+        gui.close()
+
+
+# ------------------------------------------------ no policy -> no rollout, no recording
+def _quiet_gui(tmp_path):
+    """A deploy GUI with its refresh timers stopped.
+
+    The 10 Hz timer calls into `self.recorder`, and a stand-in that only carries the few
+    keys a test cares about crashes the interpreter when the timer reaches the banner/health
+    code. Stopping the timers keeps the test to the method under test.
+    """
+    gui = _deploy_gui(False, tmp_path)
+    gui._timer.stop()
+    gui._review_timer.stop()
+    return gui
+
+
+class _FakeRunner:
+    def __init__(self, connected=False, err=""):
+        self._st = {"policy_connected": connected, "last_error": err, "streaming": connected}
+
+    def get_status(self):
+        return dict(self._st)
+
+    def shutdown(self):  # closeEvent calls this
+        pass
+
+
+class _FakeRecorder:
+    def __init__(self, running=False):
+        self.st = {"policy_running": running, "dagger_state": "policy" if running else "stopped"}
+        self.calls = []
+
+    def get_status(self):
+        return dict(self.st)
+
+    def set_policy_running(self, flag):
+        self.calls.append(bool(flag))
+        self.st["policy_running"] = bool(flag)
+
+    def shutdown(self):  # closeEvent calls this
+        pass
+
+
+def test_start_is_refused_without_a_policy(tmp_path, qapp, no_camera_scan, monkeypatch):
+    """Starting a rollout opens an episode, so with no policy the arms sit still and the
+    recording fills up with rollouts nothing ever drove."""
+    gui = _quiet_gui(tmp_path)
+    try:
+        warned = []
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: warned.append(a))
+        gui.runner = _FakeRunner(connected=False, err="policy server offline")
+        gui.recorder = _FakeRecorder()
+
+        gui._on_policy_toggle()
+        assert gui.recorder.calls == [], "must not start a rollout without a policy"
+        assert warned, "the operator has to be told why"
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_start_works_once_the_policy_is_up(tmp_path, qapp, no_camera_scan):
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=True)
+        gui.recorder = _FakeRecorder()
+        gui._on_policy_toggle()
+        assert gui.recorder.calls == [True]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_stopping_never_needs_a_policy(tmp_path, qapp, no_camera_scan):
+    """A running rollout must always be stoppable, connected or not."""
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=False)
+        gui.recorder = _FakeRecorder(running=True)
+        gui._on_policy_toggle()
+        assert gui.recorder.calls == [False]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_rollout_started_from_the_handle_button_is_stopped(tmp_path, qapp, no_camera_scan):
+    """The handle button starts rollouts without going through this UI, so the guard on
+    the button alone would not cover it."""
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=False)
+        gui.recorder = _FakeRecorder(running=True)
+        gui._update_dagger_controls({"policy_running": True, "dagger_state": "policy"})
+        assert gui.recorder.calls == [False]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_start_button_is_disabled_while_no_policy(tmp_path, qapp, no_camera_scan):
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=False)
+        gui.recorder = _FakeRecorder()
+        gui._update_dagger_controls({"policy_running": False, "dagger_state": "stopped"})
+        assert gui.policy_btn.isEnabled() is False
+        assert "no policy" in gui.policy_btn.toolTip()
+
+        gui.runner = _FakeRunner(connected=True)
+        gui._update_dagger_controls({"policy_running": False, "dagger_state": "stopped"})
+        assert gui.policy_btn.isEnabled() is True
+    finally:
+        gui.recorder = None
+        gui.runner = None
         gui.close()
