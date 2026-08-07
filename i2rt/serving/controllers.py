@@ -1149,6 +1149,21 @@ class DeployController(BaseController):
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
                         desired = act[:n]
+                elif self._has_grip:
+                    # Stopped. Nothing used to be commanded here at all, so the gripper had
+                    # no holding force and drifted open the moment the server came up — a
+                    # rollout could then only ever start from a pose the data never contains.
+                    # Keep it shut instead, from startup onwards.
+                    #
+                    # The arm is NOT held: the target is re-seeded from the measured position
+                    # every tick, so its PD error stays ~0 and the arm remains as
+                    # back-drivable as before. Only the gripper is given a target away from
+                    # where it is, and the smoother limits how fast it travels there.
+                    meas = np.asarray(pair.follower.get_joint_pos(), dtype=float)
+                    smoother.reset(meas)
+                    smoother.max_step = self._run_step
+                    desired = meas.copy()
+                    desired[-1] = self.home_grip
 
                 if desired is not None:
                     target = desired if self._leader_recentering else smoother.step(desired)

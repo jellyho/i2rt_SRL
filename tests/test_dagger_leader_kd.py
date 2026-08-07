@@ -329,7 +329,13 @@ def _stateful(dc, gripper=0.6):
         f._q = np.zeros(f.n)
         f._q[-1] = gripper
         f.get_joint_pos = lambda _f=f: _f._q.copy()
-        f.command_joint_pos = lambda pos, _f=f: _f._q.__setitem__(slice(None), np.asarray(pos, float))
+
+        def _cmd(pos, _f=f):
+            arr = np.asarray(pos, dtype=float)
+            _f.cmds.append(arr.copy())  # keep the recording the real stub does
+            _f._q[:] = arr
+
+        f.command_joint_pos = _cmd
     return dc
 
 
@@ -412,3 +418,43 @@ def test_blocked_gripper_starts_anyway_after_the_timeout(monkeypatch):
     dc.step()
     assert dc._closing_grip is False
     assert dc._policy_running is True
+
+
+def test_gripper_is_held_closed_from_startup(monkeypatch):
+    """The reported bug: `robot/yam deploy` came up and the gripper drifted open, because
+    the stopped state commanded nothing at all. It must close on its own, before any
+    rollout is requested."""
+    dc, _, follower = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.7)
+
+    for _ in range(500):  # just idle -- no set_policy_running anywhere
+        dc.step()
+    for pair in dc.pairs.values():
+        assert abs(float(pair.follower.get_joint_pos()[-1]) - dc.home_grip) < 0.05
+    assert dc._policy_running is False, "idling must not start a rollout"
+
+
+def test_idle_hold_does_not_stiffen_the_arm(monkeypatch):
+    """Only the gripper gets a target away from where it is; the arm's command tracks its
+    measured position, so it stays as back-drivable as it was when nothing was commanded."""
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.7)
+    for pair in dc.pairs.values():
+        pair.follower._q[:-1] = np.linspace(0.1, 0.6, pair.follower.n - 1)
+
+    for _ in range(50):
+        dc.step()
+    for pair in dc.pairs.values():
+        cmd = pair.follower.cmds[-1] if pair.follower.cmds else None
+        meas = pair.follower.get_joint_pos()
+        assert cmd is not None
+        np.testing.assert_allclose(cmd[:-1], meas[:-1], atol=1e-6)  # arm: zero PD error
+
+    # and if the operator moves the arm by hand, the command follows rather than fighting
+    for pair in dc.pairs.values():
+        pair.follower._q[:-1] += 0.3
+    dc.step()
+    for pair in dc.pairs.values():
+        np.testing.assert_allclose(
+            pair.follower.cmds[-1][:-1], pair.follower.get_joint_pos()[:-1], atol=1e-6
+        )
