@@ -15,13 +15,20 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from workstation.lerobot_recorder.config import CameraSpec, RecorderConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _rs():
+    """pyrealsense2, imported lazily so a machine without it can still run mock cameras."""
+    import pyrealsense2 as rs
+
+    return rs
 
 
 def color_control_sensor(device):
@@ -57,6 +64,8 @@ class CameraManager:
         self._serials: Dict[str, str] = {}  # resolved serial per key (for reconnect)
         self._last: Dict[str, np.ndarray] = {}  # latest frame per key (written by the capture thread)
         self._healthy: Dict[str, bool] = {}
+        # Per-camera pinhole intrinsics, filled in on open; see _read_intrinsics.
+        self._intrinsics: Dict[str, dict] = {}
         self._next_retry: Dict[str, float] = {}
         self._fps: Dict[str, int] = {}  # resolved color fps per key (decided once, reused on reconnect)
         self._frame_t = 0
@@ -161,7 +170,7 @@ class CameraManager:
         return fps
 
     def _open_pipe(self, spec: CameraSpec, serial: str) -> None:
-        import pyrealsense2 as rs
+        rs = _rs()
 
         fps = self._resolve_fps(spec, serial)
         pipe = rs.pipeline()
@@ -171,7 +180,31 @@ class CameraManager:
         profile = pipe.start(rs_cfg)
         self._pipelines[spec.key] = pipe
         self._healthy[spec.key] = True
+        self._read_intrinsics(spec, profile)
         self._apply_options(spec, profile)
+
+    def _read_intrinsics(self, spec: CameraSpec, profile) -> None:
+        """Record this camera's pinhole intrinsics, straight off the device.
+
+        Needed to draw anything positioned in 3-D onto a frame -- a predicted gripper path,
+        say. The camera knows its own fx/fy/cx/cy from factory calibration, so asking beats
+        both a hand calibration and a guess from the field of view. Re-read on every open, and
+        never fatal: a camera that will not report them still records perfectly well.
+        """
+        try:
+            intr = profile.get_stream(_rs().stream.color).as_video_stream_profile().get_intrinsics()
+            self._intrinsics[spec.key] = {
+                "fx": float(intr.fx), "fy": float(intr.fy),
+                "cx": float(intr.ppx), "cy": float(intr.ppy),
+                "width": int(intr.width), "height": int(intr.height),
+            }
+        except Exception as e:
+            self._intrinsics.pop(spec.key, None)
+            logger.warning("camera '%s': could not read intrinsics: %s", spec.key, e)
+
+    def intrinsics(self, key: str) -> Optional[dict]:
+        """``{fx, fy, cx, cy, width, height}`` for a camera, or None if it never reported them."""
+        return self._intrinsics.get(key)
 
     def _apply_options(self, spec: CameraSpec, profile) -> None:
         """Push ``spec.options`` onto the camera's exposure-owning sensor (best effort).
