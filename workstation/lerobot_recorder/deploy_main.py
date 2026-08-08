@@ -40,7 +40,6 @@ def build_configs(
     p.add_argument("--policy-port", type=int, default=8000)
     p.add_argument("--rate", type=float, default=30.0)
     p.add_argument("--image-size", type=int, default=224)
-    p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch")
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
@@ -135,7 +134,6 @@ def build_configs(
         rate_hz=args.rate,
         image_size=args.image_size,
         prompt=task,
-        use_async=not args.no_async,
     )
     return recorder_cfg, bridge_cfg, args
 

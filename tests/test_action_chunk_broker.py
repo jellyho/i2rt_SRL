@@ -27,7 +27,6 @@ _src = acb_path.read_text().replace("from .base_policy import BasePolicy", "Base
 _ns: dict = {}
 exec(compile(_src, str(acb_path), "exec"), _ns)  # noqa: S102
 ActionChunkBroker = _ns["ActionChunkBroker"]
-AsyncActionChunkBroker = _ns["AsyncActionChunkBroker"]
 chunk_len = _ns["chunk_len"]
 
 
@@ -118,31 +117,6 @@ def test_chunk_len_reads_the_leading_dim():
     assert chunk_len({}) == 1
 
 
-@pytest.mark.parametrize("horizon", [1, 2, 5, 30])
-def test_async_broker_matches_the_sync_one(horizon):
-    """Prefetch is an optimisation; the action sequence must be identical."""
-    a, b = FakePolicy(horizon), FakePolicy(horizon)
-    sync, async_ = ActionChunkBroker(a), AsyncActionChunkBroker(b)
-    try:
-        s = np.stack([sync.infer({})["actions"] for _ in range(horizon * 3)])
-        n = np.stack([async_.infer({})["actions"] for _ in range(horizon * 3)])
-        np.testing.assert_array_equal(s, n)
-        assert a.calls == 3
-    finally:
-        async_.close()
-
-
-def test_async_broker_prefetches_before_the_chunk_runs_out():
-    p = FakePolicy(10)
-    broker = AsyncActionChunkBroker(p, prefetch_lead=2)
-    try:
-        for _ in range(8):  # chunk 10, lead 2 -> the 8th step kicks off the next infer
-            broker.infer({})
-        assert p.calls == 2, "the next chunk should already be in flight"
-    finally:
-        broker.close()
-
-
 def test_reset_drops_the_cached_chunk():
     p = FakePolicy(30)
     broker = ActionChunkBroker(p)
@@ -166,25 +140,29 @@ def test_action_horizon_argument_is_accepted_and_ignored(caplog):
     assert "ignored" in caplog.text
 
 
-def test_async_accepts_the_old_positional_signature():
-    p = FakePolicy(30)
-    broker = AsyncActionChunkBroker(p, 16)  # positional, as the old API took it
-    try:
-        for _ in range(30):
-            broker.infer({})
-        assert broker.action_horizon == 30
-    finally:
-        broker.close()
+def test_each_chunk_is_inferred_from_the_observation_of_that_very_tick():
+    """The reason the prefetching broker is gone.
 
+    It started the next inference two steps early, on the observation available then, so every
+    chunk was computed from a slightly older world than the one it was applied to. Measured,
+    the two came out a wash — it started early by the same margin it was stale by — but "the
+    chunk came from the observation I handed over" is worth being able to state without an
+    argument about timing. The cost is a stall at each chunk boundary, which is what openpi's
+    and LeRobot's own brokers do too.
+    """
+    seen = []
 
-def test_prefetch_at_is_translated_to_a_lead():
-    """`prefetch_at` indexed into a fixed chunk; keep its meaning as a distance from the end."""
-    p = FakePolicy(10)
-    broker = AsyncActionChunkBroker(p, action_horizon=10, prefetch_at=8)
-    try:
-        assert broker._lead == 2
-        for _ in range(8):
-            broker.infer({})
-        assert p.calls == 2  # prefetch fired at the same point as before
-    finally:
-        broker.close()
+    class _Policy:
+        def infer(self, obs):
+            seen.append(obs["tick"])
+            return {"actions": np.zeros((4, 3))}
+
+        def reset(self):
+            pass
+
+    broker = ActionChunkBroker(_Policy())
+    for tick in range(9):
+        broker.infer({"tick": tick})
+
+    # A 4-step chunk re-infers on ticks 0, 4 and 8 — each with THAT tick's observation.
+    assert seen == [0, 4, 8]

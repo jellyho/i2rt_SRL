@@ -15,7 +15,7 @@ class BridgeConfig:
     rate_hz: float = 30.0
     image_size: int = 224
     prompt: str = "do the task"
-    use_async: bool = True
+
     # Camera role -> the observation key the policy reads. These are openpi's slot names,
     # shared by every multi-camera policy there (libero uses the first two; RoboCasa and
     # YAM all three), so one client drives any of them without a per-robot branch.

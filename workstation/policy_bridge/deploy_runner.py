@@ -162,7 +162,7 @@ class DeploymentPolicyRunner:
             return
         if not self._policy_port_open():
             raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
-        from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClientPolicy
+        from yam_policy import ActionChunkBroker, WebsocketClientPolicy
 
         client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
         meta = client.get_server_metadata() or {}
@@ -170,9 +170,8 @@ class DeploymentPolicyRunner:
         image_keys = meta.get("image_keys", self.cfg.image_keys)
         # No action_horizon here on purpose: the broker reads the chunk size off each
         # response, so a checkpoint's horizon can never disagree with a client setting.
-        broker_cls = AsyncActionChunkBroker if self.cfg.use_async else ActionChunkBroker
         self._policy_client = client
-        self._policy = broker_cls(client)
+        self._policy = ActionChunkBroker(client)
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,

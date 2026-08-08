@@ -64,15 +64,22 @@ Then serve it with `--policy your.module:YourPolicy`.
 ## Client side (used by the workstation bridge)
 
 ```python
-from yam_policy import WebsocketClientPolicy, AsyncActionChunkBroker
+from yam_policy import WebsocketClientPolicy, ActionChunkBroker
 client = WebsocketClientPolicy(host="policy-host", port=8000)
-policy = AsyncActionChunkBroker(client, action_horizon=16)   # prefetches the next chunk
-action = policy.infer(obs)["actions"]   # one (action_dim,) step per call, re-queries every 16
+policy = ActionChunkBroker(client)      # chunk size comes from the policy's own reply
+action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
 ```
 
-- **AsyncActionChunkBroker** fetches the next chunk in a background thread so the
-  per-chunk inference latency doesn't stall the control loop (use
-  `ActionChunkBroker` for the simple synchronous version).
+- **ActionChunkBroker** holds the chunk and hands out one step per control tick, re-inferring
+  when it runs out — so a 30-step chunk means one inference per second at 30 Hz rather than
+  thirty. It takes the chunk size from what the policy returns, so a checkpoint trained at 30
+  cannot be silently truncated by a client configured for 16.
+- There is no prefetching variant. One existed, starting the next inference two steps early on
+  the observation available then; measured, its freshness came out a wash against the
+  synchronous version — it started early by the same margin it was stale by — and it cost the
+  guarantee that a chunk was computed from the observation the caller actually handed over.
+  The price is a stall at each chunk boundary, which is what openpi's and LeRobot's own
+  brokers do as well.
 - **Metadata-driven config**: declare `action_horizon` (and optionally an
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from
