@@ -345,3 +345,92 @@ def test_disk_guard_refuses_save(tmp_path):
     w.finalize()
     assert w.low_disk is True
     assert w.num_episodes == 0
+
+
+def test_streaming_memory_does_not_grow_with_episode_length(tmp_path):
+    """The writer must not hold an episode whole.
+
+    Three 640x480 cameras are ~2.8 MB a frame, so buffering a 90 s episode as a list is
+    ~7.5 GB -- which is what pushed the machine into swap and got the recorder OOM-killed
+    mid-episode. Streaming caps the resident set at the queue instead. Measured, in separate
+    processes so the high-water mark is not carried over:
+
+        frames   buffered   streamed
+           300     2.67 GB    2.03 GB
+           900     4.34 GB    2.05 GB
+          2700     9.21 GB    2.05 GB
+
+    This test asserts the shape of that -- flat, not linear -- on a small enough scale to run
+    in CI, by counting how many frames are ever resident at once rather than measuring RSS.
+    """
+    import numpy as np
+
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    cams = {"cam": (32, 32, 3)}
+
+    def frame(i):
+        return {
+            "state": np.zeros(42, np.float32),
+            "action": np.zeros(14, np.float32),
+            "leader": np.zeros(12, np.float32),
+            "eef": np.zeros(14, np.float32),
+            "images": {"cam": np.full((32, 32, 3), i % 255, np.uint8)},
+            "task": "t",
+        }
+
+    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=False, fps=30, use_videos=True)
+    writer = AsyncDatasetWriter(cfg, list(cams), cams)
+    writer.open(frame(0))
+    assert writer.supports_streaming()
+
+    high_water = 0
+    for i in range(400):
+        writer.stream_frame(frame(i))
+        high_water = max(high_water, writer._frame_queue.qsize())
+    writer.end_episode("success", "t")
+    writer.finalize()
+
+    # Bounded by the queue, not by the 400 frames that went through it.
+    assert high_water <= writer._frame_queue.maxsize, high_water
+
+    info = json.loads((tmp_path / "stream" / "meta" / "info.json").read_text())
+    assert info["total_episodes"] == 1
+    assert info["total_frames"] == 400, "every streamed frame must reach the dataset"
+
+
+def test_streaming_abort_drops_the_episode_and_leaves_the_writer_usable(tmp_path):
+    """The review 'Delete', once frames are already inside LeRobot's buffer."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    cams = {"cam": (32, 32, 3)}
+
+    def frame(i):
+        return {
+            "state": np.zeros(42, np.float32),
+            "action": np.zeros(14, np.float32),
+            "leader": np.zeros(12, np.float32),
+            "eef": np.zeros(14, np.float32),
+            "images": {"cam": np.full((32, 32, 3), i % 255, np.uint8)},
+            "task": "t",
+        }
+
+    cfg = RecorderConfig(repo_id="t/abort", root=str(tmp_path), mock=False, fps=30, use_videos=True)
+    writer = AsyncDatasetWriter(cfg, list(cams), cams)
+    writer.open(frame(0))
+
+    for i in range(20):
+        writer.stream_frame(frame(i))
+    writer.abort_episode()
+    for i in range(25):
+        writer.stream_frame(frame(i))
+    writer.end_episode("success", "t")
+    writer.finalize()
+
+    info = json.loads((tmp_path / "abort" / "meta" / "info.json").read_text())
+    assert info["total_episodes"] == 1, "the aborted episode must not be saved"
+    assert info["total_frames"] == 25, "and must not contribute frames to the kept one"
