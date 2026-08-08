@@ -22,6 +22,11 @@ class BridgeConfig:
     #
     # The chunk size is deliberately NOT here: the broker takes it from what the policy
     # returns, so there is no number to keep in sync with the checkpoint.
+    # How many action chunks to ask the policy for per observation. 0/1 is normal deployment:
+    # one chunk, one forward pass, today's latency. Above that the server returns the extra
+    # draws under `action_samples` and the viewer can show the spread -- which costs N forward
+    # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
+    num_samples: int = 0
     image_keys: Dict[str, str] = field(
         default_factory=lambda: {
             "agentview": "observation/image",

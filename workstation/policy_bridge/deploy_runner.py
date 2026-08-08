@@ -50,7 +50,11 @@ class DeploymentPolicyRunner:
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
+            "num_samples": 0,   # how many chunks the last reply actually carried
         }
+        # The most recent chunk set, for the overlay. Held outside _status because it is an
+        # array rather than a status scalar, and a viewer reads it at its own pace.
+        self._samples: Optional[np.ndarray] = None
 
     def start(self) -> None:
         self._stop.clear()
@@ -97,6 +101,21 @@ class DeploymentPolicyRunner:
             else:
                 logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port,
                                f" ({error})" if error else "")
+
+    def _set_samples(self, samples) -> None:
+        """Keep the chunk set the policy just returned, if it returned one.
+
+        Cleared when a reply has none, so a viewer never draws a stale spread over a live
+        frame -- a picture that is confidently about the wrong moment.
+        """
+        with self._lock:
+            self._samples = np.asarray(samples, dtype=float) if samples is not None else None
+            self._status["num_samples"] = 0 if self._samples is None else int(self._samples.shape[0])
+
+    def get_samples(self) -> Optional[np.ndarray]:
+        """``[N, horizon, action_dim]`` from the most recent inference, or None."""
+        with self._lock:
+            return None if self._samples is None else self._samples.copy()
 
     def _connect_robot(self) -> None:
         if self.recorder_cfg.mock or self._robot is not None:
@@ -188,7 +207,9 @@ class DeploymentPolicyRunner:
                             self._reset_policy_chunk()
                         policy_obs = self._build_obs(obs, self.images_fn())
                         if policy_obs:
-                            action = self._policy.infer(policy_obs)["actions"]
+                            result = self._policy.infer(policy_obs)
+                            action = result["actions"]
+                            self._set_samples(result.get("action_samples"))
                             self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
                             self._set(
                                 streaming=True,
@@ -296,6 +317,10 @@ class DeploymentPolicyRunner:
             return {}
 
         obs = {"observation/state": state, "prompt": self.cfg.prompt}
+        # Only sent when actually wanted: a server that supports it does N forward passes for
+        # N samples, and an unpatched one ignores an unknown key rather than failing.
+        if self.cfg.num_samples > 1:
+            obs["num_samples"] = int(self.cfg.num_samples)
 
         height, width = self._image_shape
         for role, key in self.cfg.image_keys.items():

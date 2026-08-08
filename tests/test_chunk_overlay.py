@@ -135,3 +135,31 @@ def test_a_bimanual_action_can_be_sliced_to_one_arm(geometry):
 def test_sample_shape_is_checked(geometry):
     with pytest.raises(ValueError, match="samples"):
         project_samples(geometry, np.zeros((30, 7)), np.zeros(6), _intrinsics())
+
+
+def test_a_chunk_set_survives_the_broker_intact():
+    """The broker hands out one STEP of a chunk at a time. `action_samples` describes the whole
+    chunk, so indexing it by step would return sample number `step` — not corrupted-looking
+    data, but a different chunk presented as the current action.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "policy_serving"))
+    from yam_policy.action_chunk_broker import ActionChunkBroker
+
+    samples = np.stack([np.full((30, 14), i, float) for i in range(5)])
+
+    class _Policy:
+        def infer(self, obs):
+            return {"actions": np.arange(30 * 14, dtype=float).reshape(30, 14),
+                    "action_samples": samples.copy()}
+
+        def reset(self):
+            pass
+
+    broker = ActionChunkBroker(_Policy())
+    for _ in range(3):
+        result = broker.infer({})
+        assert result["actions"].shape == (14,), "the executed action is still per-step"
+        assert np.array_equal(result["action_samples"], samples), "the chunk set was sliced"

@@ -29,8 +29,18 @@ from .base_policy import BasePolicy
 logger = logging.getLogger(__name__)
 
 
+#: Keys that describe the CHUNK rather than one step of it, so indexing them by step would
+#: return something entirely different. ``action_samples`` is [N, horizon, dim] -- the other
+#: chunks the policy might have picked -- and slicing it by step yields sample number `step`,
+#: which is not wrong-looking data, it is a different chunk presented as the current action.
+_PER_CHUNK_KEYS = frozenset({"action_samples"})
+
+
 def _slice_step(results: Dict, step: int) -> Dict:
-    return {k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 else v) for k, v in results.items()}
+    return {
+        k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 and k not in _PER_CHUNK_KEYS else v)
+        for k, v in results.items()
+    }
 
 
 def chunk_len(results: Dict) -> int:

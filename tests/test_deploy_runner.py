@@ -298,3 +298,56 @@ def test_probe_reports_down_when_nothing_is_listening():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     assert _idle_runner(policy_port=port)._policy_port_open() is False
+
+
+# --------------------------------------------------------------------------------------- #
+# Multi-sample: several chunks per observation, on request only
+# --------------------------------------------------------------------------------------- #
+def test_num_samples_is_absent_from_a_normal_deployment_request():
+    """A rollout must not silently pay for N forward passes."""
+    runner = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    obs = runner._build_obs(_robot_obs(), {})
+    assert "num_samples" not in obs
+
+
+def test_num_samples_of_one_is_still_a_plain_request():
+    cfg = BridgeConfig()
+    cfg.num_samples = 1
+    runner = DeploymentPolicyRunner(cfg, RecorderConfig(mock=True), lambda: {})
+    assert "num_samples" not in runner._build_obs(_robot_obs(), {})
+
+
+def test_multi_sample_mode_asks_for_them():
+    cfg = BridgeConfig()
+    cfg.num_samples = 6
+    runner = DeploymentPolicyRunner(cfg, RecorderConfig(mock=True), lambda: {})
+    assert runner._build_obs(_robot_obs(), {})["num_samples"] == 6
+
+
+def test_samples_are_kept_for_the_viewer_and_counted():
+    runner = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    assert runner.get_samples() is None
+    assert runner.get_status()["num_samples"] == 0
+
+    samples = np.zeros((5, 30, 14))
+    runner._set_samples(samples)
+    assert runner.get_samples().shape == (5, 30, 14)
+    assert runner.get_status()["num_samples"] == 5
+
+
+def test_a_reply_without_samples_clears_the_previous_ones():
+    """Otherwise a viewer keeps drawing a stale spread over a live frame — a picture that is
+    confidently about the wrong moment."""
+    runner = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    runner._set_samples(np.zeros((5, 30, 14)))
+    runner._set_samples(None)
+    assert runner.get_samples() is None
+    assert runner.get_status()["num_samples"] == 0
+
+
+def test_the_viewer_cannot_mutate_the_runners_copy():
+    runner = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    runner._set_samples(np.zeros((2, 30, 14)))
+    got = runner.get_samples()
+    got[:] = 99.0
+    assert not (runner.get_samples() == 99.0).any()
