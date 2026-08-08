@@ -178,6 +178,44 @@ class DeployGUI(RecorderGUI):
                + ("" if recording else " Nothing is recorded."))
         )
 
+    def _on_samples_toggled(self, on: bool) -> None:
+        """Turn the action-distribution overlay on or off.
+
+        The count goes to the runner, which only puts `num_samples` on the wire above 1 -- so
+        switching this off restores exactly the request a plain rollout makes, not a request
+        for one sample.
+        """
+        on = bool(on)
+        self.samples_spin.setEnabled(on)
+        if self.runner is not None:
+            self.runner.cfg.num_samples = int(self.samples_spin.value()) if on else 0
+        if not on and self.runner is not None:
+            self.runner._set_samples(None)     # drop the last spread rather than leave it drawn
+
+    def _decorate_preview(self, images: dict) -> dict:
+        if not self.samples_check.isChecked() or self.runner is None or self.recorder is None:
+            return images
+        renderer = self._overlay_renderer()
+        if renderer is None or not renderer.available:
+            return images
+        snapshot = self.recorder.robot.get_snapshot()
+        return renderer.draw(
+            images,
+            self.runner.get_samples(),
+            snapshot.get("state"),
+            self.recorder.cameras.intrinsics,
+        )
+
+    def _overlay_renderer(self):
+        """Built on first use: loading the MuJoCo model costs more than a UI toggle should."""
+        if not hasattr(self, "_renderer"):
+            from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+
+            self._renderer = WristOverlayRenderer()
+            if not self._renderer.available:
+                logger.warning("action-sample overlay disabled: %s", self._renderer.error)
+        return self._renderer
+
     def _on_mirror_toggled(self, flag: bool) -> None:
         """Apply live: the operator may want the handles to stop moving mid-session."""
         if self.recorder is not None:
@@ -227,6 +265,21 @@ class DeployGUI(RecorderGUI):
             "(rate-limited) to wherever the leader is."
         )
         self.mirror_check.toggled.connect(self._on_mirror_toggled)
+        # Sampling several chunks costs a forward pass each, so this is an explicit inspection
+        # mode rather than something a rollout leaves on.
+        self.samples_check = QtWidgets.QCheckBox("Show action samples")
+        self.samples_check.setToolTip(
+            "Ask the policy for several action chunks per step and draw them on the wrist "
+            "views.\nA tight bundle means it is confident; a wide spray means it is torn "
+            "between options.\nCosts one forward pass per sample, so leave it off while "
+            "collecting."
+        )
+        self.samples_spin = QtWidgets.QSpinBox()
+        self.samples_spin.setRange(2, 32)
+        self.samples_spin.setValue(8)
+        self.samples_spin.setEnabled(False)
+        self.samples_check.toggled.connect(self._on_samples_toggled)
+        self.samples_spin.valueChanged.connect(lambda *_: self._on_samples_toggled(self.samples_check.isChecked()))
         self.button_legend = QtWidgets.QLabel(
             "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during intervention; "
             "left lower = human intervention on/off, "
@@ -238,14 +291,22 @@ class DeployGUI(RecorderGUI):
             "border-radius:8px;padding:10px 12px;font-weight:600;"
         )
 
+        samples_row = QtWidgets.QHBoxLayout()
+        samples_row.addWidget(self.samples_check)
+        samples_row.addWidget(self.samples_spin)
+        samples_row.addStretch(1)
+        samples_box = QtWidgets.QWidget()
+        samples_box.setLayout(samples_row)
+
         grid.addWidget(self.dagger_state, 0, 0, 1, 4)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
         grid.addWidget(self.keep_home_btn, 1, 2)
         grid.addWidget(self.discard_home_btn, 1, 3)
         grid.addWidget(self.mirror_check, 2, 0, 1, 4)
-        grid.addWidget(self.button_legend, 3, 0, 1, 4)
-        grid.addWidget(self.runner_status, 4, 0, 1, 4)
+        grid.addWidget(samples_box, 3, 0, 1, 4)
+        grid.addWidget(self.button_legend, 4, 0, 1, 4)
+        grid.addWidget(self.runner_status, 5, 0, 1, 4)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):

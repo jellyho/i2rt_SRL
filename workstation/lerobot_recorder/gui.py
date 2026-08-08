@@ -807,6 +807,15 @@ class RecorderGUI(QtWidgets.QWidget):
         super().keyPressEvent(event)
 
     # ------------------------------------------------------------------ refresh
+    def _decorate_preview(self, images: dict) -> dict:
+        """Last chance to draw on the live frames before they are composited.
+
+        Nothing here; subclasses that have something to say about what they are watching
+        (the deploy UI draws the policy's sampled chunks) override it. The hook lives on the
+        composite path so a decorated view and the plain one cannot diverge.
+        """
+        return images
+
     def _refresh(self) -> None:
         self._drain_log()
         if self.recorder is None:
@@ -831,6 +840,7 @@ class RecorderGUI(QtWidgets.QWidget):
             if reference_frames
             else images
         )
+        preview_images = self._decorate_preview(preview_images)
         composite = compose_camera_strip(preview_images, agent_key=self.cfg.review_cam)
         if isinstance(composite, np.ndarray) and composite.ndim == 3:
             self.live_lbl.setPixmap(_np_to_pixmap(composite).scaled(self.live_lbl.size(), QtCore.Qt.KeepAspectRatio))

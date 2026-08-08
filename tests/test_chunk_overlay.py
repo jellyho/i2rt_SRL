@@ -163,3 +163,77 @@ def test_a_chunk_set_survives_the_broker_intact():
         result = broker.infer({})
         assert result["actions"].shape == (14,), "the executed action is still per-step"
         assert np.array_equal(result["action_samples"], samples), "the chunk set was sliced"
+
+
+# --------------------------------------------------------------------------------------- #
+# The renderer both surfaces share
+# --------------------------------------------------------------------------------------- #
+def _wrist_frames():
+    return {k: np.full((480, 640, 3), 40, np.uint8)
+            for k in ("agentview", "wrist_left", "wrist_right")}
+
+
+def _bimanual_samples(n=4, horizon=30):
+    samples = np.zeros((n, horizon, 14))
+    for i in range(n):
+        samples[i, :, 1] = np.linspace(0.0, 0.05 * (i + 1), horizon)     # left
+        samples[i, :, 8] = np.linspace(0.0, -0.05 * (i + 1), horizon)    # right
+    return samples
+
+
+def test_the_renderer_decorates_both_wrists_and_leaves_the_agentview_alone():
+    """The agentview is not on a wrist, so nothing here knows where it is pointing."""
+    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+
+    renderer = WristOverlayRenderer()
+    assert renderer.available, renderer.error
+
+    images = _wrist_frames()
+    out = renderer.draw(images, _bimanual_samples(), np.zeros(42), lambda _k: _intrinsics())
+
+    assert np.array_equal(out["agentview"], images["agentview"])
+    assert (out["wrist_left"] != images["wrist_left"]).any()
+    assert (out["wrist_right"] != images["wrist_right"]).any()
+
+
+def test_each_wrist_is_drawn_from_its_own_arm():
+    """Left and right chunks differ, so the two views must not come out identical -- which is
+    what happens if the action or state slice is taken from the wrong arm."""
+    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+
+    renderer = WristOverlayRenderer()
+    out = renderer.draw(_wrist_frames(), _bimanual_samples(), np.zeros(42), lambda _k: _intrinsics())
+    assert not np.array_equal(out["wrist_left"], out["wrist_right"])
+
+
+@pytest.mark.parametrize(
+    ("samples", "state", "intrinsics_for"),
+    [
+        (None, np.zeros(42), lambda _k: _intrinsics()),                    # nothing to draw
+        (_bimanual_samples(), None, lambda _k: _intrinsics()),             # no pose to project from
+        (_bimanual_samples(), np.zeros(42), lambda _k: None),              # camera never reported
+        (np.zeros((30, 14)), np.zeros(42), lambda _k: _intrinsics()),      # wrong rank
+        (_bimanual_samples(), np.zeros(6), lambda _k: _intrinsics()),      # truncated state
+    ],
+)
+def test_missing_pieces_leave_the_view_alone_rather_than_breaking_it(samples, state, intrinsics_for):
+    """A frame that cannot be decorated is still a frame worth showing: the overlay is a
+    diagnostic, and taking the live view down with it would be a worse failure than not
+    drawing."""
+    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+
+    renderer = WristOverlayRenderer()
+    images = _wrist_frames()
+    out = renderer.draw(images, samples, state, intrinsics_for)
+    for key, frame in images.items():
+        assert np.array_equal(out[key], frame), key
+
+
+def test_an_unusable_model_disables_the_overlay_instead_of_raising():
+    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+
+    renderer = WristOverlayRenderer(xml_path="/nonexistent/model.xml")
+    assert not renderer.available
+    assert renderer.error
+    images = _wrist_frames()
+    assert renderer.draw(images, _bimanual_samples(), np.zeros(42), lambda _k: _intrinsics()) == images

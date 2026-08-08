@@ -149,3 +149,94 @@ def overlay_samples(
         intrinsics = intrinsics.scaled_to(width, height)
     paths = project_samples(geometry, samples, q_now, intrinsics, arm_slice=arm_slice)
     return draw_chunk_paths(frame, paths, executed_index=executed_index)
+
+
+# Which slice of the robot's 42-d observation.state holds each arm's joint positions, and
+# which slice of a 14-d action belongs to each arm. The state is per arm [pos(7), vel(7),
+# eff(7)], so an arm's positions are the first 7 of its 21.
+ARM_STATE_SLICES = {"left": slice(0, 7), "right": slice(21, 28)}
+ARM_ACTION_SLICES = {"left": slice(0, 7), "right": slice(7, 14)}
+
+#: Camera role -> which arm's wrist it rides on. The agentview sees neither.
+WRIST_CAMERA_ARMS = {"wrist_left": "left", "wrist_right": "right"}
+
+
+class WristOverlayRenderer:
+    """Draw a chunk set onto whichever wrist views are present.
+
+    One object for the live GUI and for rendering a recorded episode afterwards: the drawing
+    must not be written twice, or the two surfaces quietly stop agreeing about what the policy
+    predicted.
+
+    Built lazily and defensively -- a missing MuJoCo, an unreadable model or a camera that
+    never reported intrinsics disables the overlay rather than breaking the view it decorates.
+    """
+
+    def __init__(self, xml_path: Optional[str] = None) -> None:
+        self._geometry = None
+        self._error = ""
+        try:
+            from workstation.policy_bridge.wrist_view import WristCameraGeometry
+
+            if xml_path is None:
+                from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
+
+                xml_path = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
+            self._geometry = WristCameraGeometry(xml_path)
+        except Exception as e:
+            self._error = f"{type(e).__name__}: {e}"
+            logger.warning("wrist overlay unavailable: %s", self._error)
+
+    @property
+    def available(self) -> bool:
+        return self._geometry is not None
+
+    @property
+    def error(self) -> str:
+        return self._error
+
+    def draw(
+        self,
+        images: dict,
+        samples: Optional[np.ndarray],
+        state: Optional[np.ndarray],
+        intrinsics_for: "callable",
+        *,
+        executed_index: int = 0,
+    ) -> dict:
+        """Return ``images`` with the wrist views overlaid; untouched views are passed through.
+
+        ``intrinsics_for(camera_key)`` supplies that camera's intrinsics or None. ``state`` is
+        the robot's 42-d observation vector, from which each arm's current joint positions are
+        taken -- the camera rides on the wrist, so the projection depends on where the arm is
+        NOW, not on where the chunk starts.
+        """
+        if not self.available or samples is None or state is None:
+            return images
+        samples = np.asarray(samples, dtype=float)
+        state = np.asarray(state, dtype=float).reshape(-1)
+        if samples.ndim != 3 or state.size < 28:
+            return images
+
+        out = dict(images)
+        for camera_key, arm in WRIST_CAMERA_ARMS.items():
+            frame = images.get(camera_key)
+            if frame is None:
+                continue
+            intrinsics = intrinsics_for(camera_key)
+            if intrinsics is None:
+                continue
+            try:
+                out[camera_key] = overlay_samples(
+                    frame,
+                    self._geometry,
+                    samples,
+                    state[ARM_STATE_SLICES[arm]],
+                    intrinsics,
+                    arm_slice=ARM_ACTION_SLICES[arm],
+                    executed_index=executed_index,
+                )
+            except Exception as e:
+                # A frame that fails to decorate is still a frame worth showing.
+                logger.debug("overlay on %s failed: %s", camera_key, e)
+        return out
