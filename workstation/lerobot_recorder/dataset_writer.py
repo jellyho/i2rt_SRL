@@ -150,7 +150,7 @@ class AsyncDatasetWriter:
         self._features: Optional[dict] = None
         self._active_episode_frames: Optional[List[dict]] = None
         self._pyav_encode_temporary = None
-        if cfg.use_videos and not self._mock and not self._abcdl:
+        if not self._mock and not self._abcdl:
             self._encoding_decision = select_encoding_backend(
                 getattr(cfg, "encoding_backend", "torchcodec"),
                 float(getattr(cfg, "torchcodec_max_used_vram_gb", 5.0)),
@@ -229,7 +229,9 @@ class AsyncDatasetWriter:
         return [f"{key.rsplit('.', 1)[-1]}.{i}" for i in range(dim)]
 
     def _build_features(self, sample: dict) -> dict:
-        img_dtype = "video" if self.cfg.use_videos else "image"
+        # Always video. Storing frames as images is not an option here: three 640x480
+        # cameras at 30 fps is ~4.5 GB a minute of PNGs on disk.
+        img_dtype = "video"
         feats: dict = {}
         for key in self.image_keys:
             feats[f"observation.images.{key}"] = {
@@ -617,7 +619,7 @@ class AsyncDatasetWriter:
                         features=self._features,
                         root=self._root,
                         robot_type=self.cfg.robot_type,
-                        use_videos=self.cfg.use_videos,
+                        use_videos=True,
                         **enc,
                     )
                 except TypeError:  # older/newer LeRobot without these kwargs — fall back
@@ -628,7 +630,7 @@ class AsyncDatasetWriter:
                         features=self._features,
                         root=self._root,
                         robot_type=self.cfg.robot_type,
-                        use_videos=self.cfg.use_videos,
+                        use_videos=True,
                     )
                 logger.info(
                     "dataset created at %s (repo_id=%s, vcodec=%s, batch=%s)",

@@ -285,7 +285,18 @@ class PortalBridge:
             # A DAgger episode is the complete policy rollout.  Keep recording
             # through human takeovers and store the command actually sent to the
             # followers in both phases; control_mode identifies its producer.
-            teleop_state = "ENGAGED" if obs.get("policy_running") else "IDLE"
+            #
+            # HOMING while the arm returns, so the episode spans ENGAGED -> HOMING -> IDLE,
+            # exactly as a teleop one does. Mapping the return straight to IDLE ended the
+            # episode the instant the rollout stopped, and the return trajectory -- the arm
+            # putting the object down and travelling home -- was never recorded at all. It is
+            # tagged control_mode=homing, so it can still be filtered out at train time.
+            if obs.get("homing"):
+                teleop_state = "HOMING"
+            elif obs.get("policy_running"):
+                teleop_state = "ENGAGED"
+            else:
+                teleop_state = "IDLE"
             action = self._fuse(sides, ("applied",), ARM_DOF)
             control_mode = CONTROL_MODE["intervention"] if intervening else CONTROL_MODE["policy"]
         elif self.cfg.record_source == "eval":

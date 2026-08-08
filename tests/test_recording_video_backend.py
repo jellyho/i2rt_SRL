@@ -261,7 +261,7 @@ def test_a_real_episode_writes_no_png_whatever_the_config_says(tmp_path, configu
         }
 
     cfg = RecorderConfig(repo_id="t/nopng", root=str(tmp_path), mock=False, fps=30,
-                         use_videos=True, encoding_backend=configured_backend)
+                         encoding_backend=configured_backend)
     writer = AsyncDatasetWriter(cfg, list(cams), cams)
     writer.open(frame(0))
     writer.submit([frame(i) for i in range(15)], "t", "success")
@@ -274,3 +274,91 @@ def test_a_real_episode_writes_no_png_whatever_the_config_says(tmp_path, configu
     assert len(list(dataset.rglob("*.mp4"))) == len(cams)
     info = json.loads((dataset / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 1 and info["total_frames"] == 15
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"encoding_backend": "torchcodec"},
+        {"encoding_backend": "pyav"},
+        {"vcodec": "h264"},
+        {"vcodec": "auto"},
+        {"image_writer_threads": 4, "image_writer_processes": 1},
+        {"batch_encoding_size": 4},
+    ],
+)
+def test_no_reachable_video_setting_writes_an_image(tmp_path, settings):
+    """Sweep the settings that reach the encoder and check the filesystem after each.
+
+    This has now been got wrong twice by checking an intermediate instead of the result --
+    once by asserting a kwarg was passed, once by asserting a method was patched, and both
+    times something downstream still put frames on disk. So: record, then look.
+    """
+    import json
+
+    import numpy as np
+
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    cams = {"cam": (48, 48, 3)}
+
+    def frame(i):
+        return {
+            "state": np.zeros(42, np.float32),
+            "action": np.zeros(14, np.float32),
+            "leader": np.zeros(12, np.float32),
+            "eef": np.zeros(14, np.float32),
+            "images": {"cam": np.full((48, 48, 3), i % 255, np.uint8)},
+            "task": "t",
+        }
+
+    cfg = RecorderConfig(repo_id="t/sweep", root=str(tmp_path), mock=False, fps=30, **settings)
+    writer = AsyncDatasetWriter(cfg, list(cams), cams)
+    writer.open(frame(0))
+    for i in range(12):
+        writer.stream_frame(frame(i))
+    writer.end_episode("success", "t")
+    writer.finalize()
+
+    dataset = tmp_path / "sweep"
+    assert list(dataset.rglob("*.png")) == [], settings
+    assert not (dataset / "images").exists(), settings
+    assert len(list(dataset.rglob("*.mp4"))) == 1, settings
+    info = json.loads((dataset / "meta" / "info.json").read_text())
+    assert info["total_frames"] == 12, settings
+
+
+def test_there_is_no_way_to_ask_for_an_image_dataset(tmp_path):
+    """`use_videos` is gone, not merely defaulted or guarded.
+
+    It skipped the encoder and stored every frame as a PNG *as the dataset format*, which no
+    encoder-side guard could have caught -- it never reached the encoder. Removing the option
+    is what makes "no images, ever" a property of the code rather than of the config file.
+    """
+    import numpy as np
+
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    assert not hasattr(RecorderConfig(), "use_videos"), "the option is gone on purpose"
+    with pytest.raises(TypeError):
+        RecorderConfig(use_videos=False)
+
+    # ...and the schema the writer builds says video, with no branch that could say image.
+    cams = {"cam": (48, 48, 3)}
+    frame = {
+        "state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "images": {"cam": np.zeros((48, 48, 3), np.uint8)},
+        "task": "t",
+    }
+    cfg = RecorderConfig(repo_id="t/raw", root=str(tmp_path), mock=False, fps=30)
+    writer = AsyncDatasetWriter(cfg, list(cams), cams)
+    features = writer._build_features(frame)
+    image_features = [k for k, v in features.items() if k.startswith("observation.images.")]
+    assert image_features
+    assert all(features[k]["dtype"] == "video" for k in image_features), features

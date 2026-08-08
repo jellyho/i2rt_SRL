@@ -14,6 +14,43 @@ from workstation.lerobot_recorder.portal_bridge import PortalBridge
 from workstation.lerobot_recorder.recorder import Recorder
 
 
+class _FakeWriter(SimpleNamespace):
+    """Stand-in writer that records what the recorder streams to it.
+
+    The recorder no longer keeps an episode in memory -- frames go to the writer one at a
+    time -- so a fake that cannot receive them tests the wrong path. `frames` is the episode
+    in flight, exactly what `rec._episode` used to hold.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(
+            num_episodes=0, total_episodes=0, outcome_totals={"success": 0, "fail": 0},
+            queue_depth=0, low_disk=False, finalized=False,
+            progress={"saving": False, "queued": 0}, **kw
+        )
+        self.frames = []
+        self.saved = []
+
+    def supports_streaming(self):
+        return True
+
+    def stream_frame(self, frame):
+        self.frames.append(frame)
+
+    def end_episode(self, outcome, task):
+        self.saved.append((list(self.frames), outcome, task))
+        self.frames = []
+
+    def abort_episode(self):
+        self.frames = []
+
+
+def _in_flight(rec):
+    """The frames of the episode in progress, whichever path the recorder took."""
+    writer = rec.writer
+    return getattr(writer, "frames", None) if hasattr(writer, "frames") else rec._episode
+
+
 def test_recorder_start_failure_releases_hardware(tmp_path, monkeypatch):
     cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), mock=True)
     rec = Recorder(cfg)
@@ -237,14 +274,7 @@ def test_control_mode_in_frame():
 def test_recenter_pauses_appends_without_closing_episode():
     cfg = RecorderConfig(record_source="teleop", mock=True)
     rec = Recorder(cfg)
-    rec.writer = SimpleNamespace(
-        num_episodes=0,
-        total_episodes=0,
-        outcome_totals={"success": 0, "fail": 0},
-        queue_depth=0,
-        low_disk=False,
-        progress={"saving": False, "queued": 0},
-    )
+    rec.writer = _FakeWriter()
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
     snap = {
@@ -259,19 +289,19 @@ def test_recenter_pauses_appends_without_closing_episode():
     }
 
     rec._step(images, snap)
-    assert len(rec._episode) == 1
+    assert len(_in_flight(rec)) == 1
     assert rec.gate.recording is True
 
     snap["leader_recentering"] = True
     rec._step(images, snap)
     rec._step(images, snap)
-    assert len(rec._episode) == 1  # no frame, state, or action => no dataset time
+    assert len(_in_flight(rec)) == 1  # no frame, state, or action => no dataset time
     assert rec.gate.recording is True  # same episode remains open internally
     assert rec.get_status()["recording"] is False
 
     snap["leader_recentering"] = False
     rec._step(images, snap)
-    assert len(rec._episode) == 2
+    assert len(_in_flight(rec)) == 2
     assert rec.get_status()["recording"] is True
 
 
@@ -355,17 +385,8 @@ def test_finish_clears_policy_action_and_latched_rollout_request():
 def test_dagger_records_one_rollout_across_interventions():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     rec = Recorder(cfg)
-    submitted = []
-    rec.writer = SimpleNamespace(
-        num_episodes=0,
-        total_episodes=0,
-        outcome_totals={"success": 0, "fail": 0},
-        queue_depth=0,
-        low_disk=False,
-        progress={"saving": False, "queued": 0},
-        finalized=False,
-        submit=lambda frames, outcome, task: submitted.append((list(frames), outcome, task)),
-    )
+    rec.writer = _FakeWriter()
+    submitted = rec.writer.saved
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
 
@@ -387,8 +408,8 @@ def test_dagger_records_one_rollout_across_interventions():
     rec._step(images, snap(intervention=True, mode=2))
     rec._step(images, snap())
     assert rec.gate.recording is True
-    assert len(rec._episode) == 3
-    assert [int(f["observation.control_mode"][0]) for f in rec._episode] == [1, 2, 1]
+    assert len(_in_flight(rec)) == 3
+    assert [int(f["observation.control_mode"][0]) for f in _in_flight(rec)] == [1, 2, 1]
     assert rec.get_status()["interventions"] == 1
 
     rec._step(images, snap(running=False, event={"seq": 1, "action": "keep"}))
@@ -403,14 +424,7 @@ def test_dagger_records_one_rollout_across_interventions():
 def test_dagger_discard_drops_the_complete_rollout():
     cfg = RecorderConfig(record_source="dagger", mock=False, review_before_save=False)
     rec = Recorder(cfg)
-    rec.writer = SimpleNamespace(
-        num_episodes=0,
-        total_episodes=0,
-        outcome_totals={"success": 0, "fail": 0},
-        queue_depth=0,
-        low_disk=False,
-        progress={"saving": False, "queued": 0},
-    )
+    rec.writer = _FakeWriter()
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
     base = {
@@ -432,7 +446,7 @@ def test_dagger_discard_drops_the_complete_rollout():
             "last_dagger_event": {"seq": 1, "action": "discard"},
         },
     )
-    assert rec._episode == []
+    assert _in_flight(rec) == []
     assert rec.get_status()["discarded"] == 1
     assert rec.get_status()["kept"] == 0
 

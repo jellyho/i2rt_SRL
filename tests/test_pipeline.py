@@ -380,7 +380,7 @@ def test_streaming_memory_does_not_grow_with_episode_length(tmp_path):
             "task": "t",
         }
 
-    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=False, fps=30, use_videos=True)
+    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=False, fps=30)
     writer = AsyncDatasetWriter(cfg, list(cams), cams)
     writer.open(frame(0))
     assert writer.supports_streaming()
@@ -419,7 +419,7 @@ def test_streaming_abort_drops_the_episode_and_leaves_the_writer_usable(tmp_path
             "task": "t",
         }
 
-    cfg = RecorderConfig(repo_id="t/abort", root=str(tmp_path), mock=False, fps=30, use_videos=True)
+    cfg = RecorderConfig(repo_id="t/abort", root=str(tmp_path), mock=False, fps=30)
     writer = AsyncDatasetWriter(cfg, list(cams), cams)
     writer.open(frame(0))
 

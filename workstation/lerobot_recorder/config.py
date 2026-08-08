@@ -92,8 +92,6 @@ class RecorderConfig:
     task: str = "do the task"  # ACTIVE language instruction (persists until changed)
     tasks: List[str] = field(default_factory=list)  # quick-switch templates shown in the GUI
     fps: int = 60  # dataset / record-loop rate (matched to the 60 fps cameras)
-    robot_type: str = "yam_bimanual"
-    use_videos: bool = True
     # Output dataset format: "lerobot" (LeRobotDataset, default) or "abcdl" (the abcdl
     # MP4+binary training cache — one episode dir per save, loadable via AbcdlDataset /
     # pushable with AbcdlDataset.push_to_hub). Needs the `abcdl` package installed.
@@ -124,6 +122,7 @@ class RecorderConfig:
     # encoder; the alternative round-trips every frame of every camera through a ~1.5 MB PNG
     # on disk, which is not a mode worth being one config key away from. See
     # AsyncDatasetWriter._dataset_encoding_kwargs.)
+    robot_type: str = "yam_bimanual"
     cameras: List[CameraSpec] = field(default_factory=default_cameras)
     # Robot link: the YAM robot machine running i2rt.serving.run_robot_server (portal).
     robot_host: str = "127.0.0.1"
@@ -186,7 +185,6 @@ def apply_recorder_section(cfg: RecorderConfig, rec_section) -> RecorderConfig:
     cfg.reward_mode = str(g("reward_mode", cfg.reward_mode))
     cfg.discount_factor = float(g("discount_factor", cfg.discount_factor))
     # video-encoding knobs (saving speed)
-    cfg.use_videos = bool(g("use_videos", cfg.use_videos))
     cfg.vcodec = str(g("vcodec", cfg.vcodec))
     cfg.encoding_backend = str(g("encoding_backend", cfg.encoding_backend))
     cfg.torchcodec_max_used_vram_gb = float(

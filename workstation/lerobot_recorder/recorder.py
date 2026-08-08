@@ -88,7 +88,13 @@ class Recorder:
         }
         self._last_images: dict = {}
         self._pending = False
-        self._episode: List[dict] = []  # buffered frames for the in-progress / pending episode
+        # Frames of the in-progress / pending episode. Only ever populated on the fallback
+        # path (per-frame RL signals, which need the whole episode before any frame can be
+        # written); otherwise frames go straight to the writer and this stays empty --
+        # see _ep_add. _n_frames is the count either way.
+        self._episode: List[dict] = []
+        self._n_frames = 0
+        self._streaming_episode = False
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
@@ -229,7 +235,8 @@ class Recorder:
             return
         self.gate.arm()
         if self._eval:  # eval: arm starts one continuous rollout
-            self._episode, self._preview, self._btn_outcome = [], [], None
+            self._reset_episode()
+            self._btn_outcome = None
             logger.info("collection armed (eval) — recording rollout until you stop")
         elif self.cfg.record_source == "dagger":
             logger.info("collection armed — each complete policy rollout is recorded as an episode")
@@ -247,7 +254,7 @@ class Recorder:
         if self._eval:
             if self._btn_outcome == "discard":
                 self._discard_episode(counted=True)
-            elif not self._episode:
+            elif self._ep_empty():
                 self._discard_episode()
             elif self.cfg.review_before_save and self._btn_outcome is None:
                 self._pending = True
@@ -279,22 +286,55 @@ class Recorder:
             self._discard_episode(counted=True)
             self._set(pending=False, frames=0)
 
-    def _submit(self, outcome: Optional[str]) -> None:
-        """Hand the buffered episode to the writer queue and update live stats."""
-        self._log_ram_after_episode(len(self._episode))
+    # ---------------------------------------------------------------- episode sink
+    def _ep_add(self, frame: dict) -> None:
+        """Take one captured frame, either streaming it out or buffering it.
+
+        Streaming is the point: three 640x480 cameras are ~2.8 MB a frame, so holding an
+        episode as a list costs ~2.5 GB for 30 s and ~7.5 GB for 90 s -- which is what pushed
+        the machine into swap and got this process OOM-killed mid-episode. The writer takes
+        frames one at a time over a bounded queue instead.
+        """
         writer = self._ensure_writer_open()
-        writer.submit(self._episode, outcome, self.cfg.task)
+        if not self._n_frames:
+            self._streaming_episode = writer.supports_streaming()
+        if self._streaming_episode:
+            writer.stream_frame(frame)
+        else:
+            self._episode.append(frame)
+        self._n_frames += 1
+
+    def _ep_empty(self) -> bool:
+        return self._n_frames == 0
+
+    def _submit(self, outcome: Optional[str]) -> None:
+        """Close the episode out to the writer and update live stats."""
+        self._log_ram_after_episode(self._n_frames)
+        writer = self._ensure_writer_open()
+        if self._streaming_episode:
+            writer.end_episode(outcome, self.cfg.task)
+        else:
+            writer.submit(self._episode, outcome, self.cfg.task)
         with self._lock:
             self._status["kept"] += 1
             if outcome in ("success", "fail"):
                 self._status[outcome] += 1
-        self._episode, self._preview, self._pending = [], [], False
+        self._reset_episode()
 
     def _discard_episode(self, *, counted: bool = False) -> None:
         if counted:
             with self._lock:
                 self._status["discarded"] += 1
+        # A streamed episode is already inside LeRobot's buffer, so discarding it is the
+        # writer's job rather than just dropping a list.
+        if self._streaming_episode and self._n_frames and self.writer is not None:
+            self.writer.abort_episode()
+        self._reset_episode()
+
+    def _reset_episode(self) -> None:
         self._episode, self._preview, self._pending = [], [], False
+        self._n_frames = 0
+        self._streaming_episode = False
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -313,7 +353,7 @@ class Recorder:
             return
         if self._pending:
             raise RuntimeError("review the pending episode before saving the dataset")
-        if self.gate.recording or (self._eval and self.gate.armed and self._episode):
+        if self.gate.recording or (self._eval and self.gate.armed and not self._ep_empty()):
             raise RuntimeError("finish or stop the current recording before saving the dataset")
 
         was_armed = self.gate.armed
@@ -470,10 +510,17 @@ class Recorder:
         if limit <= 0 or not frames:
             return
         free = self.available_ram_gb()
-        logger.info(
-            "episode buffered %d frames (~%.1f GB); %.1f GB available now",
-            frames, frames * self._frame_mb() / 1000, free,
-        )
+        if self._streaming_episode:
+            logger.info(
+                "episode streamed %d frames (~%.1f GB, none of it held in RAM); "
+                "%.1f GB available now",
+                frames, frames * self._frame_mb() / 1000, free,
+            )
+        else:
+            logger.info(
+                "episode buffered %d frames (~%.1f GB); %.1f GB available now",
+                frames, frames * self._frame_mb() / 1000, free,
+            )
         if free < limit * 1.5:
             logger.warning(
                 "memory is getting tight (%.1f GB free, limit %.1f GB) — the next episode "
@@ -564,7 +611,7 @@ class Recorder:
                 and snap["state"] is not None
                 and snap["action"] is not None
             ):
-                self._episode.append(self._frame(images, snap))
+                self._ep_add(self._frame(images, snap))
                 self._buffer_preview(images)
             self._set(
                 armed=self.gate.armed,
@@ -575,7 +622,7 @@ class Recorder:
                 episodes_total=self.writer.total_episodes,
                 success_total=self.writer.outcome_totals["success"],
                 fail_total=self.writer.outcome_totals["fail"],
-                frames=len(self._episode),
+                frames=self._n_frames,
                 queue=self.writer.queue_depth,
                 cam_ok=self.cameras.healthy,
                 robot_ok=self.robot.connected,
@@ -606,7 +653,8 @@ class Recorder:
                     self.gate.disarm()
                     self._set(armed=False, recording=False)
                     return
-                self._episode, self._preview, self._btn_outcome = [], [], None
+                self._reset_episode()
+                self._btn_outcome = None
                 if self.cfg.record_source == "dagger":
                     logger.info("● recording DAgger rollout (policy started)")
                 else:
@@ -617,11 +665,11 @@ class Recorder:
                 and snap["action"] is not None
                 and self.cameras.healthy
             ):
-                self._episode.append(self._frame(images, snap))
+                self._ep_add(self._frame(images, snap))
                 self._buffer_preview(images)
 
         if event == eg.EV_STOP:
-            if not self._episode:
+            if self._ep_empty():
                 logger.warning(
                     "episode ended with 0 frames — nothing saved (cameras healthy? robot state/action present?)"
                 )
@@ -631,7 +679,7 @@ class Recorder:
                 self._submit(self._btn_outcome)  # button auto-label+save
             elif self.cfg.review_before_save:
                 self._pending = True  # hold for Keep/Delete
-                logger.info("episode ready for review (%d frames) — keep [S/F] or delete [D]", len(self._episode))
+                logger.info("episode ready for review (%d frames) — keep [S/F] or delete [D]", self._n_frames)
             else:
                 self._submit(None)
 
@@ -644,7 +692,7 @@ class Recorder:
             episodes_total=self.writer.total_episodes,
                 success_total=self.writer.outcome_totals["success"],
                 fail_total=self.writer.outcome_totals["fail"],
-            frames=len(self._episode),
+            frames=self._n_frames,
             queue=self.writer.queue_depth,
             cam_ok=self.cameras.healthy,
             robot_ok=self.robot.connected,

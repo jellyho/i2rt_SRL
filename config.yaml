@@ -141,7 +141,6 @@ recorder:
   image_writer_threads: 12   # temp-PNG writer threads (the slow pre-encode step of the fallback);
                              # LeRobot advises ~4 per camera. 0 = synchronous (slowest)
   image_writer_processes: 0  # >0 = also use subprocesses if threads alone aren't enough
-  # use_videos: true         # false = store raw frames (no encode; fastest save, larger on disk)
   # Single source for teleop end+label behavior. Each mapped button both starts
   # homing on the robot and assigns this outcome in the recorder.
   buttons:                   # "<side>.<index>" -> success | fail | discard (upper=0, lower=1)
