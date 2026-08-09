@@ -757,6 +757,10 @@ class DeployController(BaseController):
         # grippers open to put down whatever they are holding (see finish_dagger_run).
         self._releasing_grip = False
         self._releasing_grip_t0 = 0.0
+        # Latched once the policy has actually driven the followers at least once this
+        # rollout. `policy_running` says the operator asked for a rollout; this says one is
+        # under way. See the snapshot's `policy_driving`.
+        self._policy_drove = False
         # True once the homing travel is under way, so the closing phase that follows it
         # knows to go back to idle rather than hand control to the policy.
         self._closing_at_home = False
@@ -940,9 +944,14 @@ class DeployController(BaseController):
                     )
                 logger.info("closing the gripper before starting the rollout")
         self._policy_running = driving
+        if requested and not self._policy_running:
+            # Starting: nothing has driven yet. Cleared here as well as on stop so a rollout
+            # deferred behind the gripper close does not inherit the previous one's latch.
+            self._policy_drove = False
         if not requested:
             # An actual stop request, not the deferral above, cancels a pending close.
             self._closing_grip = False
+            self._policy_drove = False
             self.set_intervention(False)
 
     def _grip_open(self, tol: float = _GRIP_CLOSED_TOL) -> bool:
@@ -983,6 +992,7 @@ class DeployController(BaseController):
         self._intervening = False
         self._closing_grip = False
         self._closing_at_home = False
+        self._policy_drove = False
         self._reset_fine_grained()
         # Put down whatever is being held BEFORE travelling, so an object is released where
         # it was worked on rather than dragged across the workspace and dropped at home.
@@ -1213,6 +1223,7 @@ class DeployController(BaseController):
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
                         desired = act[:n]
+                        self._policy_drove = True
                 elif self._has_grip:
                     # Stopped. Nothing used to be commanded here at all, so the gripper had
                     # no holding force and drifted open the moment the server came up — a
@@ -1328,6 +1339,12 @@ class DeployController(BaseController):
                 "leader_recentering": self._leader_recentering,
                 "recenter_fault": self._recenter_fault,
                 "policy_running": bool(self._policy_running),
+                # Whether a rollout is actually UNDER WAY, as opposed to merely requested.
+                # The two differ for as long as the first inference takes -- a JAX compile is
+                # tens of seconds -- during which the arm holds still and no policy action
+                # exists. Recording that stretch labels a stationary arm as policy-driven.
+                # Latched, so a mid-rollout hiccup does not split the episode in two.
+                "policy_driving": bool(self._policy_drove) or bool(self._intervening),
                 "leader_mirror": bool(self._leader_mirror),
                 # Releasing and the closing tail are part of the same homing routine: report
                 # them as homing so nothing starts a rollout or streams actions mid-sequence.

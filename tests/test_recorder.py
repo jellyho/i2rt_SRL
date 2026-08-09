@@ -695,3 +695,35 @@ def test_available_ram_is_read_from_proc():
     assert free > 0
     if free != float("inf"):
         assert free < 10_000
+
+
+def test_no_episode_starts_while_the_first_inference_is_still_running():
+    """End to end through the bridge: the compile stall must not become recorded frames."""
+    from workstation.lerobot_recorder.portal_bridge import PortalBridge
+
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    bridge = PortalBridge(cfg)
+    side = {"pos": np.zeros(7), "vel": np.zeros(7), "eff": np.zeros(7), "applied": np.zeros(7)}
+
+    requested = bridge._assemble({
+        "left": side, "right": side,
+        "policy_running": True, "policy_driving": False,     # asked for, not yet driving
+    })
+    assert requested["teleop_state"] == "IDLE"
+
+    driving = bridge._assemble({
+        "left": side, "right": side,
+        "policy_running": True, "policy_driving": True,
+    })
+    assert driving["teleop_state"] == "ENGAGED"
+
+
+def test_an_older_robot_server_still_records():
+    """A server that predates `policy_driving` must not silently stop producing episodes."""
+    from workstation.lerobot_recorder.portal_bridge import PortalBridge
+
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    bridge = PortalBridge(cfg)
+    side = {"pos": np.zeros(7), "vel": np.zeros(7), "eff": np.zeros(7), "applied": np.zeros(7)}
+    old = bridge._assemble({"left": side, "right": side, "policy_running": True})
+    assert old["teleop_state"] == "ENGAGED"

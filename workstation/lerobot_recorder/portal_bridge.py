@@ -38,6 +38,7 @@ _EMPTY = {
     "leader_recentering": False,
     "recenter_fault": False,
     "policy_running": False,
+    "policy_driving": False,
     "leader_mirror": True,
     "homing": False,
     "dagger_state": "stopped",
@@ -293,7 +294,13 @@ class PortalBridge:
             # tagged control_mode=homing, so it can still be filtered out at train time.
             if obs.get("homing"):
                 teleop_state = "HOMING"
-            elif obs.get("policy_running"):
+            elif obs.get("policy_driving", obs.get("policy_running")):
+                # `policy_driving`, not `policy_running`: the latter is true the moment the
+                # operator asks for a rollout, while the policy's FIRST inference is still
+                # running -- a JAX compile is tens of seconds. Recording that stretch writes
+                # hundreds of frames of a stationary arm labelled control_mode=policy, which
+                # teaches "given this observation, do nothing". Falls back to policy_running
+                # for a robot server too old to report the difference.
                 teleop_state = "ENGAGED"
             else:
                 teleop_state = "IDLE"
@@ -323,6 +330,7 @@ class PortalBridge:
             "leader_recentering": bool(obs.get("leader_recentering")),
             "recenter_fault": bool(obs.get("recenter_fault")),
             "policy_running": bool(obs.get("policy_running")),
+            "policy_driving": bool(obs.get("policy_driving", obs.get("policy_running"))),
             "leader_mirror": bool(obs.get("leader_mirror", True)),
             "homing": bool(obs.get("homing")),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),

@@ -255,3 +255,63 @@ def test_nothing_can_cut_into_the_homing_routine():
     dc.set_intervention(True)
     assert dc.snapshot()["policy_running"] is False
     assert dc.snapshot()["intervention"] is False
+
+
+def test_a_rollout_is_not_under_way_until_the_policy_actually_drives():
+    """`policy_running` is the request; `policy_driving` is the fact.
+
+    They differ for as long as the first inference takes, and a JAX compile is tens of
+    seconds. The recorder gates the episode on the teleop state, so treating the request as
+    the fact writes hundreds of frames of a stationary arm labelled control_mode=policy --
+    which teaches "given this observation, do nothing", at the head of every episode.
+    """
+    dc = DaggerController(DaggerConfig(sim=True, max_joint_speed=10.0, home_speed=10.0))
+    dc.step()
+    assert dc.snapshot()["policy_driving"] is False
+
+    dc.set_policy_running(True)
+    for _ in range(5):          # the gripper-close phase, then waiting on a policy action
+        dc.step()
+    assert dc.snapshot()["policy_running"] is True
+    assert dc.snapshot()["policy_driving"] is False, "no action has arrived yet"
+
+    dc.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+    dc.step()
+    assert dc.snapshot()["policy_driving"] is True
+
+
+def test_the_driving_latch_survives_a_gap_in_policy_actions():
+    """A network hiccup mid-rollout must not split the episode in two.
+
+    The gate ends an episode when the state leaves ENGAGED, so an un-latched signal would
+    close the episode on every dropped packet and open a new one after it.
+    """
+    dc = DaggerController(DaggerConfig(sim=True, max_joint_speed=10.0, home_speed=10.0))
+    dc.step()
+    dc.set_policy_running(True)
+    for _ in range(5):
+        dc.step()
+    dc.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+    dc.step()
+    assert dc.snapshot()["policy_driving"] is True
+
+    # Actions stop arriving; the controller's own staleness watchdog makes the arm hold.
+    for _ in range(40):
+        dc.step()
+    assert dc.snapshot()["policy_driving"] is True, "a stall must not end the episode"
+
+
+def test_the_latch_clears_between_rollouts():
+    """Otherwise the next rollout starts 'already driving' and records its own compile."""
+    dc = DaggerController(DaggerConfig(sim=True, max_joint_speed=10.0, home_speed=10.0))
+    dc.step()
+    dc.set_policy_running(True)
+    for _ in range(5):
+        dc.step()
+    dc.set_policy_action({"left": np.zeros(7), "right": np.zeros(7)})
+    dc.step()
+    assert dc.snapshot()["policy_driving"] is True
+
+    dc.set_policy_running(False)
+    dc.step()
+    assert dc.snapshot()["policy_driving"] is False
