@@ -48,7 +48,6 @@ class Recorder:
         self,
         cfg: RecorderConfig,
         on_status: Optional[Callable[[dict], None]] = None,
-        samples_fn: Optional[Callable[[], Optional[np.ndarray]]] = None,
     ) -> None:
         self.cfg = cfg
         self.cameras = CameraManager(cfg)
@@ -119,11 +118,11 @@ class Recorder:
         # takeover are unchanged, so this is the recorder minus the dataset.
         self._deploy = cfg.record_source == "deploy"
         self._last_ram_gb = 0.0
-        # Supplies the action chunks the policy sampled for the current frame, when something
-        # is asking for them (the deploy runner). Logged beside the dataset, not in it -- see
-        # yam_policy.viz.sample_log for why.
-        self._samples_fn = samples_fn
-        self._sample_log = None
+        # Per-step arrays the policy declared at handshake: {name: shape} for the schema, and
+        # a callable returning this step's values. Both arrive after the policy connects, so
+        # they are set before the dataset is opened rather than at construction.
+        self._extra_features: Dict[str, tuple] = {}
+        self._extras_fn: Optional[Callable[[], Dict[str, np.ndarray]]] = None
 
     # ------------------------------------------------------------------ control
     def start(self) -> None:
@@ -135,7 +134,10 @@ class Recorder:
             self.cameras.start()
             self.robot.start()
             self._check_robot_mode()
-            if not self._deploy:
+            # Not opened here when a policy drives: the schema may include columns the policy
+            # only declares at handshake, which has not happened yet. _ensure_writer_open
+            # opens it on the first recorded frame, by which time it has.
+            if not self._deploy and self.cfg.record_source not in ("dagger", "eval"):
                 self.writer = self._open_writer()
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -193,7 +195,8 @@ class Recorder:
 
     def _open_writer(self) -> AsyncDatasetWriter:
         shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}
-        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes)
+        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes,
+                                    extra_features=self._extra_features)
         writer.open(self._sample_frame())
         return writer
 
@@ -220,6 +223,8 @@ class Recorder:
             "observation.eef": np.zeros(EEF_DIM, np.float32),
             "observation.control_mode": np.zeros(1, np.float32),
             "action": np.zeros(ACTION_DIM, np.float32),
+            **{name: np.zeros(int(np.prod(shape)), np.float32)
+               for name, shape in self._extra_features.items()},
         }
 
     @staticmethod
@@ -297,32 +302,40 @@ class Recorder:
             self._set(pending=False, frames=0)
 
     # ---------------------------------------------------------------- episode sink
-    def set_samples_source(self, samples_fn) -> None:
-        """Attach the thing that knows what the policy sampled for the current frame.
+    def set_extra_features(self, features: Dict[str, tuple], values_fn) -> None:
+        """Declare extra per-step columns, and where to read them each frame.
 
-        A setter rather than a constructor argument because the deploy runner needs the
-        recorder's camera frames, so it cannot exist yet when the recorder is built.
+        Called once the policy handshake is in, which is why the dataset is not opened until
+        the first recorded frame: the schema has to include these, and nothing knows them
+        before the server says so.
         """
-        self._samples_fn = samples_fn
+        self._extra_features = {str(k): tuple(v) for k, v in (features or {}).items()}
+        self._extras_fn = values_fn if self._extra_features else None
+        if self._extra_features:
+            logger.info("recording extra per-step features: %s", ", ".join(
+                f"{k}{v}" for k, v in self._extra_features.items()))
 
-    def _log_samples(self) -> None:
-        """Collect this frame's sampled chunks, if any. Never fatal: a lost diagnostic must
-        not cost the episode it describes."""
-        if self._samples_fn is None:
-            return
+    def _extra_values(self) -> Dict[str, np.ndarray]:
+        """This frame's extras, zero-filled when the policy did not send one.
+
+        A declared column has to exist on every frame -- LeRobot's schema is fixed -- so a
+        missing value becomes zeros rather than a hole. That is a real loss of meaning, which
+        is why _set_extras only ever drops a value it cannot use, loudly.
+        """
+        if self._extras_fn is None:
+            return {}
         try:
-            if self._sample_log is None:
-                from yam_policy.viz import EpisodeSampleLog
-
-                self._sample_log = EpisodeSampleLog()
-            row = self._samples_fn()
-            if isinstance(row, dict):
-                self._sample_log.add(self._n_frames, row.get("samples"),
-                                     chosen=int(row.get("chosen", 0) or 0), scores=row.get("scores"))
-            else:
-                self._sample_log.add(self._n_frames, row)
+            got = self._extras_fn() or {}
         except Exception as e:
-            logger.debug("action-sample logging skipped: %s", e)
+            logger.debug("extra features unavailable this frame: %s", e)
+            got = {}
+        out = {}
+        for name, shape in self._extra_features.items():
+            size = int(np.prod(shape))
+            value = got.get(name)
+            out[name] = (np.zeros(size, np.float32) if value is None
+                         else np.asarray(value, np.float32).reshape(-1)[:size])
+        return out
 
     def _ep_add(self, frame: dict) -> None:
         """Take one captured frame, either streaming it out or buffering it.
@@ -339,7 +352,6 @@ class Recorder:
             writer.stream_frame(frame, self.cfg.task)
         else:
             self._episode.append(frame)
-        self._log_samples()
         self._n_frames += 1
 
     def _ep_empty(self) -> bool:
@@ -350,9 +362,9 @@ class Recorder:
         self._log_ram_after_episode(self._n_frames)
         writer = self._ensure_writer_open()
         if self._streaming_episode:
-            writer.end_episode(outcome, self.cfg.task, sample_log=self._sample_log)
+            writer.end_episode(outcome, self.cfg.task)
         else:
-            writer.submit(self._episode, outcome, self.cfg.task, sample_log=self._sample_log)
+            writer.submit(self._episode, outcome, self.cfg.task)
         with self._lock:
             self._status["kept"] += 1
             if outcome in ("success", "fail"):
@@ -373,9 +385,6 @@ class Recorder:
         self._episode, self._preview, self._pending = [], [], False
         self._n_frames = 0
         self._streaming_episode = False
-        # Dropped, not reset: the log just handed to the writer is being written on another
-        # thread, so reusing the object would race with it.
-        self._sample_log = None
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -617,6 +626,7 @@ class Recorder:
             "observation.eef": self._fit(snap.get("eef"), EEF_DIM),
             "observation.control_mode": np.array([control_mode], dtype=np.float32),
             "action": self._fit(snap.get("action"), ACTION_DIM),
+            **self._extra_values(),
         }
 
     def _step(self, images: dict, snap: dict) -> None:

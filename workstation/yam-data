@@ -12,7 +12,6 @@
 #   workstation/yam-data check-videos    # verify videos really hold the frames meta/ claims (--fix repairs)
 #   workstation/yam-data recover         # clear what a crashed recording left behind (--fix moves it aside)
 #   workstation/yam-data deploy [args]   # policy deployment (mode + record are UI toggles; --headless for no GUI)
-#   workstation/yam-data render-samples  # replay an episode with the policy's sampled chunks drawn on it
 #   workstation/yam-data cams            # list connected RealSense serials
 #   workstation/yam-data tune [args]     # GUI exposure/brightness tuner (match cameras)
 #   workstation/yam-data doctor [args]   # dataset stats / validation
@@ -58,7 +57,6 @@ case "$cmd" in
         echo "yam-data bridge has moved: use 'yam-data deploy --headless' (same loop, and it can record)" >&2
         exit 2 ;;
     deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;
-    render-samples) exec python -m workstation.policy_bridge.render_samples "$@" ;;
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;

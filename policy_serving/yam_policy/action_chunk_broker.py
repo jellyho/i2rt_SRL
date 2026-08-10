@@ -14,6 +14,12 @@ client then drives any policy, whatever chunk size it was trained with.
 
 The inner policy must return ``{"actions": ndarray(chunk, action_dim), ...}``. Each
 ``infer`` returns that dict with array fields sliced to the current step.
+
+**Extra per-step data rides along.** A policy may return more than actions -- a critic's Q per
+step, the candidate chunks it chose between, anything it wants recorded. Those arrays are
+sliced by the same rule: leading axis equal to the chunk means per-step, so step `i` gets row
+`i`. Nothing here knows their names; the server declares those at handshake (see
+``extra_features`` in the server metadata) and the recorder turns them into dataset columns.
 """
 
 from __future__ import annotations
@@ -28,16 +34,18 @@ from .base_policy import BasePolicy
 logger = logging.getLogger(__name__)
 
 
-#: Keys that describe the CHUNK rather than one step of it, so indexing them by step would
-#: return something entirely different. ``action_samples`` is [N, horizon, dim] -- the other
-#: chunks the policy might have picked -- and slicing it by step yields sample number `step`,
-#: which is not wrong-looking data, it is a different chunk presented as the current action.
-_PER_CHUNK_KEYS = frozenset({"action_samples"})
-
-
 def _slice_step(results: Dict, step: int) -> Dict:
+    """One step out of a chunked reply.
+
+    Every array whose leading axis is the chunk is sliced, ``actions`` and whatever else the
+    policy sent along -- Q values per step, candidate chunks, anything. That is the contract:
+    an extra array is per-step data, indexed like the actions it accompanies. An array whose
+    leading axis is NOT the chunk is passed through whole rather than mis-indexed, because
+    slicing it would return a different thing entirely and look like data.
+    """
+    chunk = chunk_len(results)
     return {
-        k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 and k not in _PER_CHUNK_KEYS else v)
+        k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 and v.shape[0] == chunk else v)
         for k, v in results.items()
     }
 

@@ -23,6 +23,37 @@ from workstation.policy_bridge.config import BridgeConfig
 logger = logging.getLogger(__name__)
 
 
+def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
+    """What extra per-step arrays this policy sends, from its handshake metadata.
+
+    The client hard-codes none of it. A policy that wants its critic values, its candidate
+    chunks, or anything else recorded declares them once:
+
+        {"extra_features": {"critic_q": [1], "action_samples": [8, 14]}}
+
+    The shape given is ONE STEP's shape -- the chunk axis is implied, because that is what
+    makes the value per-step and therefore recordable as a dataset column. Anything malformed
+    is dropped with a warning rather than taken on faith: a wrong shape here becomes a wrong
+    column in every episode of the dataset.
+    """
+    declared = meta.get("extra_features") or {}
+    if not isinstance(declared, dict):
+        logger.warning("ignoring extra_features: expected a mapping, got %s", type(declared).__name__)
+        return {}
+    out: Dict[str, tuple] = {}
+    for name, shape in declared.items():
+        try:
+            dims = tuple(int(d) for d in (shape if isinstance(shape, (list, tuple)) else [shape]))
+        except (TypeError, ValueError):
+            logger.warning("ignoring extra feature %r: shape %r is not a list of ints", name, shape)
+            continue
+        if not dims or any(d <= 0 for d in dims):
+            logger.warning("ignoring extra feature %r: shape %r has no positive dimensions", name, shape)
+            continue
+        out[str(name)] = dims
+    return out
+
+
 class DeploymentPolicyRunner:
     def __init__(self, cfg: BridgeConfig, recorder_cfg: RecorderConfig, images_fn: Callable[[], Dict[str, np.ndarray]]):
         self.cfg = cfg
@@ -34,6 +65,12 @@ class DeploymentPolicyRunner:
         self._policy = None
         self._policy_client = None
         self._image_shape = (cfg.image_size, cfg.image_size)
+        # Declared by the server at handshake; see _extra_features_from_meta.
+        self._extra_features: Dict[str, tuple] = {}
+        self._extras: Dict[str, "np.ndarray"] = {}
+        self._extra_warned: set = set()
+        #: Called once the handshake is in, so the recorder can declare its columns.
+        self.on_connected = None
         self._was_streaming = False
         self._lock = threading.Lock()
         # Seconds between idle reachability probes -- see _probe_policy.
@@ -50,13 +87,7 @@ class DeploymentPolicyRunner:
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
-            "num_samples": 0,   # how many chunks the last reply actually carried
         }
-        # The most recent chunk set, for the overlay. Held outside _status because it is an
-        # array rather than a status scalar, and a viewer reads it at its own pace.
-        self._samples: Optional[np.ndarray] = None
-        self._samples_chosen = 0
-        self._samples_scores: Optional[np.ndarray] = None
 
     def start(self) -> None:
         self._stop.clear()
@@ -103,40 +134,6 @@ class DeploymentPolicyRunner:
             else:
                 logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port,
                                f" ({error})" if error else "")
-
-    def _set_samples(self, samples, *, chosen: int = 0, scores=None) -> None:
-        """Keep the chunk set the policy just returned, if it returned one.
-
-        Cleared when a reply has none, so a viewer never draws a stale spread over a live
-        frame -- a picture that is confidently about the wrong moment.
-        """
-        with self._lock:
-            self._samples = np.asarray(samples, dtype=float) if samples is not None else None
-            # Which candidate is being executed. 0 for plain multi-sampling, where the executed
-            # chunk is first by construction; a critic picking best-of-N chooses another, and
-            # drawing candidate 0 as "what the robot did" looks correct and is not.
-            self._samples_chosen = int(chosen)
-            self._samples_scores = None if scores is None else np.asarray(scores, dtype=float).reshape(-1)
-            self._status["num_samples"] = 0 if self._samples is None else int(self._samples.shape[0])
-
-    def get_samples(self) -> Optional[np.ndarray]:
-        """``[N, horizon, action_dim]`` from the most recent inference, or None."""
-        with self._lock:
-            return None if self._samples is None else self._samples.copy()
-
-    def get_sample_row(self) -> Optional[dict]:
-        """The last inference's candidates plus which one is running and how it scored.
-
-        ``{"samples": [N, H, A], "chosen": int, "scores": [N] | None}``.
-        """
-        with self._lock:
-            if self._samples is None:
-                return None
-            return {
-                "samples": self._samples.copy(),
-                "chosen": self._samples_chosen,
-                "scores": None if self._samples_scores is None else self._samples_scores.copy(),
-            }
 
     def _connect_robot(self) -> None:
         if self.recorder_cfg.mock or self._robot is not None:
@@ -189,6 +186,10 @@ class DeploymentPolicyRunner:
         meta = client.get_server_metadata() or {}
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
+        self._extra_features = _extra_features_from_meta(meta)
+        if self._extra_features:
+            logger.info("policy also returns per-step %s", ", ".join(
+                f"{k}{tuple(v)}" for k, v in self._extra_features.items()))
         # No action_horizon here on purpose: the broker reads the chunk size off each
         # response, so a checkpoint's horizon can never disagree with a client setting.
         self._policy_client = client
@@ -200,6 +201,47 @@ class DeploymentPolicyRunner:
             image_shape=self._image_shape,
         )
         logger.info("deploy policy metadata: %s", meta)
+        # The extra-feature declaration only exists now, and the dataset schema is fixed on the
+        # first recorded frame -- so whoever owns the recorder is told here, not at construction.
+        if self.on_connected is not None:
+            try:
+                self.on_connected()
+            except Exception as e:
+                logger.error("on_connected failed: %s", e)
+
+    def _set_extras(self, result: Dict) -> None:
+        """Keep this step's declared extras, so the recorder can write them.
+
+        Only the declared keys, and only at the declared shape. A policy that changes what it
+        sends mid-run would otherwise change the dataset's columns mid-episode, which no
+        reader can make sense of; a mismatch is dropped and said once.
+        """
+        if not self._extra_features:
+            return
+        values = {}
+        for name, shape in self._extra_features.items():
+            value = result.get(name)
+            if value is None:
+                continue
+            array = np.asarray(value, dtype=np.float32).reshape(-1)
+            if array.size != int(np.prod(shape)):
+                if name not in self._extra_warned:
+                    self._extra_warned.add(name)
+                    logger.warning("extra feature %r: expected %s values, got %d — not recorded",
+                                   name, int(np.prod(shape)), array.size)
+                continue
+            values[name] = array
+        with self._lock:
+            self._extras = values
+
+    def get_extras(self) -> Dict[str, "np.ndarray"]:
+        """The declared per-step extras from the most recent step, flattened."""
+        with self._lock:
+            return {k: v.copy() for k, v in self._extras.items()}
+
+    def extra_features(self) -> Dict[str, tuple]:
+        """``{name: per-step shape}`` the policy declared at handshake, empty until connected."""
+        return dict(self._extra_features)
 
     def _image_shape_from_meta(self, meta: Dict) -> tuple[int, int]:
         image_shape = meta.get("image_shape")
@@ -229,11 +271,7 @@ class DeploymentPolicyRunner:
                         if policy_obs:
                             result = self._policy.infer(policy_obs)
                             action = result["actions"]
-                            self._set_samples(
-                                result.get("action_samples"),
-                                chosen=int(result.get("critic_choice", 0) or 0),
-                                scores=result.get("critic_scores"),
-                            )
+                            self._set_extras(result)
                             self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
                             self._set(
                                 streaming=True,

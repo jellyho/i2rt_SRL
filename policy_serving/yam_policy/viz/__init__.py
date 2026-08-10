@@ -1,34 +1,27 @@
-"""Draw what a YAM policy predicted, on the frames it predicted from.
+"""Forward kinematics and wrist-camera projection for YAM.
 
-A policy is a distribution over action chunks, not a single answer. Sampling several and
-drawing them together is the only cheap way to see whether it is confident (a tight bundle) or
-torn between options (a wide spray) — a scalar loss averages exactly that away.
+The geometry a viewer needs to draw what a policy predicted, without the viewer. Drawing lives
+wherever the analysis lives -- this side only answers "where would these joint targets put the
+gripper, and where does that land in the wrist camera".
 
-This is the geometry and drawing half, packaged so a policy repo can import it and build its
-own views. The three pieces stack:
+    from yam_policy.viz import WristCameraGeometry, CameraIntrinsics, WristProjector
 
-    geometry     joint targets -> a metric end-effector path -> pixels in a wrist camera
-    overlay      those pixels -> lines on a frame
-    sample_log   the chunks a run actually sampled, recorded beside its dataset
+    geometry = WristCameraGeometry(mjcf_path)      # the arm+gripper model the robot runs
+    path     = geometry.chunk_to_path(chunk)       # [T, joints] -> [T, 3] in the arm's base frame
+    pixels   = geometry.project(path, q_now, intrinsics)
 
 Two things worth knowing before building on it.
 
 **The paths are in metres.** YAM actions are joint targets, so FK over a chunk gives the real
-path. Overlays built on end-effector *deltas* cannot do this — openpi's RoboCasa one rescales
-each replan to a legible length and says so — which means a bundle that looks tight here IS
-tight, and two chunks a centimetre apart look a centimetre apart.
+path -- a bundle that looks tight IS tight. Overlays built on end-effector *deltas* cannot say
+that; openpi's RoboCasa one rescales each replan to a legible length and says so.
 
 **The wrist extrinsic is published, not calibrated.** i2rt ships the arm with its D405 mount as
 one model whose body chain ends in a `camera` optical frame, so :data:`T_GRIPPER_CAMERA` is the
-manufacturer's transform rather than something measured in a lab. See its docstring.
+manufacturer's transform. See its docstring for how it was checked.
 
-    from yam_policy.viz import WristCameraGeometry, CameraIntrinsics, overlay_samples
-
-    geometry = WristCameraGeometry(mjcf_path)          # arm + gripper, as the robot runs it
-    frame = overlay_samples(frame, geometry, samples, q_now, intrinsics)
-
-`mujoco` and `mink` are needed for the kinematics and `pillow` for the drawing; they are
-imported lazily, so importing this package costs nothing until something is actually drawn.
+`mujoco` and `mink` are imported lazily and declared as the `viz` extra, so a policy server
+never loads them.
 """
 
 from yam_policy.viz.geometry import (
@@ -39,37 +32,12 @@ from yam_policy.viz.geometry import (
     WristCameraGeometry,
     WristProjector,
 )
-from yam_policy.viz.overlay import (
-    ARM_ACTION_SLICES,
-    ARM_STATE_SLICES,
-    WRIST_CAMERA_ARMS,
-    WristOverlayRenderer,
-    draw_chunk_paths,
-    overlay_samples,
-    project_samples,
-)
-from yam_policy.viz.sample_log import EpisodeSampleLog, episode_path, load, row_at, samples_at
 
 __all__ = [
-    # geometry
     "WristCameraGeometry",
-    "CameraIntrinsics",
     "WristProjector",
+    "CameraIntrinsics",
     "T_GRIPPER_CAMERA",
     "FLANGE_BODY",
     "GRASP_SITE",
-    # drawing
-    "overlay_samples",
-    "project_samples",
-    "draw_chunk_paths",
-    "WristOverlayRenderer",
-    "ARM_STATE_SLICES",
-    "ARM_ACTION_SLICES",
-    "WRIST_CAMERA_ARMS",
-    # recorded samples
-    "EpisodeSampleLog",
-    "load",
-    "samples_at",
-    "row_at",
-    "episode_path",
 ]

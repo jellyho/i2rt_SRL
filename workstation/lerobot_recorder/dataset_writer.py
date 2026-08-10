@@ -138,10 +138,15 @@ def remove_dataset_root(root: str) -> None:
 class AsyncDatasetWriter:
     """Queued episode writer. ``submit()`` returns immediately; a worker saves."""
 
-    def __init__(self, cfg: RecorderConfig, image_keys: List[str], image_shapes: Dict[str, tuple]) -> None:
+    def __init__(self, cfg: RecorderConfig, image_keys: List[str], image_shapes: Dict[str, tuple],
+                 extra_features: Optional[Dict[str, tuple]] = None) -> None:
         self.cfg = cfg
         self.image_keys = image_keys
         self.image_shapes = image_shapes
+        # Per-step columns a policy declared at handshake, kept at the shape it declared so the
+        # dataset describes itself. Flattening them would store [N, action_dim] candidates as an
+        # anonymous 56-vector and leave the reader to know the layout out of band.
+        self.extra_features = {str(k): tuple(v) for k, v in (extra_features or {}).items()}
         self._mock = cfg.mock
         # Output format: "lerobot" (LeRobotDataset) or "abcdl" (the abcdl MP4+binary
         # training cache; one episode dir per submit, written via abcdl.EpisodeWriter).
@@ -241,6 +246,10 @@ class AsyncDatasetWriter:
             }
         for key, val in sample.items():
             if key in ("images", "task"):
+                continue
+            if key in self.extra_features:
+                shape = self.extra_features[key]
+                feats[key] = {"dtype": "float32", "shape": shape, "names": None}
                 continue
             vec = np.asarray(val, dtype=np.float32).reshape(-1)
             feats[key] = {"dtype": "float32", "shape": (vec.size,), "names": self._vector_names(key, vec.size)}
@@ -733,11 +742,11 @@ class AsyncDatasetWriter:
         if self._finalized:
             raise RuntimeError("dataset writer has already been finalized")
 
-    def submit(self, frames: List[dict], outcome: Optional[str], task: str, sample_log=None) -> None:
+    def submit(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
         """Enqueue a complete episode (list of frame dicts) for background saving."""
         self._check_writable()
         if frames:
-            self._queue.put(("episode", frames, outcome, task, sample_log))
+            self._queue.put(("episode", frames, outcome, task))
             with self._lock:
                 self._n_submitted += 1
 
@@ -773,17 +782,12 @@ class AsyncDatasetWriter:
         self._check_writable()
         self._frame_queue.put(("frame", frame, task))
 
-    def end_episode(self, outcome: Optional[str], task: str, sample_log=None) -> None:
+    def end_episode(self, outcome: Optional[str], task: str) -> None:
         """Close the streamed episode and save it.
 
-        ``sample_log`` is an optional EpisodeSampleLog to write beside the dataset. It travels
-        with the episode rather than being saved by the caller because only the worker knows
-        which index this episode gets: it assigns one when it reaches the queue, so a caller
-        reading `num_episodes` at submit time names the sidecar after whichever episode is
-        still in flight.
         """
         self._check_writable()
-        self._frame_queue.put(("end", outcome, task, sample_log))
+        self._frame_queue.put(("end", outcome, task))
         with self._lock:
             self._n_submitted += 1
 
@@ -870,14 +874,13 @@ class AsyncDatasetWriter:
                 item = self._queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            _kind, frames, outcome, task, sample_log = item
+            _kind, frames, outcome, task = item
             with self._lock:
                 self._saving = True
                 self._saving_index = self._n_episodes
                 self._saving_frames = len(frames)
             try:
                 self._save_episode(frames, outcome, task)
-                self._save_sample_log(sample_log, self._n_episodes - 1)
             except Exception as e:
                 logger.error("episode save failed: %s", e)
                 self._recover_failed_episode_buffer()
@@ -899,7 +902,10 @@ class AsyncDatasetWriter:
         for key, val in f.items():
             if key in ("images", "task"):
                 continue
-            frame[key] = np.asarray(val, dtype=np.float32)
+            array = np.asarray(val, dtype=np.float32)
+            # Declared extras go in at their declared shape; they travel flattened so nothing
+            # in between has to care what the layout is.
+            frame[key] = array.reshape(self.extra_features[key]) if key in self.extra_features else array
         if extra:
             for k, v in extra.items():
                 frame[k] = np.asarray([v], dtype=np.float32)
@@ -953,7 +959,7 @@ class AsyncDatasetWriter:
                 self._saving_frames = 0
             return
 
-        _, outcome, task, sample_log = item
+        _, outcome, task = item
         n_frames, self._streamed_frames = self._streamed_frames, 0
         if not n_frames:
             return
@@ -987,7 +993,6 @@ class AsyncDatasetWriter:
             episode_index = self._n_episodes
             self._n_episodes += 1
         self._record_outcome(episode_index, outcome, task, n_frames)
-        self._save_sample_log(sample_log, episode_index)
         logger.info("saved episode #%d (%d frames, outcome=%s, streamed)", episode_index, n_frames, outcome)
 
     def _recover_failed_episode_buffer(self) -> None:
@@ -1139,17 +1144,6 @@ class AsyncDatasetWriter:
             w.add_frame(i * tick, np.asarray(f["observation.state"], np.float64),
                         np.asarray(f["action"], np.float64), imgs)
         w.save(task=task, frame_features=frame_features)
-
-    def _save_sample_log(self, sample_log, episode_index: int) -> None:
-        """Write the episode's sampled action chunks beside the dataset (best effort)."""
-        if sample_log is None or not len(sample_log):
-            return
-        try:
-            path = sample_log.save(self._root, episode_index)
-            if path:
-                logger.info("episode #%d: wrote %d action-sample set(s)", episode_index, len(sample_log))
-        except Exception as e:
-            logger.error("could not save action samples for episode %d: %s", episode_index, e)
 
     def _record_outcome(self, episode_index: int, outcome: Optional[str], task: str, n_frames: int) -> None:
         entry = {

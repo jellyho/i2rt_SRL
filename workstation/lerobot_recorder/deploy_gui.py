@@ -267,9 +267,10 @@ class DeployGUI(RecorderGUI):
             self.recorder.set_leader_mirror(self.mirror_check.isChecked())
         if self.recorder is not None and self.runner is None:
             self.runner = DeploymentPolicyRunner(self.bridge_cfg, self.cfg, self.recorder.get_last_images)
-            # The sampled chunks are logged beside the dataset, so a rendered video can show what
-            # the policy predicted AT THE TIME rather than what the current checkpoint would.
-            self.recorder.set_samples_source(self.runner.get_sample_row)
+            # Whatever per-step data the policy declares at handshake becomes dataset columns.
+            # Wired before the first frame, which is when the dataset schema is fixed.
+            self.runner.on_connected = lambda: self.recorder.set_extra_features(
+                self.runner.extra_features(), self.runner.get_extras)
             self.runner.start()
 
     @property
