@@ -121,7 +121,7 @@ class Recorder:
         self._last_ram_gb = 0.0
         # Supplies the action chunks the policy sampled for the current frame, when something
         # is asking for them (the deploy runner). Logged beside the dataset, not in it -- see
-        # workstation.policy_bridge.sample_log for why.
+        # yam_policy.viz.sample_log for why.
         self._samples_fn = samples_fn
         self._sample_log = None
 
@@ -312,7 +312,7 @@ class Recorder:
             return
         try:
             if self._sample_log is None:
-                from workstation.policy_bridge.sample_log import EpisodeSampleLog
+                from yam_policy.viz import EpisodeSampleLog
 
                 self._sample_log = EpisodeSampleLog()
             self._sample_log.add(self._n_frames, self._samples_fn())

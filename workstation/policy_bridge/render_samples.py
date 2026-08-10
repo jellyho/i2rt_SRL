@@ -79,8 +79,8 @@ def render(
     limit: Optional[int] = None,
     replay_policy: bool = False,
 ) -> str:
-    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
-    from workstation.policy_bridge.wrist_view import CameraIntrinsics
+    from yam_policy.viz import WristOverlayRenderer
+    from yam_policy.viz import CameraIntrinsics
 
     frames = _episode_frames(dataset_dir, episode)
     if limit:
@@ -95,7 +95,7 @@ def render(
     # Prefer what the policy actually predicted at the time, if the run recorded it. Asking a
     # server instead answers a different question -- what the CURRENT checkpoint would do at
     # each moment -- which is useful, but is not what happened.
-    from workstation.policy_bridge import sample_log as _sample_log
+    from yam_policy.viz import sample_log as _sample_log
 
     recorded = None if replay_policy else _sample_log.load(dataset_dir, episode)
     if recorded is not None:
@@ -153,7 +153,7 @@ def _write(rendered: List[np.ndarray], out_path: str, fps: int) -> str:
 
 
 def _intrinsics_fallback(frames: List[dict], intrinsics_by_key: Optional[dict]):
-    from workstation.policy_bridge.wrist_view import CameraIntrinsics
+    from yam_policy.viz import CameraIntrinsics
 
     def intrinsics_for(key: str):
         if intrinsics_by_key and key in intrinsics_by_key:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from workstation.policy_bridge.sample_log import EpisodeSampleLog, episode_path, load, samples_at
+from yam_policy.viz.sample_log import EpisodeSampleLog, episode_path, load, samples_at
 
 
 def _samples(value, n=4, horizon=30, dim=14):

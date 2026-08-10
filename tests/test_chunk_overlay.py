@@ -10,13 +10,13 @@ pytest.importorskip("mink")
 pytest.importorskip("PIL")
 
 from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
-from workstation.policy_bridge.chunk_overlay import (
+from yam_policy.viz.overlay import (
     _visible_runs,
     draw_chunk_paths,
     overlay_samples,
     project_samples,
 )
-from workstation.policy_bridge.wrist_view import CameraIntrinsics, WristCameraGeometry
+from yam_policy.viz import CameraIntrinsics, WristCameraGeometry
 
 
 @pytest.fixture(scope="module")
@@ -183,7 +183,7 @@ def _bimanual_samples(n=4, horizon=30):
 
 def test_the_renderer_decorates_both_wrists_and_leaves_the_agentview_alone():
     """The agentview is not on a wrist, so nothing here knows where it is pointing."""
-    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+    from yam_policy.viz.overlay import WristOverlayRenderer
 
     renderer = WristOverlayRenderer()
     assert renderer.available, renderer.error
@@ -199,7 +199,7 @@ def test_the_renderer_decorates_both_wrists_and_leaves_the_agentview_alone():
 def test_each_wrist_is_drawn_from_its_own_arm():
     """Left and right chunks differ, so the two views must not come out identical -- which is
     what happens if the action or state slice is taken from the wrong arm."""
-    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+    from yam_policy.viz.overlay import WristOverlayRenderer
 
     renderer = WristOverlayRenderer()
     out = renderer.draw(_wrist_frames(), _bimanual_samples(), np.zeros(42), lambda _k: _intrinsics())
@@ -220,7 +220,7 @@ def test_missing_pieces_leave_the_view_alone_rather_than_breaking_it(samples, st
     """A frame that cannot be decorated is still a frame worth showing: the overlay is a
     diagnostic, and taking the live view down with it would be a worse failure than not
     drawing."""
-    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+    from yam_policy.viz.overlay import WristOverlayRenderer
 
     renderer = WristOverlayRenderer()
     images = _wrist_frames()
@@ -230,7 +230,7 @@ def test_missing_pieces_leave_the_view_alone_rather_than_breaking_it(samples, st
 
 
 def test_an_unusable_model_disables_the_overlay_instead_of_raising():
-    from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
+    from yam_policy.viz.overlay import WristOverlayRenderer
 
     renderer = WristOverlayRenderer(xml_path="/nonexistent/model.xml")
     assert not renderer.available

@@ -4,7 +4,7 @@ One picture answers a question no metric does: is the policy sure? Several chunk
 together read immediately — a tight bundle is confidence, a wide spray is a policy torn
 between options, and a single line wandering off is a policy that has lost the plot.
 
-The paths come from :mod:`workstation.policy_bridge.wrist_view`, which turns joint targets into
+The paths come from :mod:`yam_policy.viz.geometry`, which turns joint targets into
 a metric path via FK and projects it through the published D405 extrinsic. So unlike ACRFT's
 RoboCasa overlay — which cannot know how far an unnormalised OSC delta reaches, and rescales
 each replan to a legible length — the spread you see here is the spread in metres.
@@ -176,7 +176,7 @@ class WristOverlayRenderer:
         self._geometry = None
         self._error = ""
         try:
-            from workstation.policy_bridge.wrist_view import WristCameraGeometry
+            from yam_policy.viz.geometry import WristCameraGeometry
 
             if xml_path is None:
                 from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml

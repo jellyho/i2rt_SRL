@@ -9,7 +9,7 @@ pytest.importorskip("mujoco")
 pytest.importorskip("mink")
 
 from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
-from workstation.policy_bridge.wrist_view import (
+from yam_policy.viz import (
     T_GRIPPER_CAMERA,
     CameraIntrinsics,
     WristCameraGeometry,

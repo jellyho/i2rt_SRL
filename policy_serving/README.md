@@ -84,3 +84,39 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from
   `get_server_metadata()` — no need to hand-match the bridge to the policy.
+
+## Visualisation (`yam_policy.viz`)
+
+Draw what a policy predicted, on the frames it predicted from. Packaged here so a policy repo
+can import it and build its own views:
+
+```python
+from yam_policy.viz import WristCameraGeometry, CameraIntrinsics, overlay_samples
+
+geometry = WristCameraGeometry(mjcf_path)        # the arm+gripper model the robot runs
+path     = geometry.chunk_to_path(chunk)         # [T, joints] -> [T, 3] in the arm's base frame
+pixels   = geometry.project(path, q_now, intrinsics)
+frame    = overlay_samples(frame, geometry, samples, q_now, intrinsics)
+```
+
+- **The paths are in metres.** YAM actions are joint targets, so FK over a chunk gives the real
+  path. Overlays built on end-effector *deltas* cannot — openpi's RoboCasa one rescales each
+  replan to a legible length and says so — which means a bundle that looks tight here IS tight.
+- **The wrist extrinsic is published, not calibrated.** i2rt ships the arm with its D405 mount
+  as one model whose body chain ends in a `camera` optical frame, so `T_GRIPPER_CAMERA` is the
+  manufacturer's transform. Composing that chain reproduces the three figures its header states
+  (pos, quat, and a 25° cant), which is what makes it safe to carry the matrix instead of the
+  model and its meshes.
+- **Projection flags points behind the lens** rather than returning their pixel: the divide is
+  happy to produce a finite coordinate for those, and the mirrored path that results reads as a
+  confident wrong prediction rather than a bug.
+- `yam_policy.viz.sample_log` reads and writes the chunk sets a run recorded beside its dataset,
+  so a render can show what the policy predicted AT THE TIME rather than what the current
+  checkpoint would predict now.
+
+`mujoco`/`mink` (kinematics) and `pillow` (drawing) are imported lazily and declared as the
+`viz` extra, so a policy server never loads them:
+
+```bash
+pip install -e "policy_serving[viz]"
+```
