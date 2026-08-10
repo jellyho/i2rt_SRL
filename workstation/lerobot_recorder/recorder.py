@@ -315,7 +315,12 @@ class Recorder:
                 from yam_policy.viz import EpisodeSampleLog
 
                 self._sample_log = EpisodeSampleLog()
-            self._sample_log.add(self._n_frames, self._samples_fn())
+            row = self._samples_fn()
+            if isinstance(row, dict):
+                self._sample_log.add(self._n_frames, row.get("samples"),
+                                     chosen=int(row.get("chosen", 0) or 0), scores=row.get("scores"))
+            else:
+                self._sample_log.add(self._n_frames, row)
         except Exception as e:
             logger.debug("action-sample logging skipped: %s", e)
 

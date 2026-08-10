@@ -114,6 +114,30 @@ frame    = overlay_samples(frame, geometry, samples, q_now, intrinsics)
   so a render can show what the policy predicted AT THE TIME rather than what the current
   checkpoint would predict now.
 
+### Plugging into a HUD
+
+`WristProjector` matches the projector interface ACRFT's `examples/robocasa/deploy_hud.py`
+expects — `chunks[N, H, A] -> list of [H, 2]` — so it drops in where its `SketchProjector`
+sits. That one integrates two action dims into a corner minimap because the fan had to be
+visible "before camera calibration/FK exist"; both exist now.
+
+```python
+from yam_policy.viz import WristCameraGeometry, CameraIntrinsics, WristProjector
+
+proj = WristProjector(WristCameraGeometry(mjcf), intrinsics, arm_slice=slice(0, 7))
+rec  = HudRecorder(mode="bon", horizon=H, projector=proj)
+...
+proj.set_pose(state[0:7])        # this arm's joints, THIS replan — the camera is on the wrist
+rec.add(agent_rgb, wrist_rgb, response, step=t)
+```
+
+The pose has to be set each replan and cannot be inferred from the chunk: the camera rides on
+the wrist, so where a future position lands on screen depends on where the arm is now.
+
+`CriticSelectPolicy` does not put its choice first, so a recorded run stores `chosen` (and the
+critic's `scores`) alongside the candidates — `yam_policy.viz.row_at` returns all three. Drawing
+candidate 0 as the executed one produces a picture that looks right and is not.
+
 `mujoco`/`mink` (kinematics) and `pillow` (drawing) are imported lazily and declared as the
 `viz` extra, so a policy server never loads them:
 

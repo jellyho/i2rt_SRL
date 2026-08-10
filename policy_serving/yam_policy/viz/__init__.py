@@ -37,6 +37,7 @@ from yam_policy.viz.geometry import (
     T_GRIPPER_CAMERA,
     CameraIntrinsics,
     WristCameraGeometry,
+    WristProjector,
 )
 from yam_policy.viz.overlay import (
     ARM_ACTION_SLICES,
@@ -47,12 +48,13 @@ from yam_policy.viz.overlay import (
     overlay_samples,
     project_samples,
 )
-from yam_policy.viz.sample_log import EpisodeSampleLog, episode_path, load, samples_at
+from yam_policy.viz.sample_log import EpisodeSampleLog, episode_path, load, row_at, samples_at
 
 __all__ = [
     # geometry
     "WristCameraGeometry",
     "CameraIntrinsics",
+    "WristProjector",
     "T_GRIPPER_CAMERA",
     "FLANGE_BODY",
     "GRASP_SITE",
@@ -68,5 +70,6 @@ __all__ = [
     "EpisodeSampleLog",
     "load",
     "samples_at",
+    "row_at",
     "episode_path",
 ]

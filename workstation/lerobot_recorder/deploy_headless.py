@@ -71,7 +71,7 @@ def run_headless(
         runner = DeploymentPolicyRunner(bridge_cfg, recorder_cfg, recorder.get_last_images)
         # The sampled chunks are logged beside the dataset, so a rendered video can show what
         # the policy predicted AT THE TIME rather than what the current checkpoint would.
-        recorder.set_samples_source(runner.get_samples)
+        recorder.set_samples_source(runner.get_sample_row)
         runner.start()
         recorder.set_leader_mirror(mirror)
         logger.info(

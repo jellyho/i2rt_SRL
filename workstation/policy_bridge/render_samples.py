@@ -103,9 +103,18 @@ def render(
         rendered = []
         from workstation.lerobot_recorder.views import compose_camera_strip
 
+        intrinsics_for = _intrinsics_fallback(frames, intrinsics_by_key)
         for index, frame in enumerate(frames):
-            samples = _sample_log.samples_at(recorded, index)
-            decorated = renderer.draw(frame["images"], samples, frame["state"], _intrinsics_fallback(frames, intrinsics_by_key))
+            row = _sample_log.row_at(recorded, index)
+            decorated = renderer.draw(
+                frame["images"],
+                None if row is None else row["samples"],
+                frame["state"],
+                intrinsics_for,
+                # The critic does not put its choice first, so drawing candidate 0 as the
+                # executed one would be a picture that looks right and is not.
+                executed_index=0 if row is None else row["chosen"],
+            )
             rendered.append(compose_camera_strip(decorated))
         return _write(rendered, out_path, fps)
 

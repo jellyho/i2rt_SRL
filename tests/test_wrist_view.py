@@ -141,3 +141,66 @@ def test_the_gripper_value_does_not_move_the_grasp_point(geometry):
     q_open = np.zeros(7)
     q_open[6] = 0.04
     assert np.allclose(geometry.grasp_pose(q_closed)[:3, 3], geometry.grasp_pose(q_open)[:3, 3])
+
+
+# --------------------------------------------------------------------------------------- #
+# The projector ACRFT's HUD plugs in
+# --------------------------------------------------------------------------------------- #
+def test_the_projector_matches_the_hud_interface(geometry):
+    """ACRFT's deploy_hud expects `chunks[N, H, A] -> list of [H, 2]`, and ships a
+    SketchProjector that integrates two action dims into a corner minimap because, as it says,
+    the fan has to be visible "before camera calibration/FK exist". Both exist now, so this
+    returns a real projection in the same shape."""
+    from yam_policy.viz import WristProjector
+
+    projector = WristProjector(geometry, _intrinsics(), arm_slice=slice(0, 7))
+    chunks = np.zeros((6, 30, 14))
+    for i in range(6):
+        chunks[i, :, 1] = np.linspace(0.0, 0.05 * (i + 1), 30)
+
+    projector.set_pose(np.zeros(6))
+    paths = projector(chunks)
+
+    assert isinstance(paths, list) and len(paths) == 6
+    assert all(p.shape == (30, 2) for p in paths)
+    assert len({tuple(np.round(p[-1], 1)) for p in paths}) == 6, "candidates must diverge"
+
+
+def test_the_projection_follows_the_arm(geometry):
+    """The camera rides on the wrist, so the same chunk lands somewhere else once the arm has
+    moved. A projector that ignores set_pose would return identical pixels — and quietly draw
+    the fan for a pose the robot left."""
+    from yam_policy.viz import WristProjector
+
+    projector = WristProjector(geometry, _intrinsics(), arm_slice=slice(0, 7))
+    chunks = np.zeros((1, 30, 14))
+    chunks[0, :, 1] = np.linspace(0.0, 0.2, 30)
+
+    projector.set_pose(np.zeros(6))
+    before = projector(chunks)[0]
+    projector.set_pose(np.array([0.3, -0.2, 0.1, 0.0, 0.0, 0.0]))
+    after = projector(chunks)[0]
+
+    assert np.nanmax(np.abs(after - before)) > 1.0
+
+
+def test_points_behind_the_lens_come_back_as_nan(geometry):
+    """Not as the finite pixel the divide would give them: a drawing routine that plots those
+    puts a mirrored path on screen, which reads as a confident wrong prediction."""
+    from yam_policy.viz import WristProjector
+
+    projector = WristProjector(geometry, _intrinsics(), arm_slice=slice(0, 7))
+    projector.set_pose(np.zeros(6))
+    # A chunk that swings the arm hard behind the current camera pose.
+    chunks = np.zeros((1, 30, 14))
+    chunks[0, :, 1] = np.linspace(0.0, -2.5, 30)
+    path = projector(chunks)[0]
+    assert np.isnan(path).any(), "nothing was flagged as behind the lens"
+
+
+def test_chunk_rank_is_checked(geometry):
+    from yam_policy.viz import WristProjector
+
+    projector = WristProjector(geometry, _intrinsics())
+    with pytest.raises(ValueError, match="chunks"):
+        projector(np.zeros((30, 14)))

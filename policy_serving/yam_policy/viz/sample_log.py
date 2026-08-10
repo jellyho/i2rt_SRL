@@ -57,9 +57,20 @@ class EpisodeSampleLog:
     def __init__(self) -> None:
         self._frames: List[int] = []
         self._samples: List[np.ndarray] = []
+        self._chosen: List[int] = []
+        self._scores: List[Optional[np.ndarray]] = []
         self._last: Optional[np.ndarray] = None
 
-    def add(self, frame_index: int, samples: Optional[np.ndarray]) -> None:
+    def add(self, frame_index: int, samples: Optional[np.ndarray], *,
+            chosen: int = 0, scores: Optional[np.ndarray] = None) -> None:
+        """Record a sample set, if it differs from the last one kept.
+
+        ``chosen`` is which candidate was executed. It is 0 for plain multi-sampling, where the
+        executed chunk is drawn first by construction, but NOT for a critic that picks
+        best-of-N -- and drawing the wrong one as "what the robot did" is the sort of error that
+        looks like a correct picture. ``scores`` is the critic's Q per candidate when there is
+        one, so a view can shade the fan by value instead of treating every candidate alike.
+        """
         if samples is None:
             return
         samples = np.asarray(samples)
@@ -70,6 +81,8 @@ class EpisodeSampleLog:
             return
         self._frames.append(int(frame_index))
         self._samples.append(samples.astype(np.float16))
+        self._chosen.append(int(chosen))
+        self._scores.append(None if scores is None else np.asarray(scores, dtype=np.float16).reshape(-1))
         self._last = samples
 
     def __len__(self) -> int:
@@ -81,6 +94,7 @@ class EpisodeSampleLog:
 
     def reset(self) -> None:
         self._frames, self._samples, self._last = [], [], None
+        self._chosen, self._scores = [], []
 
     def save(self, dataset_dir: str, episode_index: int) -> Optional[str]:
         """Write the episode's samples; returns the path, or None when there were none.
@@ -98,14 +112,21 @@ class EpisodeSampleLog:
             keep = [i for i, s in enumerate(self._samples) if s.shape == first]
             self._frames = [self._frames[i] for i in keep]
             self._samples = [self._samples[i] for i in keep]
+            self._chosen = [self._chosen[i] for i in keep]
+            self._scores = [self._scores[i] for i in keep]
         path = episode_path(dataset_dir, episode_index)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            np.savez_compressed(
-                path,
-                frame_index=np.asarray(self._frames, dtype=np.int32),
-                samples=np.stack(self._samples),
-            )
+            arrays = {
+                "frame_index": np.asarray(self._frames, dtype=np.int32),
+                "samples": np.stack(self._samples),
+                "chosen": np.asarray(self._chosen, dtype=np.int32),
+            }
+            # Only when a critic actually scored them -- an array of zeros would read as
+            # "every candidate is worthless" rather than "nobody was asked".
+            if all(sc is not None for sc in self._scores) and self._scores:
+                arrays["scores"] = np.stack(self._scores)
+            np.savez_compressed(path, **arrays)
             return path
         except Exception as e:
             logger.error("could not write action samples for episode %d: %s", episode_index, e)
@@ -119,7 +140,12 @@ def load(dataset_dir: str, episode_index: int) -> Optional[dict]:
         return None
     try:
         with np.load(path) as data:
-            return {"frame_index": data["frame_index"], "samples": data["samples"]}
+            out = {"frame_index": data["frame_index"], "samples": data["samples"]}
+            # Older logs predate these; a reader must not have to know which vintage it has.
+            out["chosen"] = (data["chosen"] if "chosen" in data.files
+                             else np.zeros(len(out["frame_index"]), np.int32))
+            out["scores"] = data["scores"] if "scores" in data.files else None
+            return out
     except Exception as e:
         logger.error("could not read action samples at %s: %s", path, e)
         return None
@@ -138,3 +164,24 @@ def samples_at(log: dict, frame_index: int) -> Optional[np.ndarray]:
     if position < 0:
         return None
     return np.asarray(log["samples"][position], dtype=np.float32)
+
+
+def row_at(log: dict, frame_index: int) -> Optional[dict]:
+    """Everything recorded for the set in force at ``frame_index``.
+
+    ``{"samples": [N, H, A], "chosen": int, "scores": [N] | None}`` -- the chosen index matters
+    because a critic picking best-of-N does not put its choice first, and drawing candidate 0
+    as "what the robot did" produces a picture that looks right and is not.
+    """
+    if not log:
+        return None
+    frames = np.asarray(log["frame_index"])
+    position = int(np.searchsorted(frames, frame_index, side="right")) - 1
+    if position < 0:
+        return None
+    scores = log.get("scores")
+    return {
+        "samples": np.asarray(log["samples"][position], dtype=np.float32),
+        "chosen": int(np.asarray(log.get("chosen", np.zeros(len(frames))))[position]),
+        "scores": None if scores is None else np.asarray(scores[position], dtype=np.float32),
+    }

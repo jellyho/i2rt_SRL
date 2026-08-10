@@ -152,3 +152,63 @@ class CameraIntrinsics:
     def __repr__(self) -> str:
         return (f"CameraIntrinsics(fx={self.fx:.1f}, fy={self.fy:.1f}, "
                 f"cx={self.cx:.1f}, cy={self.cy:.1f}, {self.width}x{self.height})")
+
+
+class WristProjector:
+    """A callable that turns action chunks into image-pixel paths, for a HUD to draw.
+
+    Matches the projector interface ACRFT's ``examples/robocasa/deploy_hud.py`` expects —
+    ``chunks[N, H, A] -> list of [H, 2]`` — so it drops in where its ``SketchProjector`` sits.
+    That one integrates two action dimensions into a corner minimap because, as it says, the
+    fan has to be visible "before camera calibration/FK exist". Both now do: FK comes from the
+    arm's own MJCF and the wrist extrinsic is published by i2rt, so this returns a real
+    projection rather than a schematic.
+
+    The pose matters and cannot be inferred from the chunk. The camera rides on the wrist, so
+    where a future position lands on screen depends on where the arm is NOW; call
+    :meth:`set_pose` each replan with the arm's current joints. Until it is called the projector
+    uses the pose it was built with.
+
+        from yam_policy.viz import WristCameraGeometry, CameraIntrinsics, WristProjector
+
+        proj = WristProjector(WristCameraGeometry(mjcf), intrinsics, arm_slice=slice(0, 7))
+        recorder = HudRecorder(mode="bon", horizon=H, projector=proj)
+        ...
+        proj.set_pose(state[0:7])                 # this arm's joints, this replan
+        recorder.add(agent_rgb, wrist_rgb, response, step=t)
+
+    Points behind the lens come back as NaN rather than as the finite pixel the perspective
+    divide would give them: a drawing routine that plots those puts a mirrored path on screen,
+    which reads as a confident wrong prediction rather than as missing data.
+    """
+
+    def __init__(self, geometry: "WristCameraGeometry", intrinsics: "CameraIntrinsics",
+                 q_now: Optional[Sequence[float]] = None, *, arm_slice: Optional[slice] = None) -> None:
+        self._geometry = geometry
+        self._intrinsics = intrinsics
+        self._arm_slice = arm_slice
+        self._q = np.zeros(6) if q_now is None else np.asarray(q_now, dtype=float)
+
+    def set_pose(self, q_now: Sequence[float]) -> None:
+        """The arm's current joints. Call once per replan, before projecting."""
+        self._q = np.asarray(q_now, dtype=float)
+
+    def set_intrinsics(self, intrinsics: "CameraIntrinsics") -> None:
+        self._intrinsics = intrinsics
+
+    def __call__(self, chunks: np.ndarray) -> list:
+        chunks = np.asarray(chunks, dtype=float)
+        if chunks.ndim != 3:
+            raise ValueError(f"expected [N, H, action_dim] chunks, got shape {chunks.shape}")
+        if self._arm_slice is not None:
+            chunks = chunks[:, :, self._arm_slice]
+
+        out = []
+        for chunk in chunks:
+            projected = self._geometry.project(
+                self._geometry.chunk_to_path(chunk), self._q, self._intrinsics
+            )
+            pixels = projected[:, :2].copy()
+            pixels[projected[:, 2] < 0.5] = np.nan
+            out.append(pixels)
+        return out

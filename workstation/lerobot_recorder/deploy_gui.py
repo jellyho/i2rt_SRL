@@ -269,7 +269,7 @@ class DeployGUI(RecorderGUI):
             self.runner = DeploymentPolicyRunner(self.bridge_cfg, self.cfg, self.recorder.get_last_images)
             # The sampled chunks are logged beside the dataset, so a rendered video can show what
             # the policy predicted AT THE TIME rather than what the current checkpoint would.
-            self.recorder.set_samples_source(self.runner.get_samples)
+            self.recorder.set_samples_source(self.runner.get_sample_row)
             self.runner.start()
 
     @property

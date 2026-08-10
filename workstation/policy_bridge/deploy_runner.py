@@ -55,6 +55,8 @@ class DeploymentPolicyRunner:
         # The most recent chunk set, for the overlay. Held outside _status because it is an
         # array rather than a status scalar, and a viewer reads it at its own pace.
         self._samples: Optional[np.ndarray] = None
+        self._samples_chosen = 0
+        self._samples_scores: Optional[np.ndarray] = None
 
     def start(self) -> None:
         self._stop.clear()
@@ -102,7 +104,7 @@ class DeploymentPolicyRunner:
                 logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port,
                                f" ({error})" if error else "")
 
-    def _set_samples(self, samples) -> None:
+    def _set_samples(self, samples, *, chosen: int = 0, scores=None) -> None:
         """Keep the chunk set the policy just returned, if it returned one.
 
         Cleared when a reply has none, so a viewer never draws a stale spread over a live
@@ -110,12 +112,31 @@ class DeploymentPolicyRunner:
         """
         with self._lock:
             self._samples = np.asarray(samples, dtype=float) if samples is not None else None
+            # Which candidate is being executed. 0 for plain multi-sampling, where the executed
+            # chunk is first by construction; a critic picking best-of-N chooses another, and
+            # drawing candidate 0 as "what the robot did" looks correct and is not.
+            self._samples_chosen = int(chosen)
+            self._samples_scores = None if scores is None else np.asarray(scores, dtype=float).reshape(-1)
             self._status["num_samples"] = 0 if self._samples is None else int(self._samples.shape[0])
 
     def get_samples(self) -> Optional[np.ndarray]:
         """``[N, horizon, action_dim]`` from the most recent inference, or None."""
         with self._lock:
             return None if self._samples is None else self._samples.copy()
+
+    def get_sample_row(self) -> Optional[dict]:
+        """The last inference's candidates plus which one is running and how it scored.
+
+        ``{"samples": [N, H, A], "chosen": int, "scores": [N] | None}``.
+        """
+        with self._lock:
+            if self._samples is None:
+                return None
+            return {
+                "samples": self._samples.copy(),
+                "chosen": self._samples_chosen,
+                "scores": None if self._samples_scores is None else self._samples_scores.copy(),
+            }
 
     def _connect_robot(self) -> None:
         if self.recorder_cfg.mock or self._robot is not None:
@@ -208,7 +229,11 @@ class DeploymentPolicyRunner:
                         if policy_obs:
                             result = self._policy.infer(policy_obs)
                             action = result["actions"]
-                            self._set_samples(result.get("action_samples"))
+                            self._set_samples(
+                                result.get("action_samples"),
+                                chosen=int(result.get("critic_choice", 0) or 0),
+                                scores=result.get("critic_scores"),
+                            )
                             self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
                             self._set(
                                 streaming=True,
