@@ -318,7 +318,7 @@ def test_no_reachable_video_setting_writes_an_image(tmp_path, settings):
     writer = AsyncDatasetWriter(cfg, list(cams), cams)
     writer.open(frame(0))
     for i in range(12):
-        writer.stream_frame(frame(i))
+        writer.stream_frame(frame(i), "t")
     writer.end_episode("success", "t")
     writer.finalize()
 

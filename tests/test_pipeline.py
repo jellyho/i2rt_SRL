@@ -387,7 +387,7 @@ def test_streaming_memory_does_not_grow_with_episode_length(tmp_path):
 
     high_water = 0
     for i in range(400):
-        writer.stream_frame(frame(i))
+        writer.stream_frame(frame(i), "t")
         high_water = max(high_water, writer._frame_queue.qsize())
     writer.end_episode("success", "t")
     writer.finalize()
@@ -424,13 +424,56 @@ def test_streaming_abort_drops_the_episode_and_leaves_the_writer_usable(tmp_path
     writer.open(frame(0))
 
     for i in range(20):
-        writer.stream_frame(frame(i))
+        writer.stream_frame(frame(i), "t")
     writer.abort_episode()
     for i in range(25):
-        writer.stream_frame(frame(i))
+        writer.stream_frame(frame(i), "t")
     writer.end_episode("success", "t")
     writer.finalize()
 
     info = json.loads((tmp_path / "abort" / "meta" / "info.json").read_text())
     assert info["total_episodes"] == 1, "the aborted episode must not be saved"
     assert info["total_frames"] == 25, "and must not contribute frames to the kept one"
+
+
+def test_a_streamed_episode_keeps_its_task(tmp_path):
+    """The task has to travel with each frame, not with the episode's end.
+
+    LeRobot wants a task on every add_frame, and by the time an episode ends its frames are
+    already inside the dataset — so a streaming path that waits for `end_episode` has nothing
+    to give them. Reading it off the frame dict instead, which carries no task, wrote an empty
+    string for 34 consecutive episodes before anyone noticed: nothing fails, the dataset opens,
+    and the task column is simply blank.
+    """
+    import pandas as pd
+
+    from workstation.lerobot_recorder.config import RecorderConfig
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    cams = {"cam": (32, 32, 3)}
+
+    def frame(i):
+        # Exactly what Recorder._frame produces — note it has no "task" key.
+        return {
+            "images": {"cam": np.full((32, 32, 3), i % 255, np.uint8)},
+            "observation.state": np.zeros(42, np.float32),
+            "action": np.zeros(14, np.float32),
+        }
+
+    cfg = RecorderConfig(repo_id="t/tasks", root=str(tmp_path), mock=False, fps=30,
+                         task="assemble lego blocks")
+    writer = AsyncDatasetWriter(cfg, list(cams), cams)
+    writer.open(frame(0))
+
+    for i in range(10):
+        writer.stream_frame(frame(i), "assemble lego blocks")
+    writer.end_episode("success", "assemble lego blocks")
+    # A task change mid-session must be kept per episode, not overwritten globally.
+    for i in range(8):
+        writer.stream_frame(frame(i), "put the taxi down")
+    writer.end_episode("success", "put the taxi down")
+    writer.finalize()
+
+    tasks = list(pd.read_parquet(tmp_path / "tasks" / "meta" / "tasks.parquet").index)
+    assert "" not in tasks, f"an episode was written with a blank task: {tasks}"
+    assert set(tasks) == {"assemble lego blocks", "put the taxi down"}

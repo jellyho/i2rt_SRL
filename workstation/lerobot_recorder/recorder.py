@@ -331,7 +331,7 @@ class Recorder:
         if not self._n_frames:
             self._streaming_episode = writer.supports_streaming()
         if self._streaming_episode:
-            writer.stream_frame(frame)
+            writer.stream_frame(frame, self.cfg.task)
         else:
             self._episode.append(frame)
         self._log_samples()

@@ -751,8 +751,14 @@ class AsyncDatasetWriter:
         """
         return not (self._mock or self._abcdl or bool(getattr(self.cfg, "rl_features", False)))
 
-    def stream_frame(self, frame: dict) -> None:
-        """Hand one captured frame to the writer thread.
+    def stream_frame(self, frame: dict, task: str) -> None:
+        """Hand one captured frame to the writer thread, with the task it belongs to.
+
+        The task is passed per frame rather than waiting for ``end_episode``, because LeRobot
+        wants it on every ``add_frame`` and by the time the episode ends its frames are already
+        inside the dataset. Taking it from the frame dict instead -- which carries no task --
+        silently wrote an empty string for every streamed episode.
+        
 
         The point of this path is that no episode is ever held whole in memory. Three cameras
         at 640x480 are ~2.8 MB a frame, so a 40 s episode buffered as a list is ~7 GB -- enough
@@ -765,7 +771,7 @@ class AsyncDatasetWriter:
         640x480 cameras against a 30 fps capture rate.
         """
         self._check_writable()
-        self._frame_queue.put(("frame", frame))
+        self._frame_queue.put(("frame", frame, task))
 
     def end_episode(self, outcome: Optional[str], task: str, sample_log=None) -> None:
         """Close the streamed episode and save it.
@@ -932,7 +938,8 @@ class AsyncDatasetWriter:
     def _handle_stream_item(self, item: tuple) -> None:
         kind = item[0]
         if kind == "frame":
-            self._ds.add_frame(self._to_lerobot_frame(item[1], item[1].get("task", "")))
+            _, frame, task = item
+            self._ds.add_frame(self._to_lerobot_frame(frame, task))
             self._streamed_frames += 1
             with self._lock:
                 self._saving_frames = self._streamed_frames

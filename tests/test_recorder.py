@@ -29,14 +29,16 @@ class _FakeWriter(SimpleNamespace):
             progress={"saving": False, "queued": 0}, **kw
         )
         self.frames = []
+        self.tasks = []
         self.saved = []
         self.sample_logs = []
 
     def supports_streaming(self):
         return True
 
-    def stream_frame(self, frame):
+    def stream_frame(self, frame, task=""):
         self.frames.append(frame)
+        self.tasks.append(task)
 
     def end_episode(self, outcome, task, sample_log=None):
         self.saved.append((list(self.frames), outcome, task))
@@ -791,3 +793,28 @@ def test_no_samples_source_records_nothing_extra():
     rec._step(images, {**snap, "teleop_state": "IDLE", "action": None,
                        "last_dagger_event": {"seq": 1, "action": "keep"}})
     assert rec.writer.sample_logs == [None]
+
+
+def test_the_recorder_streams_the_active_task_with_every_frame():
+    """The task the operator set has to reach the writer, or the dataset's task column is blank."""
+    cfg = RecorderConfig(record_source="dagger", mock=True, task="assemble lego blocks")
+    rec = Recorder(cfg)
+    rec.writer = _FakeWriter()
+    rec.gate.arm()
+
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+    snap = {
+        "teleop_state": "ENGAGED",
+        "state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "control_mode": 1,
+        "buttons": {},
+        "intervention": False,
+        "leader_recentering": False,
+    }
+    for _ in range(3):
+        rec._step(images, snap)
+
+    assert rec.writer.tasks == ["assemble lego blocks"] * 3
