@@ -471,3 +471,61 @@ def test_start_button_is_disabled_while_no_policy(tmp_path, qapp, no_camera_scan
         gui.recorder = None
         gui.runner = None
         gui.close()
+
+
+def _samples_gui(tmp_path, num_samples=0):
+    """A deploy window plus the bridge config it was built from, which is the object the
+    runner is later constructed with."""
+    from workstation.lerobot_recorder.deploy_gui import DeployGUI
+    from workstation.policy_bridge.config import BridgeConfig
+
+    bridge_cfg = BridgeConfig()
+    bridge_cfg.num_samples = num_samples
+    cfg = RecorderConfig(mock=True, repo_id="test/deploy", root=str(tmp_path))
+    return DeployGUI(cfg, bridge_cfg, mode="dagger", record=True), bridge_cfg
+
+
+def test_no_count_is_shown_while_sampling_is_off(tmp_path, qapp, no_camera_scan):
+    """A greyed-out spinner still shows a number, and a number on screen reads as "this many
+    samples are being taken" however pale it is. Nothing visible, nothing sampled."""
+    gui, bridge_cfg = _samples_gui(tmp_path, num_samples=0)
+    try:
+        assert gui.samples_check.isChecked() is False
+        assert gui.samples_spin.isHidden() is True
+        assert bridge_cfg.num_samples == 0
+    finally:
+        gui.close()
+
+
+def test_turning_it_on_before_the_rig_starts_is_not_lost(tmp_path, qapp, no_camera_scan):
+    """The handler used to write to self.runner.cfg, and the runner is only built when the rig
+    starts — so ticking this on the setup page silently did nothing."""
+    gui, bridge_cfg = _samples_gui(tmp_path, num_samples=0)
+    try:
+        assert gui.runner is None, "this test is about the window before the runner exists"
+        gui.samples_check.setChecked(True)
+        assert bridge_cfg.num_samples == gui.samples_spin.value()
+        assert gui.samples_spin.isHidden() is False
+    finally:
+        gui.close()
+
+
+def test_turning_it_off_restores_a_plain_request(tmp_path, qapp, no_camera_scan):
+    gui, bridge_cfg = _samples_gui(tmp_path, num_samples=8)
+    try:
+        assert bridge_cfg.num_samples == 8
+        gui.samples_check.setChecked(False)
+        assert bridge_cfg.num_samples == 0, "0, not 1: the key must leave the wire entirely"
+        assert gui.samples_spin.isHidden() is True
+    finally:
+        gui.close()
+
+
+def test_the_launch_flag_and_the_checkbox_agree(tmp_path, qapp, no_camera_scan):
+    gui, bridge_cfg = _samples_gui(tmp_path, num_samples=6)
+    try:
+        assert gui.samples_check.isChecked() is True
+        assert gui.samples_spin.value() == 6
+        assert bridge_cfg.num_samples == 6
+    finally:
+        gui.close()

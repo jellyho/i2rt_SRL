@@ -186,9 +186,15 @@ class DeployGUI(RecorderGUI):
         for one sample.
         """
         on = bool(on)
+        # Hidden rather than merely greyed when off: a disabled spinner still shows a number,
+        # and a number on screen reads as "this many samples are being taken" no matter how
+        # pale it is. Nothing visible, nothing being sampled.
+        self.samples_spin.setVisible(on)
         self.samples_spin.setEnabled(on)
-        if self.runner is not None:
-            self.runner.cfg.num_samples = int(self.samples_spin.value()) if on else 0
+        # Written to the bridge config, NOT to self.runner.cfg: the runner is built when the
+        # rig starts, so ticking this on the setup page would otherwise be silently dropped.
+        # The runner is constructed with this very object, so it sees the value either way.
+        self.bridge_cfg.num_samples = int(self.samples_spin.value()) if on else 0
         if not on and self.runner is not None:
             self.runner._set_samples(None)     # drop the last spread rather than leave it drawn
 
@@ -279,7 +285,9 @@ class DeployGUI(RecorderGUI):
         # Seeded from --num-samples, so the flag and the checkbox cannot disagree at startup.
         launch_samples = int(getattr(self.bridge_cfg, "num_samples", 0) or 0)
         self.samples_spin.setValue(max(2, launch_samples) if launch_samples > 1 else 8)
+        self.samples_spin.setSuffix(" samples")
         self.samples_check.setChecked(launch_samples > 1)
+        self.samples_spin.setVisible(launch_samples > 1)
         self.samples_spin.setEnabled(launch_samples > 1)
         self.samples_check.toggled.connect(self._on_samples_toggled)
         self.samples_spin.valueChanged.connect(lambda *_: self._on_samples_toggled(self.samples_check.isChecked()))
