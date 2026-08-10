@@ -44,7 +44,12 @@ logger = logging.getLogger(__name__)
 
 
 class Recorder:
-    def __init__(self, cfg: RecorderConfig, on_status: Optional[Callable[[dict], None]] = None) -> None:
+    def __init__(
+        self,
+        cfg: RecorderConfig,
+        on_status: Optional[Callable[[dict], None]] = None,
+        samples_fn: Optional[Callable[[], Optional[np.ndarray]]] = None,
+    ) -> None:
         self.cfg = cfg
         self.cameras = CameraManager(cfg)
         self.robot = PortalBridge(cfg)
@@ -114,6 +119,11 @@ class Recorder:
         # takeover are unchanged, so this is the recorder minus the dataset.
         self._deploy = cfg.record_source == "deploy"
         self._last_ram_gb = 0.0
+        # Supplies the action chunks the policy sampled for the current frame, when something
+        # is asking for them (the deploy runner). Logged beside the dataset, not in it -- see
+        # workstation.policy_bridge.sample_log for why.
+        self._samples_fn = samples_fn
+        self._sample_log = None
 
     # ------------------------------------------------------------------ control
     def start(self) -> None:
@@ -287,6 +297,28 @@ class Recorder:
             self._set(pending=False, frames=0)
 
     # ---------------------------------------------------------------- episode sink
+    def set_samples_source(self, samples_fn) -> None:
+        """Attach the thing that knows what the policy sampled for the current frame.
+
+        A setter rather than a constructor argument because the deploy runner needs the
+        recorder's camera frames, so it cannot exist yet when the recorder is built.
+        """
+        self._samples_fn = samples_fn
+
+    def _log_samples(self) -> None:
+        """Collect this frame's sampled chunks, if any. Never fatal: a lost diagnostic must
+        not cost the episode it describes."""
+        if self._samples_fn is None:
+            return
+        try:
+            if self._sample_log is None:
+                from workstation.policy_bridge.sample_log import EpisodeSampleLog
+
+                self._sample_log = EpisodeSampleLog()
+            self._sample_log.add(self._n_frames, self._samples_fn())
+        except Exception as e:
+            logger.debug("action-sample logging skipped: %s", e)
+
     def _ep_add(self, frame: dict) -> None:
         """Take one captured frame, either streaming it out or buffering it.
 
@@ -302,6 +334,7 @@ class Recorder:
             writer.stream_frame(frame)
         else:
             self._episode.append(frame)
+        self._log_samples()
         self._n_frames += 1
 
     def _ep_empty(self) -> bool:
@@ -312,9 +345,9 @@ class Recorder:
         self._log_ram_after_episode(self._n_frames)
         writer = self._ensure_writer_open()
         if self._streaming_episode:
-            writer.end_episode(outcome, self.cfg.task)
+            writer.end_episode(outcome, self.cfg.task, sample_log=self._sample_log)
         else:
-            writer.submit(self._episode, outcome, self.cfg.task)
+            writer.submit(self._episode, outcome, self.cfg.task, sample_log=self._sample_log)
         with self._lock:
             self._status["kept"] += 1
             if outcome in ("success", "fail"):
@@ -335,6 +368,9 @@ class Recorder:
         self._episode, self._preview, self._pending = [], [], False
         self._n_frames = 0
         self._streaming_episode = False
+        # Dropped, not reset: the log just handed to the writer is being written on another
+        # thread, so reusing the object would race with it.
+        self._sample_log = None
 
     def shutdown(self) -> None:
         self._stop.set()

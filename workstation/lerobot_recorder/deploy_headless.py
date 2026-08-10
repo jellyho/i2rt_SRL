@@ -69,6 +69,9 @@ def run_headless(
     try:
         recorder.start()  # raises with an actionable message on the wrong robot mode
         runner = DeploymentPolicyRunner(bridge_cfg, recorder_cfg, recorder.get_last_images)
+        # The sampled chunks are logged beside the dataset, so a rendered video can show what
+        # the policy predicted AT THE TIME rather than what the current checkpoint would.
+        recorder.set_samples_source(runner.get_samples)
         runner.start()
         recorder.set_leader_mirror(mirror)
         logger.info(

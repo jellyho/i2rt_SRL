@@ -733,11 +733,11 @@ class AsyncDatasetWriter:
         if self._finalized:
             raise RuntimeError("dataset writer has already been finalized")
 
-    def submit(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
+    def submit(self, frames: List[dict], outcome: Optional[str], task: str, sample_log=None) -> None:
         """Enqueue a complete episode (list of frame dicts) for background saving."""
         self._check_writable()
         if frames:
-            self._queue.put(("episode", frames, outcome, task))
+            self._queue.put(("episode", frames, outcome, task, sample_log))
             with self._lock:
                 self._n_submitted += 1
 
@@ -767,10 +767,17 @@ class AsyncDatasetWriter:
         self._check_writable()
         self._frame_queue.put(("frame", frame))
 
-    def end_episode(self, outcome: Optional[str], task: str) -> None:
-        """Close the streamed episode and save it."""
+    def end_episode(self, outcome: Optional[str], task: str, sample_log=None) -> None:
+        """Close the streamed episode and save it.
+
+        ``sample_log`` is an optional EpisodeSampleLog to write beside the dataset. It travels
+        with the episode rather than being saved by the caller because only the worker knows
+        which index this episode gets: it assigns one when it reaches the queue, so a caller
+        reading `num_episodes` at submit time names the sidecar after whichever episode is
+        still in flight.
+        """
         self._check_writable()
-        self._frame_queue.put(("end", outcome, task))
+        self._frame_queue.put(("end", outcome, task, sample_log))
         with self._lock:
             self._n_submitted += 1
 
@@ -857,13 +864,14 @@ class AsyncDatasetWriter:
                 item = self._queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            _kind, frames, outcome, task = item
+            _kind, frames, outcome, task, sample_log = item
             with self._lock:
                 self._saving = True
                 self._saving_index = self._n_episodes
                 self._saving_frames = len(frames)
             try:
                 self._save_episode(frames, outcome, task)
+                self._save_sample_log(sample_log, self._n_episodes - 1)
             except Exception as e:
                 logger.error("episode save failed: %s", e)
                 self._recover_failed_episode_buffer()
@@ -938,7 +946,7 @@ class AsyncDatasetWriter:
                 self._saving_frames = 0
             return
 
-        _, outcome, task = item
+        _, outcome, task, sample_log = item
         n_frames, self._streamed_frames = self._streamed_frames, 0
         if not n_frames:
             return
@@ -972,6 +980,7 @@ class AsyncDatasetWriter:
             episode_index = self._n_episodes
             self._n_episodes += 1
         self._record_outcome(episode_index, outcome, task, n_frames)
+        self._save_sample_log(sample_log, episode_index)
         logger.info("saved episode #%d (%d frames, outcome=%s, streamed)", episode_index, n_frames, outcome)
 
     def _recover_failed_episode_buffer(self) -> None:
@@ -1123,6 +1132,17 @@ class AsyncDatasetWriter:
             w.add_frame(i * tick, np.asarray(f["observation.state"], np.float64),
                         np.asarray(f["action"], np.float64), imgs)
         w.save(task=task, frame_features=frame_features)
+
+    def _save_sample_log(self, sample_log, episode_index: int) -> None:
+        """Write the episode's sampled action chunks beside the dataset (best effort)."""
+        if sample_log is None or not len(sample_log):
+            return
+        try:
+            path = sample_log.save(self._root, episode_index)
+            if path:
+                logger.info("episode #%d: wrote %d action-sample set(s)", episode_index, len(sample_log))
+        except Exception as e:
+            logger.error("could not save action samples for episode %d: %s", episode_index, e)
 
     def _record_outcome(self, episode_index: int, outcome: Optional[str], task: str, n_frames: int) -> None:
         entry = {

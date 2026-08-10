@@ -30,6 +30,7 @@ class _FakeWriter(SimpleNamespace):
         )
         self.frames = []
         self.saved = []
+        self.sample_logs = []
 
     def supports_streaming(self):
         return True
@@ -37,8 +38,9 @@ class _FakeWriter(SimpleNamespace):
     def stream_frame(self, frame):
         self.frames.append(frame)
 
-    def end_episode(self, outcome, task):
+    def end_episode(self, outcome, task, sample_log=None):
         self.saved.append((list(self.frames), outcome, task))
+        self.sample_logs.append(sample_log)
         self.frames = []
 
     def abort_episode(self):
@@ -727,3 +729,65 @@ def test_an_older_robot_server_still_records():
     side = {"pos": np.zeros(7), "vel": np.zeros(7), "eff": np.zeros(7), "applied": np.zeros(7)}
     old = bridge._assemble({"left": side, "right": side, "policy_running": True})
     assert old["teleop_state"] == "ENGAGED"
+
+
+def test_sampled_chunks_travel_with_the_episode_to_the_writer():
+    """The writer names the sidecar, not the recorder.
+
+    Only the worker knows which index an episode gets — it assigns one when the episode
+    reaches the queue — so a recorder reading `num_episodes` at submit time would name the
+    file after whichever episode is still in flight.
+    """
+    cfg = RecorderConfig(record_source="dagger", mock=True)
+    rec = Recorder(cfg)
+    rec.writer = _FakeWriter()
+
+    samples = np.zeros((4, 30, 14))
+    rec.set_samples_source(lambda: samples)
+    rec.gate.arm()
+
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+    snap = {
+        "teleop_state": "ENGAGED",
+        "state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "control_mode": 1,
+        "buttons": {},
+        "intervention": False,
+        "leader_recentering": False,
+    }
+    for _ in range(3):
+        rec._step(images, snap)
+    rec._step(images, {**snap, "teleop_state": "IDLE", "action": None,
+                       "last_dagger_event": {"seq": 1, "action": "keep"}})
+
+    assert rec.writer.sample_logs, "the episode was saved without its samples"
+    log = rec.writer.sample_logs[-1]
+    assert log is not None and log.rows == 1, "three identical frames are one stored set"
+
+
+def test_no_samples_source_records_nothing_extra():
+    """Plain teleop must not grow a sidecar it has no use for."""
+    cfg = RecorderConfig(record_source="dagger", mock=True)
+    rec = Recorder(cfg)
+    rec.writer = _FakeWriter()
+    rec.gate.arm()
+
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+    snap = {
+        "teleop_state": "ENGAGED",
+        "state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "control_mode": 1,
+        "buttons": {},
+        "intervention": False,
+        "leader_recentering": False,
+    }
+    rec._step(images, snap)
+    rec._step(images, {**snap, "teleop_state": "IDLE", "action": None,
+                       "last_dagger_event": {"seq": 1, "action": "keep"}})
+    assert rec.writer.sample_logs == [None]

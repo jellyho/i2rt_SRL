@@ -77,6 +77,7 @@ def render(
     fps: int,
     intrinsics_by_key: Optional[dict] = None,
     limit: Optional[int] = None,
+    replay_policy: bool = False,
 ) -> str:
     from workstation.policy_bridge.chunk_overlay import WristOverlayRenderer
     from workstation.policy_bridge.wrist_view import CameraIntrinsics
@@ -91,6 +92,23 @@ def render(
     if not renderer.available:
         raise RuntimeError(f"wrist geometry unavailable: {renderer.error}")
 
+    # Prefer what the policy actually predicted at the time, if the run recorded it. Asking a
+    # server instead answers a different question -- what the CURRENT checkpoint would do at
+    # each moment -- which is useful, but is not what happened.
+    from workstation.policy_bridge import sample_log as _sample_log
+
+    recorded = None if replay_policy else _sample_log.load(dataset_dir, episode)
+    if recorded is not None:
+        logger.info("using the %d sample set(s) recorded with the episode", len(recorded["frame_index"]))
+        rendered = []
+        from workstation.lerobot_recorder.views import compose_camera_strip
+
+        for index, frame in enumerate(frames):
+            samples = _sample_log.samples_at(recorded, index)
+            decorated = renderer.draw(frame["images"], samples, frame["state"], _intrinsics_fallback(frames, intrinsics_by_key))
+            rendered.append(compose_camera_strip(decorated))
+        return _write(rendered, out_path, fps)
+
     from yam_policy import WebsocketClientPolicy
 
     client = WebsocketClientPolicy(host=policy_host, port=policy_port)
@@ -103,21 +121,7 @@ def render(
             "(no `supports_multi_sample` in its metadata) — update it before rendering"
         )
 
-    def intrinsics_for(key: str):
-        if intrinsics_by_key and key in intrinsics_by_key:
-            return intrinsics_by_key[key]
-        sample = frames[0]["images"].get(key)
-        if sample is None:
-            return None
-        # No stored intrinsics: fall back to the D405's nominal figures for this frame size.
-        # Approximate, and said out loud, because a silently-wrong focal length makes the paths
-        # wrong in a way that still looks plausible.
-        height, width = sample.shape[:2]
-        logger.warning("no intrinsics for %s; assuming a nominal D405 at %dx%d", key, width, height)
-        return CameraIntrinsics(fx=0.9 * width, fy=0.9 * width, cx=width / 2, cy=height / 2,
-                                width=width, height=height)
-
-    import imageio.v3 as iio
+    intrinsics_for = _intrinsics_fallback(frames, intrinsics_by_key)
 
     from workstation.lerobot_recorder.views import compose_camera_strip
 
@@ -136,10 +140,36 @@ def render(
         if index % 30 == 0:
             logger.info("rendered %d/%d frames", index, len(frames))
 
+    return _write(rendered, out_path, fps)
+
+
+def _write(rendered: List[np.ndarray], out_path: str, fps: int) -> str:
+    import imageio.v3 as iio
+
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     iio.imwrite(out_path, np.stack(rendered), fps=fps)
     logger.info("wrote %s (%d frames)", out_path, len(rendered))
     return out_path
+
+
+def _intrinsics_fallback(frames: List[dict], intrinsics_by_key: Optional[dict]):
+    from workstation.policy_bridge.wrist_view import CameraIntrinsics
+
+    def intrinsics_for(key: str):
+        if intrinsics_by_key and key in intrinsics_by_key:
+            return intrinsics_by_key[key]
+        sample = frames[0]["images"].get(key)
+        if sample is None:
+            return None
+        # No stored intrinsics: fall back to the D405's nominal figures for this frame size.
+        # Approximate, and said out loud, because a silently-wrong focal length makes the paths
+        # wrong in a way that still looks plausible.
+        height, width = sample.shape[:2]
+        logger.warning("no intrinsics for %s; assuming a nominal D405 at %dx%d", key, width, height)
+        return CameraIntrinsics(fx=0.9 * width, fy=0.9 * width, cx=width / 2, cy=height / 2,
+                                width=width, height=height)
+
+    return intrinsics_for
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -155,6 +185,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--prompt", default=None)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--limit", type=int, default=0, help="stop after this many frames (0 = whole episode)")
+    p.add_argument("--replay-policy", action="store_true",
+                   help="ignore the samples recorded with the episode and ask a live policy "
+                        "server instead — what the CURRENT checkpoint would do, not what happened")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -179,6 +212,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             prompt=args.prompt or rec.get("task"),
             fps=args.fps,
             limit=args.limit or None,
+            replay_policy=args.replay_policy,
         )
     except Exception as e:
         print(f"render failed: {type(e).__name__}: {e}", file=sys.stderr)
