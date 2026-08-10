@@ -276,8 +276,11 @@ class DeployGUI(RecorderGUI):
         )
         self.samples_spin = QtWidgets.QSpinBox()
         self.samples_spin.setRange(2, 32)
-        self.samples_spin.setValue(8)
-        self.samples_spin.setEnabled(False)
+        # Seeded from --num-samples, so the flag and the checkbox cannot disagree at startup.
+        launch_samples = int(getattr(self.bridge_cfg, "num_samples", 0) or 0)
+        self.samples_spin.setValue(max(2, launch_samples) if launch_samples > 1 else 8)
+        self.samples_check.setChecked(launch_samples > 1)
+        self.samples_spin.setEnabled(launch_samples > 1)
         self.samples_check.toggled.connect(self._on_samples_toggled)
         self.samples_spin.valueChanged.connect(lambda *_: self._on_samples_toggled(self.samples_check.isChecked()))
         self.button_legend = QtWidgets.QLabel(

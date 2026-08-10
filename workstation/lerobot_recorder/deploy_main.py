@@ -40,6 +40,10 @@ def build_configs(
     p.add_argument("--policy-port", type=int, default=8000)
     p.add_argument("--rate", type=float, default=30.0)
     p.add_argument("--image-size", type=int, default=224)
+    p.add_argument("--num-samples", type=int, default=0,
+                   help="ask the policy for N action chunks per step instead of one, draw them on "
+                        "the wrist views, and log them beside the dataset. Costs one forward pass "
+                        "per sample, so 0 (off) is normal deployment")
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
@@ -127,6 +131,7 @@ def build_configs(
     recorder_cfg.expected_robot_mode = "deploy"  # only that controller accepts policy actions
 
     bridge_cfg = BridgeConfig(
+        num_samples=max(0, int(args.num_samples)),
         robot_host=recorder_cfg.robot_host,
         robot_port=recorder_cfg.robot_port,
         policy_host=pol.get("policy_host", key="host"),
