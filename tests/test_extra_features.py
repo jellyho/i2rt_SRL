@@ -176,3 +176,59 @@ def test_a_run_that_declares_nothing_records_the_same_columns_as_before(tmp_path
 
     columns = set(pd.read_parquet(sorted((tmp_path / "extras").rglob("data/**/*.parquet"))[0]).columns)
     assert "critic_q" not in columns and "action_samples" not in columns
+
+
+# --------------------------------------------------------------------------------------- #
+# An adaptive chunk
+# --------------------------------------------------------------------------------------- #
+class _AdaptivePolicy:
+    """A policy whose chunk length changes from one replan to the next."""
+
+    LENGTHS = (4, 9, 2, 7)
+
+    def __init__(self):
+        self.calls = -1
+
+    def infer(self, obs):
+        self.calls += 1
+        length = self.LENGTHS[self.calls % len(self.LENGTHS)]
+        return {
+            "actions": np.zeros((length, 14), np.float32),
+            # A critic's value for every candidate, at every step: (X, N)
+            "critic_q": np.tile(np.arange(CANDIDATES, dtype=np.float32), (length, 1)),
+            # The candidates themselves: (X, N, action_dim)
+            "action_samples": np.zeros((length, CANDIDATES, 14), np.float32),
+        }
+
+    def reset(self):
+        pass
+
+
+def test_extras_follow_a_chunk_whose_length_changes():
+    """The chunk is adaptive, so nothing may assume a fixed horizon.
+
+    The length is read off `actions` on every reply, which is what lets an (X, N, action_dim)
+    candidate set follow the same X its (X, action_dim) actions did — with no renegotiation,
+    and with the declaration untouched because it only ever named the per-step shape.
+    """
+    policy = _AdaptivePolicy()
+    broker = ActionChunkBroker(policy)
+
+    seen = set()
+    for _ in range(30):
+        result = broker.infer({})
+        seen.add(broker.action_horizon)
+        assert result["actions"].shape == (14,)
+        assert result["critic_q"].shape == (CANDIDATES,), "a Q per candidate, this step"
+        assert result["action_samples"].shape == (CANDIDATES, 14)
+
+    assert len(seen) > 1, f"the chunk length never changed ({seen}) — nothing was proven"
+
+
+def test_the_declaration_does_not_mention_the_chunk_length():
+    """Because neither side can know it: it is whatever a reply carries."""
+    declared = _extra_features_from_meta(
+        {"extra_features": {"critic_q": [CANDIDATES], "action_samples": [CANDIDATES, 14]}}
+    )
+    assert declared["critic_q"] == (CANDIDATES,)
+    assert declared["action_samples"] == (CANDIDATES, 14)

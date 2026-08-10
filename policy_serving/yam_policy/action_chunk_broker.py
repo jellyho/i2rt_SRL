@@ -15,11 +15,19 @@ client then drives any policy, whatever chunk size it was trained with.
 The inner policy must return ``{"actions": ndarray(chunk, action_dim), ...}``. Each
 ``infer`` returns that dict with array fields sliced to the current step.
 
-**Extra per-step data rides along.** A policy may return more than actions -- a critic's Q per
-step, the candidate chunks it chose between, anything it wants recorded. Those arrays are
-sliced by the same rule: leading axis equal to the chunk means per-step, so step `i` gets row
-`i`. Nothing here knows their names; the server declares those at handshake (see
-``extra_features`` in the server metadata) and the recorder turns them into dataset columns.
+**Extra per-step data rides along.** A policy may return more than actions -- a critic's Q for
+every candidate, the candidate chunks themselves, anything it wants recorded. Those arrays are
+sliced by the same rule: leading axis equal to this reply's chunk length means per-step, so
+step `i` gets row `i`.
+
+That rule is what makes the extras survive an ADAPTIVE chunk. The length is read from
+``actions`` on every reply, never configured, so a policy free to return 4 steps this replan
+and 9 the next carries its extras along without anything being renegotiated -- an
+``(X, N, action_dim)`` candidate set follows the same X its ``(X, action_dim)`` actions did.
+
+Nothing here knows their names; the server declares those at handshake (``extra_features`` in
+the server metadata, giving each one's PER-STEP shape) and the recorder turns them into dataset
+columns.
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ def _slice_step(results: Dict, step: int) -> Dict:
     leading axis is NOT the chunk is passed through whole rather than mis-indexed, because
     slicing it would return a different thing entirely and look like data.
     """
+    # This reply's length, not a configured one: the chunk is adaptive.
     chunk = chunk_len(results)
     return {
         k: (v[step, ...] if isinstance(v, np.ndarray) and v.ndim > 0 and v.shape[0] == chunk else v)

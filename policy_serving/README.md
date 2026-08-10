@@ -85,6 +85,52 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
   puts them in the server metadata and the bridge auto-configures from
   `get_server_metadata()` — no need to hand-match the bridge to the policy.
 
+## Extra per-step data (`extra_features`)
+
+A policy can return more than actions — a critic's value for each candidate, the candidate
+chunks themselves, anything worth keeping — and have it recorded automatically. Neither side
+hard-codes a name: the server declares them once, at handshake.
+
+```python
+metadata = {
+    "extra_features": {
+        "critic_q":       [8],      # a Q per candidate,   arrives as (X, 8)
+        "action_samples": [8, 14],  # the candidates,      arrives as (X, 8, 14)
+    }
+}
+```
+
+**The shape you declare is one step's.** The leading axis is left out on purpose: the chunk
+length `X` is adaptive — whatever a reply happens to carry, and free to differ from one replan
+to the next — so it is not something either side can declare. The per-step shape is fixed, and
+is exactly what a dataset column needs.
+
+**Do not declare `action_horizon`.** This client never reads it: the chunk length comes from
+`actions.shape[0]` on every reply, which is what lets the horizon be adaptive at all. Serving
+it is harmless (openpi's own broker takes it as a constructor argument) but it is not part of
+this contract, and with a varying chunk it is not a well-defined number.
+
+**The rule.** An extra array's leading axis is `X`, the same as `actions`. That is what makes
+it per-step, so step `i` gets row `i` — the broker slices by that rule rather than by a list of
+known keys, and so never needs to learn a new one. An array whose leading axis is *not* `X` is
+passed through whole instead of mis-indexed, because slicing it returns a different thing
+entirely and still looks like data.
+
+**What you get.** Each declared feature becomes a dataset column at its declared shape, one row
+per frame:
+
+```python
+dataset[i]["critic_q"]        # (8,)
+dataset[i]["action_samples"]  # (8, 14)     — not flattened
+```
+
+Shapes are kept rather than flattened so the dataset describes itself; an anonymous 112-vector
+would leave every reader to know the layout out of band. A malformed declaration is dropped
+with a warning rather than trusted — a wrong shape here becomes a wrong column in every episode
+— and a policy that declares nothing produces exactly the dataset it produced before.
+
+The deploy stack is unchanged by any of this: one chunk, adaptive length, one action per tick.
+
 ## Visualisation (`yam_policy.viz`)
 
 Draw what a policy predicted, on the frames it predicted from. Packaged here so a policy repo

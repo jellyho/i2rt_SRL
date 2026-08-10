@@ -31,10 +31,14 @@ def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
 
         {"extra_features": {"critic_q": [1], "action_samples": [8, 14]}}
 
-    The shape given is ONE STEP's shape -- the chunk axis is implied, because that is what
-    makes the value per-step and therefore recordable as a dataset column. Anything malformed
-    is dropped with a warning rather than taken on faith: a wrong shape here becomes a wrong
-    column in every episode of the dataset.
+    The shape given is ONE STEP's shape. The chunk axis is deliberately left out: the chunk
+    length is adaptive -- whatever a reply happens to carry -- so it is not something either
+    side can declare, while the per-step shape is fixed and is exactly what a dataset column
+    needs. A critic scoring N candidates declares ``[N]`` and sends ``(X, N)``; the candidate
+    chunks declare ``[N, action_dim]`` and arrive as ``(X, N, action_dim)``.
+
+    Anything malformed is dropped with a warning rather than taken on faith: a wrong shape here
+    becomes a wrong column in every episode of the dataset.
     """
     declared = meta.get("extra_features") or {}
     if not isinstance(declared, dict):
