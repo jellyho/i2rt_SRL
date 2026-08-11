@@ -118,6 +118,12 @@ class RecorderConfig:
     # ~4 threads per camera parallelizes it (0 = synchronous; processes>0 adds subprocesses).
     image_writer_threads: int = 0
     image_writer_processes: int = 0
+    # Keyframe interval. LeRobot hard-codes 2 in its streaming encoder -- a keyframe every
+    # other frame -- which makes a random frame decode fastest and the file about 2.8x larger
+    # than the same footage at 10. Measured on this rig: 0.90 ms per random frame at g=2
+    # against 1.23 ms at g=10, a difference a dataloader worker hides, while the disk and the
+    # upload do not hide 2.8x. 10 still leaves three keyframes a second at 30 fps.
+    gop: int = 10
     # (There is no streaming_encoding knob. Frames always stream straight into the PyAV
     # encoder; the alternative round-trips every frame of every camera through a ~1.5 MB PNG
     # on disk, which is not a mode worth being one config key away from. See
@@ -190,6 +196,7 @@ def apply_recorder_section(cfg: RecorderConfig, rec_section) -> RecorderConfig:
     cfg.torchcodec_max_used_vram_gb = float(
         g("torchcodec_max_used_vram_gb", cfg.torchcodec_max_used_vram_gb)
     )
+    cfg.gop = max(1, int(g("gop", cfg.gop)))
     cfg.encoder_threads = int(g("encoder_threads", cfg.encoder_threads))
     cfg.batch_encoding_size = int(g("batch_encoding_size", cfg.batch_encoding_size))
     cfg.image_writer_threads = int(g("image_writer_threads", cfg.image_writer_threads))

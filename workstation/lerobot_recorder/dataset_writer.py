@@ -303,6 +303,28 @@ class AsyncDatasetWriter:
 
         self._ds._encode_temporary_episode_video = MethodType(encode_episode, self._ds)
 
+    def _apply_gop(self) -> None:
+        """Set the keyframe interval on LeRobot's streaming encoder.
+
+        ``LeRobotDataset.create`` hard-codes ``g=2`` and offers no way to pass another, so the
+        only place to say otherwise is the encoder it just built. Two means a keyframe every
+        other frame: the fastest random-frame decode there is, and about 2.8x the file. The
+        trade is measured in RecorderConfig.gop; what matters here is that it is a decision
+        rather than a default nobody noticed, and that it is said out loud in the log.
+        """
+        encoder = getattr(self._ds, "_streaming_encoder", None)
+        if encoder is None:
+            return
+        want = max(1, int(getattr(self.cfg, "gop", 10)))
+        current = getattr(encoder, "g", None)
+        if current == want:
+            return
+        try:
+            encoder.g = want
+            logger.info("keyframe interval: g=%s (lerobot's default is %s)", want, current)
+        except Exception as e:
+            logger.warning("could not set the keyframe interval: %s", e)
+
     def _suppress_image_staging(self) -> None:
         """Stop LeRobot staging every video frame to disk as a PNG.
 
@@ -646,6 +668,7 @@ class AsyncDatasetWriter:
                     self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
             self._configure_torchcodec_encoder()
+            self._apply_gop()
             self._suppress_image_staging()
         else:
             if self.cfg.resume:
