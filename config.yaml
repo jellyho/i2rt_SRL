@@ -48,7 +48,7 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # intervention (dagger_feedback_kp: 0 -> fully free intervention). Every other
   # phase (homing, idle/before engage, policy mirroring) uses yam.yml originals.
   # leader_grav_comp_kd: [0.05, 0.05, 0.05, 0.15, 0.025, 0.025]
-  leader_grav_comp_kd: [0.000, 0.000, 0.000, 0.001, 0.001, 0.001]
+  leader_grav_comp_kd: [0.000, 0.000, 0.000, 0.0001, 0.0001, 0.0001]
   leader_coulomb_friction: [0.55, 0.4, 0.8, 0.07, 0.07, 0.07]
   # leader_gravity_comp_factor: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # >1 floats the arm up
   # leader_gravity_comp_factor: [1.0, 1.1, 1.1, 1.2, 1.0, 1.0] # >1 floats the arm up
@@ -108,7 +108,10 @@ recorder:
   root: ~/lerobot_data
   fps: 30
   min_free_gb: 1.0
-  source: teleop             # teleop | dagger | eval
+  # teleop = gate on the teleop engage signal | dagger = one policy rollout per episode
+  # eval   = one continuous rollout from Start to Stop collection
+  # deploy = run the policy WITHOUT recording (no dataset); `yam-data deploy --no-record`
+  source: teleop             # teleop | dagger | eval | deploy (deploy UI derives its own)
   format: lerobot            # lerobot (LeRobotDataset) | abcdl (abcdl MP4+binary cache; needs the `abcdl` pkg)
   # abcdl_size: 224          # square px cameras are resized to for the abcdl format
   # --- per-frame RL signals (stored as dataset features; preserved across resume) ---
@@ -129,7 +132,6 @@ recorder:
   vcodec: auto               # auto = GPU h264_nvenc here (fastest) | h264 (CPU, reliable) | libsvtav1 (slow AV1)
   # PyAV can encode continuously during capture. TorchCodec 0.10 is batch-only, so
   # this is automatically disabled when TorchCodec is selected.
-  streaming_encoding: true
   # FALLBACK path only (streaming off / stock lerobot) — the knobs below are INERT
   # while streaming_encoding is true; they're kept at sensible values for the fallback:
   encoder_threads: 0         # CPU threads per encode; GPU nvenc ignores this (0 = codec default)
@@ -139,7 +141,6 @@ recorder:
   image_writer_threads: 12   # temp-PNG writer threads (the slow pre-encode step of the fallback);
                              # LeRobot advises ~4 per camera. 0 = synchronous (slowest)
   image_writer_processes: 0  # >0 = also use subprocesses if threads alone aren't enough
-  # use_videos: true         # false = store raw frames (no encode; fastest save, larger on disk)
   # Single source for teleop end+label behavior. Each mapped button both starts
   # homing on the robot and assigns this outcome in the recorder.
   buttons:                   # "<side>.<index>" -> success | fail | discard (upper=0, lower=1)

@@ -1,8 +1,11 @@
-"""Image helpers mirroring ``openpi_client.image_tools``.
+"""Image helpers, byte-identical to ``openpi_client.image_tools``.
 
-Resize-with-pad (preserve aspect ratio, pad to square) and uint8 conversion, so
-the client side preprocesses camera frames exactly the way openpi expects
-(typically 224x224 uint8). Uses Pillow to avoid heavy deps.
+A policy is trained on images preprocessed by openpi's resize, so feeding it anything else
+at deployment is a silent distribution shift. This is therefore openpi's implementation
+verbatim rather than an equivalent-looking one: the previous version here rounded where
+openpi truncates, which happened to agree at 640x480 but produced a one-pixel padding
+offset at e.g. 848x480 — a resolution the per-camera `width`/`height` in config.yaml can
+select.
 """
 
 from __future__ import annotations
@@ -12,32 +15,59 @@ from PIL import Image
 
 
 def convert_to_uint8(img: np.ndarray) -> np.ndarray:
-    """Convert a float image in [0, 1] to uint8 [0, 255]; pass uint8 through."""
-    if np.issubdtype(img.dtype, np.floating):
-        img = (255.0 * img).clip(0, 255).astype(np.uint8)
-    return img.astype(np.uint8)
+    """Converts an image to uint8 if it is a float image.
 
-
-def resize_with_pad(image: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Resize ``image`` (HxWx3) into ``height x width`` keeping aspect ratio.
-
-    The image is scaled to fit and zero-padded (centered) to the target size.
+    This is important for reducing the size of the image when sending it over the network.
     """
-    if image.shape[0] == height and image.shape[1] == width:
-        return image
+    if np.issubdtype(img.dtype, np.floating):
+        img = (255 * img).astype(np.uint8)
+    return img
 
-    cur_h, cur_w = image.shape[:2]
-    ratio = min(width / cur_w, height / cur_h)
-    resized_w, resized_h = round(cur_w * ratio), round(cur_h * ratio)
 
-    pil = Image.fromarray(convert_to_uint8(image))
-    pil = pil.resize((resized_w, resized_h), resample=Image.BILINEAR)
-    resized = np.asarray(pil)
+def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Replicates tf.image.resize_with_pad for multiple images using PIL.
 
-    out = np.zeros((height, width, resized.shape[2] if resized.ndim == 3 else 1), dtype=np.uint8)
-    if resized.ndim == 2:
-        resized = resized[..., None]
-    top = (height - resized_h) // 2
-    left = (width - resized_w) // 2
-    out[top : top + resized_h, left : left + resized_w, :] = resized
-    return out
+    Resizes a batch of images to a target height and width without distortion by padding
+    with zeros.
+
+    Args:
+        images: A batch of images in [..., height, width, channel] format.
+        height: The target height of the image.
+        width: The target width of the image.
+        method: The interpolation method to use. Default is bilinear.
+
+    Returns:
+        The resized images in [..., height, width, channel].
+    """
+    # If the images are already the correct size, return them as is.
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+
+    images = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+
+def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
+    """Replicates tf.image.resize_with_pad for one image using PIL.
+
+    Unlike the jax version, note that PIL uses [width, height, channel] ordering instead of
+    [batch, h, w, c].
+    """
+    cur_width, cur_height = image.size
+    if cur_width == width and cur_height == height:
+        return image  # No need to resize if the image is already the correct size.
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_image = image.resize((resized_width, resized_height), resample=method)
+
+    zero_image = Image.new(resized_image.mode, (width, height), 0)
+    pad_height = max(0, int((height - resized_height) / 2))
+    pad_width = max(0, int((width - resized_width) / 2))
+    zero_image.paste(resized_image, (pad_width, pad_height))
+    assert zero_image.size == (width, height)
+    return zero_image

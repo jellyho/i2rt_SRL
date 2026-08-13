@@ -1,7 +1,14 @@
-"""Entry point for the DAgger deployment UI.
+"""Entry point for the policy deployment UI.
 
 This replaces the normal headless ``yam-data bridge`` operator flow: the UI owns
-policy streaming and DAgger recording in one workstation process.
+policy streaming and (optionally) DAgger recording in one workstation process.
+
+    workstation/yam-data deploy              # everything else is chosen in the UI
+    workstation/yam-data deploy --headless   # no GUI (replaces the old `yam-data bridge`)
+
+A run has two independent axes, both on the setup page: **mode** (deploy = watch the
+policy, leader free; dagger = correct it, leader mirrors) and **record** (whether the run
+lands in a dataset). The flags below only set their initial values.
 """
 
 from __future__ import annotations
@@ -11,12 +18,15 @@ import sys
 from typing import List, Optional, Tuple
 
 from i2rt.serving.rig_config import Resolver, apply_camera_serials, load_rig
-from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
+from workstation.lerobot_recorder.config import RecorderConfig, apply_recorder_section, default_cameras
+from workstation.lerobot_recorder.deploy_gui import DeployGUI
 from workstation.policy_bridge.config import BridgeConfig
 
 
-def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, BridgeConfig]:
-    p = argparse.ArgumentParser(description="YAM DAgger deployment UI")
+def build_configs(
+    argv: Optional[List[str]] = None,
+) -> Tuple[RecorderConfig, BridgeConfig, argparse.Namespace]:
+    p = argparse.ArgumentParser(description="YAM policy deployment UI (DAgger or watch-only)")
     p.add_argument("--config", default=None, help="config.yaml (robot/policy/cameras/recorder)")
     p.add_argument("--repo-id", default="user/yam_bimanual")
     p.add_argument("--root", default="~/lerobot_data")
@@ -29,13 +39,56 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
     p.add_argument("--policy-host", default="127.0.0.1")
     p.add_argument("--policy-port", type=int, default=8000)
     p.add_argument("--rate", type=float, default=30.0)
-    p.add_argument("--action-horizon", type=int, default=16)
     p.add_argument("--image-size", type=int, default=224)
-    p.add_argument("--no-async", action="store_true", help="disable action-chunk prefetch")
+    p.add_argument("--num-samples", type=int, default=0,
+                   help="ask the policy for N action chunks per step instead of one, draw them on "
+                        "the wrist views, and log them beside the dataset. Costs one forward pass "
+                        "per sample, so 0 (off) is normal deployment")
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
     p.add_argument("--resume", action="store_true", help="append to an existing dataset at --root")
+    p.add_argument(
+        "--mode",
+        choices=["deploy", "dagger"],
+        default="dagger",
+        help="deploy = watch the policy (leader free); dagger = correct it (leader mirrors). "
+        "Also selectable on the setup page.",
+    )
+    p.add_argument(
+        "--no-record",
+        action="store_true",
+        help="start with recording OFF (no dataset is created or opened). Independent of "
+        "--mode; also togglable on the setup page.",
+    )
+    mirror = p.add_mutually_exclusive_group()
+    mirror.add_argument(
+        "--leader-mirror",
+        dest="leader_mirror",
+        action="store_true",
+        default=None,
+        help="force leader mirroring ON regardless of the record mode",
+    )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="run without the GUI (replaces the old `yam-data bridge`): same loop, same "
+        "obs, and unlike the old bridge it can record",
+    )
+    p.add_argument(
+        "--no-autostart",
+        dest="autostart",
+        action="store_false",
+        help="headless only: wait for the handle button instead of starting the policy "
+        "(and moving the arms) on launch",
+    )
+    mirror.add_argument(
+        "--no-leader-mirror",
+        dest="leader_mirror",
+        action="store_false",
+        help="force leader mirroring OFF: the handles hang free instead of tracking the "
+        "follower while the policy drives",
+    )
     p.add_argument("--mock", action="store_true", help="synthetic cameras/robot state")
     p.add_argument("--serials", default="", help="comma-separated RealSense serials")
     args = p.parse_args(argv)
@@ -67,48 +120,47 @@ def build_configs(argv: Optional[List[str]] = None) -> Tuple[RecorderConfig, Bri
         cameras=cams,
         robot_host=rob.get("robot_host", key="host"),
         robot_port=int(rob.get("robot_port", key="port")),
-        record_source="dagger",
+        record_source=DeployGUI.SOURCES[(args.mode, not args.no_record)],
         resume=args.resume,
         min_free_gb=float(rec.get("min_free_gb")),
         mock=args.mock,
         review_before_save=review_before_save,
         auto_arm=auto_arm,
     )
-    recorder_cfg.use_videos = bool(rec_section.get("use_videos", recorder_cfg.use_videos))
-    recorder_cfg.vcodec = str(rec_section.get("vcodec", recorder_cfg.vcodec))
-    recorder_cfg.encoding_backend = str(rec_section.get("encoding_backend", recorder_cfg.encoding_backend))
-    recorder_cfg.torchcodec_max_used_vram_gb = float(
-        rec_section.get("torchcodec_max_used_vram_gb", recorder_cfg.torchcodec_max_used_vram_gb)
-    )
-    recorder_cfg.encoder_threads = int(rec_section.get("encoder_threads", recorder_cfg.encoder_threads))
-    recorder_cfg.batch_encoding_size = int(rec_section.get("batch_encoding_size", recorder_cfg.batch_encoding_size))
-    recorder_cfg.image_writer_threads = int(rec_section.get("image_writer_threads", recorder_cfg.image_writer_threads))
-    recorder_cfg.image_writer_processes = int(
-        rec_section.get("image_writer_processes", recorder_cfg.image_writer_processes)
-    )
-    recorder_cfg.streaming_encoding = bool(
-        rec_section.get("streaming_encoding", recorder_cfg.streaming_encoding)
-    )
-    recorder_cfg.reference_live_alpha = min(
-        max(float(rec_section.get("reference_live_alpha", recorder_cfg.reference_live_alpha)), 0.0), 1.0
-    )
+    apply_recorder_section(recorder_cfg, rec_section)
+    recorder_cfg.expected_robot_mode = "deploy"  # only that controller accepts policy actions
 
     bridge_cfg = BridgeConfig(
+        num_samples=max(0, int(args.num_samples)),
         robot_host=recorder_cfg.robot_host,
         robot_port=recorder_cfg.robot_port,
         policy_host=pol.get("policy_host", key="host"),
         policy_port=int(pol.get("policy_port", key="port")),
-        action_horizon=args.action_horizon,
         rate_hz=args.rate,
         image_size=args.image_size,
         prompt=task,
-        use_async=not args.no_async,
     )
-    return recorder_cfg, bridge_cfg
+    return recorder_cfg, bridge_cfg, args
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    recorder_cfg, bridge_cfg = build_configs(argv)
+    recorder_cfg, bridge_cfg, args = build_configs(argv)
+
+    if args.headless:
+        import logging
+
+        from workstation.lerobot_recorder.deploy_headless import run_headless
+
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        sys.exit(
+            run_headless(
+                recorder_cfg,
+                bridge_cfg,
+                leader_mirror=args.leader_mirror,
+                autostart=args.autostart,
+            )
+        )
+
     from PyQt5 import QtWidgets
 
     from workstation.lerobot_recorder import theme
@@ -116,7 +168,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(theme.QSS)
-    gui = DeployGUI(recorder_cfg, bridge_cfg)
+    gui = DeployGUI(
+        recorder_cfg, bridge_cfg, mode=args.mode, record=not args.no_record,
+        leader_mirror=args.leader_mirror,
+    )
     gui.resize(900, 980)
     gui.show()
     sys.exit(app.exec_())

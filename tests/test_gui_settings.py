@@ -85,6 +85,60 @@ def test_record_and_deploy_use_separate_setting_scopes(tmp_path, qapp, no_camera
         deploy.close()
 
 
+# ------------------------------------------------------------ deploy-only (no recording)
+def _deploy_gui(deploy_only, tmp_path, mode="dagger", leader_mirror=None):
+    from workstation.lerobot_recorder.deploy_gui import DeployGUI
+    from workstation.policy_bridge.config import BridgeConfig
+
+    cfg = RecorderConfig(mock=True, repo_id="test/deploy", root=str(tmp_path))
+    return DeployGUI(cfg, BridgeConfig(), mode=mode, record=not deploy_only,
+                     leader_mirror=leader_mirror)
+
+
+def test_deploy_only_selects_the_non_recording_source(tmp_path, qapp, no_camera_scan):
+    gui = _deploy_gui(True, tmp_path)
+    try:
+        assert gui.cfg.record_source == "deploy"
+        assert gui.source_combo.currentText() == "deploy"
+        assert gui.source_combo.isEnabled() is False  # not switchable mid-session
+        assert "not recording" in gui.dagger_box.title().lower()
+        assert "nothing is recorded" in gui.hint.text().lower()
+    finally:
+        gui.close()
+
+
+def test_deploy_only_hides_every_dataset_control(tmp_path, qapp, no_camera_scan):
+    """Nothing that only means something when writing episodes should be on screen.
+
+    Asserts isHidden(), not isVisible(): the window is never show()n in a headless test, so
+    isVisible() is False for every widget and would pass no matter what."""
+    gui = _deploy_gui(True, tmp_path)
+    try:
+        for widget in (gui.repo_combo, gui.root_edit, gui.resume_check, gui.rl_check,
+                       gui.reward_combo, gui.discount_spin, gui.collect_btn, gui.save_btn,
+                       gui.review_box, gui.keep_home_btn):
+            assert widget.isHidden() is True, f"{widget} should be hidden in deploy-only"
+        # the task field stays: it doubles as the policy prompt
+        assert gui.task_combo.isHidden() is False
+        # ...and the rollout controls that make deployment usable stay too
+        for widget in (gui.policy_btn, gui.intervention_btn, gui.discard_home_btn, gui.estop_btn):
+            assert widget.isHidden() is False
+    finally:
+        gui.close()
+
+
+def test_dagger_mode_keeps_the_dataset_controls(tmp_path, qapp, no_camera_scan):
+    gui = _deploy_gui(False, tmp_path)
+    try:
+        assert gui.cfg.record_source == "dagger"
+        assert gui.source_combo.currentText() == "dagger"
+        assert gui.repo_combo.isHidden() is False
+        assert gui.keep_home_btn.isHidden() is False
+        assert "not recording" not in gui.dagger_box.title().lower()
+    finally:
+        gui.close()
+
+
 def test_reference_list_defaults_to_first_demonstration_without_off_row(tmp_path, qapp, no_camera_scan, monkeypatch):
     (tmp_path / "data").mkdir()
     episodes = [
@@ -116,6 +170,125 @@ def test_reference_list_defaults_to_first_demonstration_without_off_row(tmp_path
         assert gui.reference_list.item(0).text().startswith("demonstration 0003")
         assert played == [(3, True)]
         assert gui.reference_pause_btn.text() == "Resume reference"
+    finally:
+        gui.close()
+
+
+def test_deploy_only_stats_line_reports_control_not_episodes(tmp_path, qapp, no_camera_scan):
+    gui = _deploy_gui(True, tmp_path)
+    try:
+        gui._update_stats({"dagger_state": "policy", "policy_running": True, "intervention": False})
+        assert "not recording" in gui.stats.text()
+        assert "policy" in gui.stats.text()
+        gui._update_stats({"dagger_state": "intervention", "policy_running": True, "intervention": True})
+        assert "human" in gui.stats.text()
+    finally:
+        gui.close()
+
+
+def test_record_checkbox_switches_source_and_controls_live(tmp_path, qapp, no_camera_scan):
+    """Recording is a setup-page choice, so toggling it must re-shape the page both ways."""
+    gui = _deploy_gui(False, tmp_path)  # dagger + record
+    try:
+        assert gui.cfg.record_source == "dagger"
+        assert gui.repo_combo.isHidden() is False
+
+        gui.record_check.setChecked(False)
+        assert gui.cfg.record_source == "deploy"
+        assert gui.deploy_only is True
+        assert gui.repo_combo.isHidden() is True
+        assert gui.keep_home_btn.isHidden() is True
+        assert gui.discard_home_btn.text() == "Stop + Home"
+
+        gui.record_check.setChecked(True)  # and back again
+        assert gui.cfg.record_source == "dagger"
+        assert gui.repo_combo.isHidden() is False
+        assert gui.keep_home_btn.isHidden() is False
+        assert gui.discard_home_btn.text() == "Discard + Home"
+    finally:
+        gui.close()
+
+
+def test_leader_mirror_checkbox_is_on_the_collect_page(tmp_path, qapp, no_camera_scan):
+    """It has to be reachable DURING a rollout — the setup page is gone by then."""
+    gui = _deploy_gui(True, tmp_path)
+    try:
+        assert gui.mirror_check.isHidden() is False
+        assert gui.mirror_check.parent() is gui.dagger_box
+        assert gui.mirror_check.isChecked() is True
+    finally:
+        gui.close()
+
+
+def test_leader_mirror_follows_the_run_mode(tmp_path, qapp, no_camera_scan):
+    """Picking a mode must set mirroring by itself: on for dagger (you mean to take over),
+    off for deploy (you are only watching)."""
+    gui = _deploy_gui(True, tmp_path, mode="dagger")
+    try:
+        assert gui.mirror_check.isChecked() is True
+        gui.mode_combo.setCurrentText("deploy")
+        assert gui.mirror_check.isChecked() is False
+        gui.mode_combo.setCurrentText("dagger")
+        assert gui.mirror_check.isChecked() is True
+    finally:
+        gui.close()
+
+
+def test_mode_and_record_are_independent_axes(tmp_path, qapp, no_camera_scan):
+    """All four cells must be reachable — including "dagger but do not save" and
+    "plain deploy but do save", which a single picker could not express."""
+    gui = _deploy_gui(True, tmp_path, mode="deploy")
+    try:
+        expected = {
+            ("deploy", False): "deploy",
+            ("deploy", True): "eval",
+            ("dagger", True): "dagger",
+            ("dagger", False): "deploy",
+        }
+        for (mode, record), source in expected.items():
+            gui.mode_combo.setCurrentText(mode)
+            gui.record_check.setChecked(record)
+            assert gui.cfg.record_source == source, (mode, record)
+            # mirroring tracks the MODE, not whether we are recording
+            assert gui.mirror_check.isChecked() is (mode == "dagger"), (mode, record)
+    finally:
+        gui.close()
+
+
+def test_explicit_mirror_flag_overrides_the_mode_default(tmp_path, qapp, no_camera_scan):
+    gui = _deploy_gui(True, tmp_path, mode="dagger", leader_mirror=False)
+    try:
+        assert gui.mirror_check.isChecked() is False  # CLI flag wins at startup
+    finally:
+        gui.close()
+
+
+def test_leader_mirror_toggle_is_forwarded_to_the_robot(tmp_path, qapp, no_camera_scan):
+    """Toggling mid-rollout must reach the robot; it owns the leader gains."""
+    sent = []
+    gui = _deploy_gui(True, tmp_path)
+    try:
+        class FakeRecorder:
+            def set_leader_mirror(self, flag):
+                sent.append(bool(flag))
+
+        gui.recorder = FakeRecorder()
+        gui.mirror_check.setChecked(False)
+        gui.mirror_check.setChecked(True)
+        assert sent == [False, True]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_runner_status_reports_the_robots_own_mirror_state(tmp_path, qapp, no_camera_scan):
+    gui = _deploy_gui(True, tmp_path)
+    try:
+        gui._update_dagger_controls({"dagger_state": "policy", "leader_mirror": False})
+        assert "free (not mirroring)" in gui.runner_status.text()
+        gui._update_dagger_controls({"dagger_state": "policy", "leader_mirror": True})
+        assert "mirroring the policy" in gui.runner_status.text()
     finally:
         gui.close()
 
@@ -176,5 +349,143 @@ def test_reference_dataset_picker_switches_between_root_subfolders(
         assert discovered[-1] == "older_runs"
         assert gui.reference_list.item(0).text().startswith("demonstration 0009")
         assert played[-1] == (9, True)
+    finally:
+        gui.close()
+
+
+# ------------------------------------------------ no policy -> no rollout, no recording
+def _quiet_gui(tmp_path):
+    """A deploy GUI with its refresh timers stopped.
+
+    The 10 Hz timer calls into `self.recorder`, and a stand-in that only carries the few
+    keys a test cares about crashes the interpreter when the timer reaches the banner/health
+    code. Stopping the timers keeps the test to the method under test.
+    """
+    gui = _deploy_gui(False, tmp_path)
+    gui._timer.stop()
+    gui._review_timer.stop()
+    return gui
+
+
+class _FakeRunner:
+    def __init__(self, connected=False, err=""):
+        self._st = {"policy_connected": connected, "last_error": err, "streaming": connected}
+
+    def get_status(self):
+        return dict(self._st)
+
+    def shutdown(self):  # closeEvent calls this
+        pass
+
+
+class _FakeRecorder:
+    def __init__(self, running=False):
+        self.st = {"policy_running": running, "dagger_state": "policy" if running else "stopped"}
+        self.calls = []
+
+    def get_status(self):
+        return dict(self.st)
+
+    def set_policy_running(self, flag):
+        self.calls.append(bool(flag))
+        self.st["policy_running"] = bool(flag)
+
+    def shutdown(self):  # closeEvent calls this
+        pass
+
+
+def test_start_is_refused_without_a_policy(tmp_path, qapp, no_camera_scan, monkeypatch):
+    """Starting a rollout opens an episode, so with no policy the arms sit still and the
+    recording fills up with rollouts nothing ever drove."""
+    gui = _quiet_gui(tmp_path)
+    try:
+        warned = []
+        monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: warned.append(a))
+        gui.runner = _FakeRunner(connected=False, err="policy server offline")
+        gui.recorder = _FakeRecorder()
+
+        gui._on_policy_toggle()
+        assert gui.recorder.calls == [], "must not start a rollout without a policy"
+        assert warned, "the operator has to be told why"
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_start_works_once_the_policy_is_up(tmp_path, qapp, no_camera_scan):
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=True)
+        gui.recorder = _FakeRecorder()
+        gui._on_policy_toggle()
+        assert gui.recorder.calls == [True]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_stopping_never_needs_a_policy(tmp_path, qapp, no_camera_scan):
+    """A running rollout must always be stoppable, connected or not."""
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=False)
+        gui.recorder = _FakeRecorder(running=True)
+        gui._on_policy_toggle()
+        assert gui.recorder.calls == [False]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_rollout_started_from_the_handle_button_is_stopped(tmp_path, qapp, no_camera_scan):
+    """The handle button starts rollouts without going through this UI, so the guard on
+    the button alone would not cover it."""
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=False)
+        gui.recorder = _FakeRecorder(running=True)
+        gui._update_dagger_controls({"policy_running": True, "dagger_state": "policy"})
+        assert gui.recorder.calls == [False]
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_start_button_is_disabled_while_no_policy(tmp_path, qapp, no_camera_scan):
+    gui = _quiet_gui(tmp_path)
+    try:
+        gui.runner = _FakeRunner(connected=False)
+        gui.recorder = _FakeRecorder()
+        gui._update_dagger_controls({"policy_running": False, "dagger_state": "stopped"})
+        assert gui.policy_btn.isEnabled() is False
+        assert "no policy" in gui.policy_btn.toolTip()
+
+        gui.runner = _FakeRunner(connected=True)
+        gui._update_dagger_controls({"policy_running": False, "dagger_state": "stopped"})
+        assert gui.policy_btn.isEnabled() is True
+    finally:
+        gui.recorder = None
+        gui.runner = None
+        gui.close()
+
+
+def test_num_samples_is_a_recording_setting_not_a_view(tmp_path, qapp, no_camera_scan):
+    """There is no live overlay any more, so the count only decides whether the run RECORDS
+    what the policy sampled. It reaches the runner through the bridge config, which is the
+    object the runner is later constructed with."""
+    from workstation.lerobot_recorder.deploy_gui import DeployGUI
+    from workstation.policy_bridge.config import BridgeConfig
+
+    bridge_cfg = BridgeConfig()
+    bridge_cfg.num_samples = 6
+    cfg = RecorderConfig(mock=True, repo_id="test/deploy", root=str(tmp_path))
+    gui = DeployGUI(cfg, bridge_cfg, mode="dagger", record=True)
+    try:
+        assert not hasattr(gui, "samples_check"), "the live overlay control is gone"
+        assert bridge_cfg.num_samples == 6
     finally:
         gui.close()

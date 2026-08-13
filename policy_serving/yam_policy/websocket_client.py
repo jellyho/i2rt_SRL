@@ -1,7 +1,9 @@
 """Websocket policy client — wire-compatible with openpi's WebsocketClientPolicy.
 
 Connects to a policy server (ours or a real ``openpi`` server), sends an
-observation dict, and returns the action dict. Serialization is msgpack-numpy.
+observation dict, and returns the action dict. Serialization is openpi-compatible
+msgpack (see :mod:`.msgpack_numpy` — NOT the pip `msgpack-numpy`, which encodes
+arrays differently and fails silently against an openpi server).
 Connection is retried every 5 s until the server is up.
 """
 
@@ -11,7 +13,7 @@ import logging
 import time
 from typing import Dict, Optional
 
-import msgpack_numpy
+from . import msgpack_numpy
 import websockets.sync.client
 from websockets.exceptions import ConnectionClosed
 

@@ -18,8 +18,8 @@ DATA COLLECTION / REPLAY
 DEPLOYMENT
   robot machine            workstation                    policy server
   ┌──────────────────┐ portal ┌──────────────────┐ ws+msgpack ┌────────────────┐
-  │ run_robot_server │◀──────▶│ policy_bridge     │◀──────────▶│ yam_policy.serve│
-  │  dagger          │  TCP   │ (openpi client)   │  obs/chunk │  your model     │
+  │ run_robot_server │◀──────▶│ deploy (workstn)  │◀──────────▶│ yam_policy.serve│
+  │  deploy          │  TCP   │ (openpi client)   │  obs/chunk │  your model     │
   └──────────────────┘        └──────────────────┘            └────────────────┘
 ```
 
@@ -29,7 +29,7 @@ DEPLOYMENT
 source .venv/bin/activate        # robot env (uv; see robot/setup_robot_env.sh)
 
 robot/yam teleop  --bilateral-kp 0.15     # auto home/engage bimanual teleop
-robot/yam dagger  --mirror-kp 0.2         # HG-DAgger: policy drives, button takeover
+robot/yam deploy  --mirror-kp 0.2         # a policy drives the followers, button = takeover
 robot/yam wrapper                          # followers track an external command (replay)
 robot/yam teleop  --sim                    # no hardware
 ```
@@ -49,8 +49,8 @@ from i2rt.serving.robot_client import RobotClient
 robot = RobotClient(host="192.168.1.10", port=11331)
 obs = robot.get_observation()            # {"left": {pos,vel,eff,...}, "right": {...}, "teleop_state", ...}
 robot.command({"left": q_l, "right": q_r})        # wrapper/replay: direct follower target
-robot.set_policy_action({"left": q_l, "right": q_r})  # dagger: policy target
-robot.set_intervention(True)             # dagger: external gate override
+robot.set_policy_action({"left": q_l, "right": q_r})  # deploy: policy target
+robot.set_intervention(True)             # deploy: human takeover
 robot.set_estop(True)                    # network e-stop: hold, ignore all commands
 ```
 
@@ -59,7 +59,7 @@ robot.set_estop(True)                    # network e-stop: hold, ignore all comm
   their last pose) until released; the snapshot carries `estop`.
 - Every commanded target is clamped to `control_config.FOLLOWER_JOINT_LIMITS`
   (optional per-joint `[lo, hi]`).
-- **Link-loss watchdog:** dagger/wrapper followers hold if no fresh
+- **Link-loss watchdog:** deploy/wrapper followers hold if no fresh
   `set_policy_action`/`command` arrives within `command_timeout` (default 0.5 s) —
   so a workstation crash or network drop can't leave a stale target driving the arm.
 **End-effector (EEF):**
@@ -79,15 +79,15 @@ robot.set_estop(True)                    # network e-stop: hold, ignore all comm
 
 | key | meaning |
 |-----|---------|
-| `mode` | `teleop` / `dagger` / `wrapper` |
+| `mode` | `teleop` / `deploy` / `wrapper` |
 | `t` | robot monotonic timestamp |
 | `teleop_state` | `HOMING`/`IDLE`/`ENGAGED` (teleop) — the episode gate signal |
 | `active` | True iff ENGAGED (teleop) |
-| `intervention` | gate state (dagger) |
+| `intervention` | human takeover state (deploy) |
 | `<side>.pos/vel/eff` | follower full state (len `num_dofs`, trailing gripper) |
-| `<side>.leader_pos` | leader joints (teleop/dagger) |
+| `<side>.leader_pos` | leader joints (teleop/deploy) |
 | `<side>.applied` | the rate-limited command actually sent (the action) |
-| `<side>.human` | leader target while intervening (dagger) |
+| `<side>.human` | leader target while intervening (deploy) |
 
 ## Transport
 

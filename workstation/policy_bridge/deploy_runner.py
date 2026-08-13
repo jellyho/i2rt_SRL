@@ -9,17 +9,53 @@ of truth; this runner only sends policy actions while the robot snapshot reports
 from __future__ import annotations
 
 import logging
-import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Callable, Dict, Optional
 
 import numpy as np
 
-from workstation.lerobot_recorder.config import ARM_DOF, ARMS, CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
+from workstation.lerobot_recorder.config import ARM_DOF, ARMS, RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
+    """What extra per-step arrays this policy sends, from its handshake metadata.
+
+    The client hard-codes none of it. A policy that wants its critic values, its candidate
+    chunks, or anything else recorded declares them once:
+
+        {"extra_features": {"critic_q": [1], "action_samples": [8, 14]}}
+
+    The shape given is ONE STEP's shape. The chunk axis is deliberately left out: the chunk
+    length is adaptive -- whatever a reply happens to carry -- so it is not something either
+    side can declare, while the per-step shape is fixed and is exactly what a dataset column
+    needs. A critic scoring N candidates declares ``[N]`` and sends ``(X, N)``; the candidate
+    chunks declare ``[N, action_dim]`` and arrive as ``(X, N, action_dim)``.
+
+    Anything malformed is dropped with a warning rather than taken on faith: a wrong shape here
+    becomes a wrong column in every episode of the dataset.
+    """
+    declared = meta.get("extra_features") or {}
+    if not isinstance(declared, dict):
+        logger.warning("ignoring extra_features: expected a mapping, got %s", type(declared).__name__)
+        return {}
+    out: Dict[str, tuple] = {}
+    for name, shape in declared.items():
+        try:
+            dims = tuple(int(d) for d in (shape if isinstance(shape, (list, tuple)) else [shape]))
+        except (TypeError, ValueError):
+            logger.warning("ignoring extra feature %r: shape %r is not a list of ints", name, shape)
+            continue
+        if not dims or any(d <= 0 for d in dims):
+            logger.warning("ignoring extra feature %r: shape %r has no positive dimensions", name, shape)
+            continue
+        out[str(name)] = dims
+    return out
 
 
 class DeploymentPolicyRunner:
@@ -33,14 +69,26 @@ class DeploymentPolicyRunner:
         self._policy = None
         self._policy_client = None
         self._image_shape = (cfg.image_size, cfg.image_size)
+        # Declared by the server at handshake; see _extra_features_from_meta.
+        self._extra_features: Dict[str, tuple] = {}
+        self._extras: Dict[str, "np.ndarray"] = {}
+        self._extra_warned: set = set()
+        #: Called once the handshake is in, so the recorder can declare its columns.
+        self.on_connected = None
         self._was_streaming = False
         self._lock = threading.Lock()
+        # Seconds between idle reachability probes -- see _probe_policy.
+        self._PROBE_PERIOD_S = 2.0
+        self._last_probe = -1e9
+        self._last_probe_error = ""
         self._status = {
             "robot_connected": False,
             "policy_connected": False,
             "streaming": False,
-            "last_error": "",
-            "action_horizon": cfg.action_horizon,
+            # Not "" -- an empty error next to a red dot reads as "no problem", when what it
+            # really means is that nothing has been tried yet.
+            "last_error": "connecting…",
+            "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
         }
@@ -65,8 +113,31 @@ class DeploymentPolicyRunner:
             return dict(self._status)
 
     def _set(self, **kw: object) -> None:
+        """Update the status, announcing the link transitions on the way through.
+
+        Every client -- the GUI, ``--headless``, the sim harness -- watches this same dict, so
+        saying it here says it once for all of them. A periodic status line cannot: it prints
+        "policy idle", which means connected-but-not-running and not-connected-at-all equally
+        well. What an operator needs is the moment it changes.
+        """
         with self._lock:
+            transitions = [
+                (key, was, kw[key])
+                for key, was in ((k, self._status.get(k)) for k in ("robot_connected", "policy_connected"))
+                if key in kw and bool(kw[key]) is not bool(was)
+            ]
             self._status.update(kw)
+            error = str(kw.get("last_error", self._status.get("last_error", "")))
+
+        for key, _was, now in transitions:
+            link = "policy" if key == "policy_connected" else "robot"
+            host, port = ((self.cfg.policy_host, self.cfg.policy_port) if link == "policy"
+                          else (self.cfg.robot_host, self.cfg.robot_port))
+            if now:
+                logger.info("%s CONNECTED at %s:%s", link, host, port)
+            else:
+                logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port,
+                               f" ({error})" if error else "")
 
     def _connect_robot(self) -> None:
         if self.recorder_cfg.mock or self._robot is not None:
@@ -78,9 +149,32 @@ class DeploymentPolicyRunner:
         self._set(robot_connected=True)
 
     def _policy_port_open(self) -> bool:
+        """Is the policy server up? Asked over HTTP, because the alternative is noisy.
+
+        This check has to exist at all because `WebsocketClientPolicy` retries a refused
+        connection forever, five seconds at a time -- calling it against a server that is not
+        up would wedge the control loop instead of reporting the state.
+
+        It used to open a bare TCP connection and close it. That works, but the server is a
+        websocket server: a socket that connects and says nothing is a failed opening
+        handshake, and it logs one with a full traceback --
+
+            ERROR:websockets.server:opening handshake failed
+            EOFError: stream ends after 0 bytes, before end of line
+
+        -- immediately before the real connection succeeds. An operator watching the server
+        cannot tell that apart from a genuine fault. openpi's server answers `/healthz` for
+        exactly this, so ask it properly.
+
+        Any HTTP answer means something is listening and speaking HTTP, so a non-200 (an older
+        server without the route) still counts as up; only a connection-level failure is down.
+        """
+        url = f"http://{self.cfg.policy_host}:{self.cfg.policy_port}/healthz"
         try:
-            with socket.create_connection((self.cfg.policy_host, self.cfg.policy_port), timeout=0.5):
+            with urllib.request.urlopen(url, timeout=1.0):
                 return True
+        except urllib.error.HTTPError:
+            return True
         except OSError:
             return False
 
@@ -90,24 +184,68 @@ class DeploymentPolicyRunner:
             return
         if not self._policy_port_open():
             raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
-        from yam_policy import ActionChunkBroker, AsyncActionChunkBroker, WebsocketClientPolicy
+        from yam_policy import ActionChunkBroker, WebsocketClientPolicy
 
         client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
         meta = client.get_server_metadata() or {}
-        action_horizon = int(meta.get("action_horizon", self.cfg.action_horizon))
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
-        broker_cls = AsyncActionChunkBroker if self.cfg.use_async else ActionChunkBroker
+        self._extra_features = _extra_features_from_meta(meta)
+        if self._extra_features:
+            logger.info("policy also returns per-step %s", ", ".join(
+                f"{k}{tuple(v)}" for k, v in self._extra_features.items()))
+        # No action_horizon here on purpose: the broker reads the chunk size off each
+        # response, so a checkpoint's horizon can never disagree with a client setting.
         self._policy_client = client
-        self._policy = broker_cls(client, action_horizon=action_horizon)
+        self._policy = ActionChunkBroker(client)
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,
-            action_horizon=action_horizon,
             image_size=self._image_shape[0],
             image_shape=self._image_shape,
         )
         logger.info("deploy policy metadata: %s", meta)
+        # The extra-feature declaration only exists now, and the dataset schema is fixed on the
+        # first recorded frame -- so whoever owns the recorder is told here, not at construction.
+        if self.on_connected is not None:
+            try:
+                self.on_connected()
+            except Exception as e:
+                logger.error("on_connected failed: %s", e)
+
+    def _set_extras(self, result: Dict) -> None:
+        """Keep this step's declared extras, so the recorder can write them.
+
+        Only the declared keys, and only at the declared shape. A policy that changes what it
+        sends mid-run would otherwise change the dataset's columns mid-episode, which no
+        reader can make sense of; a mismatch is dropped and said once.
+        """
+        if not self._extra_features:
+            return
+        values = {}
+        for name, shape in self._extra_features.items():
+            value = result.get(name)
+            if value is None:
+                continue
+            array = np.asarray(value, dtype=np.float32).reshape(-1)
+            if array.size != int(np.prod(shape)):
+                if name not in self._extra_warned:
+                    self._extra_warned.add(name)
+                    logger.warning("extra feature %r: expected %s values, got %d — not recorded",
+                                   name, int(np.prod(shape)), array.size)
+                continue
+            values[name] = array
+        with self._lock:
+            self._extras = values
+
+    def get_extras(self) -> Dict[str, "np.ndarray"]:
+        """The declared per-step extras from the most recent step, flattened."""
+        with self._lock:
+            return {k: v.copy() for k, v in self._extras.items()}
+
+    def extra_features(self) -> Dict[str, tuple]:
+        """``{name: per-step shape}`` the policy declared at handshake, empty until connected."""
+        return dict(self._extra_features)
 
     def _image_shape_from_meta(self, meta: Dict) -> tuple[int, int]:
         image_shape = meta.get("image_shape")
@@ -135,9 +273,15 @@ class DeploymentPolicyRunner:
                             self._reset_policy_chunk()
                         policy_obs = self._build_obs(obs, self.images_fn())
                         if policy_obs:
-                            action = self._policy.infer(policy_obs)["actions"]
+                            result = self._policy.infer(policy_obs)
+                            action = result["actions"]
+                            self._set_extras(result)
                             self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
-                            self._set(streaming=True, last_error="")
+                            self._set(
+                                streaming=True,
+                                last_error="",
+                                action_horizon=getattr(self._policy, "action_horizon", 0),
+                            )
                             self._was_streaming = True
                         else:
                             self._set(streaming=False)
@@ -145,8 +289,9 @@ class DeploymentPolicyRunner:
                     else:
                         if self._was_streaming:
                             self._reset_policy_chunk()
-                        self._set(streaming=False, last_error="")
+                        self._set(streaming=False)
                         self._was_streaming = False
+                        self._probe_policy()
             except Exception as e:
                 self._set(streaming=False, last_error=f"{type(e).__name__}: {e}")
                 self._was_streaming = False
@@ -162,6 +307,46 @@ class DeploymentPolicyRunner:
             remaining = period - (time.monotonic() - t0)
             if remaining > 0:
                 time.sleep(remaining)
+
+    def _probe_policy(self) -> None:
+        """Connect to the policy while idle, so the UI can say whether it is there.
+
+        The connection used to be made only inside the streaming branch, which needs the robot
+        to already be running a rollout. Before that, `policy_connected` sat at its initial
+        False with `last_error` at its initial "" -- a red dot next to "policy idle" and no
+        reason given. Worse, the GUI refuses to start a rollout unless the policy is connected,
+        so nothing could ever connect it: the only path to connected ran through a rollout that
+        could not be started. Probing while idle is what breaks that circle.
+
+        Throttled, because the probe is a real websocket round-trip (`get_server_metadata`) and
+        the loop runs at the control rate -- retrying every tick would hammer a server that is
+        still loading its checkpoint.
+        """
+        if self._policy is not None:
+            return
+        now = time.monotonic()
+        if now - self._last_probe < self._PROBE_PERIOD_S:
+            return
+        self._last_probe = now
+        try:
+            self._connect_policy()
+            self._set(last_error="")
+            self._last_probe_error = ""
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            # _set only announces a *transition*, and a policy that was never up does not
+            # transition -- so starting with no server at all would say nothing whatsoever.
+            # Report each distinct reason once: enough to see why, without a line every probe.
+            # Stay quiet when _set is about to announce the drop itself, or losing a live
+            # policy would report the same event twice.
+            was_connected = bool(self.get_status().get("policy_connected"))
+            if reason != self._last_probe_error and not was_connected:
+                self._last_probe_error = reason
+                logger.warning(
+                    "policy NOT CONNECTED at %s:%s (%s) — retrying every %.0fs",
+                    self.cfg.policy_host, self.cfg.policy_port, reason, self._PROBE_PERIOD_S,
+                )
+            self._set(policy_connected=False, last_error=reason)
 
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:
@@ -183,32 +368,25 @@ class DeploymentPolicyRunner:
             parts.append(vec)
         return np.concatenate(parts).astype(np.float32)
 
-    @staticmethod
-    def _fit(value: np.ndarray | None, dim: int) -> np.ndarray:
-        out = np.zeros(dim, dtype=np.float32)
-        if value is None:
-            return out
-        arr = np.asarray(value, dtype=np.float32).reshape(-1)
-        n = min(dim, arr.size)
-        if n:
-            out[:n] = arr[:n]
-        return out
 
     def _build_obs(self, robot_obs: Dict, images: Dict[str, np.ndarray]) -> Dict:
         from yam_policy import image_tools
 
         sides = [robot_obs.get(arm) for arm in ARMS]
-        pos = self._fuse(sides, ("pos",), ARM_DOF)
-        if pos is None:
+        # `observation/state` must be the SAME vector the policy was trained on. Training
+        # repacks the dataset's `observation.state` (pos+vel+eff per arm, 42) into this
+        # key, so sending only the 14 joint positions would keep the key valid, pass every
+        # check, and quietly normalize against the wrong statistics. Send all 42 and let
+        # the policy's input transform take the slice it wants.
+        state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
+        if state is None:
             return {}
 
-        obs = {"observation/state": pos, "prompt": self.cfg.prompt}
-        full_state = self._fuse(sides, ("pos", "vel", "eff"), ARM_DOF * 3)
-        if full_state is not None:
-            obs["observation.state"] = full_state
-        obs["observation.leader"] = self._fit(self._fuse(sides, ("leader_pos",)), LEADER_DIM)
-        obs["observation.eef"] = self._fit(self._fuse(sides, ("eef",)), EEF_DIM)
-        obs["observation.control_mode"] = np.array([CONTROL_MODE["teleop"]], dtype=np.float32)
+        obs = {"observation/state": state, "prompt": self.cfg.prompt}
+        # Only sent when actually wanted: a server that supports it does N forward passes for
+        # N samples, and an unpatched one ignores an unknown key rather than failing.
+        if self.cfg.num_samples > 1:
+            obs["num_samples"] = int(self.cfg.num_samples)
 
         height, width = self._image_shape
         for role, key in self.cfg.image_keys.items():

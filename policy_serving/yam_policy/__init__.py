@@ -12,14 +12,17 @@ The wire protocol matches openpi exactly, so real openpi checkpoints served with
 :class:`BasePolicy` can be served by openpi.
 """
 
-from .action_chunk_broker import ActionChunkBroker, AsyncActionChunkBroker
+from .action_chunk_broker import ActionChunkBroker
 from .base_policy import BasePolicy
 from .websocket_client import WebsocketClientPolicy
 from .websocket_server import WebsocketPolicyServer
 
+#: Visualisation (FK, wrist-camera projection, drawing, recorded sample logs). Imported
+#: lazily -- it needs mujoco/mink/pillow, which a policy server has no reason to load:
+#:
+#:     from yam_policy.viz import WristCameraGeometry, overlay_samples
 __all__ = [
     "ActionChunkBroker",
-    "AsyncActionChunkBroker",
     "BasePolicy",
     "WebsocketClientPolicy",
     "WebsocketPolicyServer",

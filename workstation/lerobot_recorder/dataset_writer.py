@@ -138,10 +138,15 @@ def remove_dataset_root(root: str) -> None:
 class AsyncDatasetWriter:
     """Queued episode writer. ``submit()`` returns immediately; a worker saves."""
 
-    def __init__(self, cfg: RecorderConfig, image_keys: List[str], image_shapes: Dict[str, tuple]) -> None:
+    def __init__(self, cfg: RecorderConfig, image_keys: List[str], image_shapes: Dict[str, tuple],
+                 extra_features: Optional[Dict[str, tuple]] = None) -> None:
         self.cfg = cfg
         self.image_keys = image_keys
         self.image_shapes = image_shapes
+        # Per-step columns a policy declared at handshake, kept at the shape it declared so the
+        # dataset describes itself. Flattening them would store [N, action_dim] candidates as an
+        # anonymous 56-vector and leave the reader to know the layout out of band.
+        self.extra_features = {str(k): tuple(v) for k, v in (extra_features or {}).items()}
         self._mock = cfg.mock
         # Output format: "lerobot" (LeRobotDataset) or "abcdl" (the abcdl MP4+binary
         # training cache; one episode dir per submit, written via abcdl.EpisodeWriter).
@@ -150,7 +155,7 @@ class AsyncDatasetWriter:
         self._features: Optional[dict] = None
         self._active_episode_frames: Optional[List[dict]] = None
         self._pyav_encode_temporary = None
-        if cfg.use_videos and not self._mock and not self._abcdl:
+        if not self._mock and not self._abcdl:
             self._encoding_decision = select_encoding_backend(
                 getattr(cfg, "encoding_backend", "torchcodec"),
                 float(getattr(cfg, "torchcodec_max_used_vram_gb", 5.0)),
@@ -180,6 +185,13 @@ class AsyncDatasetWriter:
         self._outcome_totals = self._read_outcome_totals() if cfg.resume else {"success": 0, "fail": 0}
 
         self._queue: "queue.Queue" = queue.Queue()
+        # Streamed frames go to their own BOUNDED queue, which is the whole point: it is the
+        # thing that caps how much of an episode is ever resident. 64 frames of three 640x480
+        # cameras is ~180 MB, against ~7 GB for a 40 s episode held as a list. Encoding runs
+        # ~6.5x faster than capture, so it should sit near empty; if it ever fills,
+        # stream_frame blocks rather than dropping a frame.
+        self._frame_queue: "queue.Queue" = queue.Queue(maxsize=64)
+        self._streamed_frames = 0
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -222,7 +234,9 @@ class AsyncDatasetWriter:
         return [f"{key.rsplit('.', 1)[-1]}.{i}" for i in range(dim)]
 
     def _build_features(self, sample: dict) -> dict:
-        img_dtype = "video" if self.cfg.use_videos else "image"
+        # Always video. Storing frames as images is not an option here: three 640x480
+        # cameras at 30 fps is ~4.5 GB a minute of PNGs on disk.
+        img_dtype = "video"
         feats: dict = {}
         for key in self.image_keys:
             feats[f"observation.images.{key}"] = {
@@ -232,6 +246,10 @@ class AsyncDatasetWriter:
             }
         for key, val in sample.items():
             if key in ("images", "task"):
+                continue
+            if key in self.extra_features:
+                shape = self.extra_features[key]
+                feats[key] = {"dtype": "float32", "shape": shape, "names": None}
                 continue
             vec = np.asarray(val, dtype=np.float32).reshape(-1)
             feats[key] = {"dtype": "float32", "shape": (vec.size,), "names": self._vector_names(key, vec.size)}
@@ -250,9 +268,14 @@ class AsyncDatasetWriter:
         }
         if int(self.cfg.encoder_threads) > 0:
             enc["encoder_threads"] = int(self.cfg.encoder_threads)
-        # Direct-to-encoder streaming (no temp-PNG round-trip). Only passed when
-        # enabled so stock lerobot builds without the kwarg keep working.
-        if bool(getattr(self.cfg, "streaming_encoding", False)) and not torchcodec:
+        # Direct-to-encoder streaming, always, whenever PyAV is the encoder. This used to be
+        # opt-in via recorder.streaming_encoding, defaulting to off -- and off is the one
+        # configuration where LeRobot stages every frame of every camera as a ~1.5 MB PNG,
+        # because that is how the non-streaming PyAV encoder gets its input. One deploy run
+        # left 7926 PNGs and 2.7 GB behind that way. There is no reason to let a config key
+        # choose that: StreamingVideoEncoder ships in stock lerobot 0.4.4, so the fast path
+        # is always available, and _suppress_image_staging can then hold unconditionally.
+        if not torchcodec:
             enc["streaming_encoding"] = True
         return enc
 
@@ -279,6 +302,74 @@ class AsyncDatasetWriter:
             return self._encode_torchcodec_episode(video_key, episode_index)
 
         self._ds._encode_temporary_episode_video = MethodType(encode_episode, self._ds)
+
+    def _apply_gop(self) -> None:
+        """Set the keyframe interval on LeRobot's streaming encoder.
+
+        ``LeRobotDataset.create`` hard-codes ``g=2`` and offers no way to pass another, so the
+        only place to say otherwise is the encoder it just built. Two means a keyframe every
+        other frame: the fastest random-frame decode there is, and about 2.8x the file. The
+        trade is measured in RecorderConfig.gop; what matters here is that it is a decision
+        rather than a default nobody noticed, and that it is said out loud in the log.
+        """
+        encoder = getattr(self._ds, "_streaming_encoder", None)
+        if encoder is None:
+            return
+        want = max(1, int(getattr(self.cfg, "gop", 10)))
+        current = getattr(encoder, "g", None)
+        if current == want:
+            return
+        try:
+            encoder.g = want
+            logger.info("keyframe interval: g=%s (lerobot's default is %s)", want, current)
+        except Exception as e:
+            logger.warning("could not set the keyframe interval: %s", e)
+
+    def _suppress_image_staging(self) -> None:
+        """Stop LeRobot staging every video frame to disk as a PNG.
+
+        `add_frame` writes one PNG per frame per camera unless a streaming encoder is
+        installed — ~1.5 MB a frame, so a 2300-frame episode wrote 9741 files and 3.4 GB in
+        the middle of the record loop. Neither encoder we actually run reads them:
+
+          * TorchCodec is batch-only, so `streaming_encoding` is not passed to LeRobot and
+            the frames come from `_active_episode_frames` in memory instead;
+          * PyAV with `streaming_encoding` feeds the encoder directly as frames arrive.
+
+        The one path that genuinely needs the PNGs is PyAV with streaming *off*, whose
+        encoder reads the staging directory. `_dataset_encoding_kwargs` no longer produces
+        that combination -- streaming is forced on whenever PyAV is the encoder -- so this
+        raises instead of proceeding. Reaching it would mean LeRobot silently dropped the
+        kwarg, and writing gigabytes of PNGs mid-episode is worse than refusing to start.
+
+        Safe elsewhere because neither place LeRobot removes the directory needs it to
+        exist: the rmtree after encoding lives inside the PyAV encoder (not called under
+        TorchCodec, and not reached when streaming), and `clear_episode_buffer` guards its
+        own with `is_dir()`.
+        """
+        ds = self._ds
+        if ds is None or not hasattr(ds, "_save_image"):
+            return
+        streaming = getattr(ds, "_streaming_encoder", None) is not None
+        torchcodec = self._encoding_decision.effective == "torchcodec"
+        if not (streaming or torchcodec):
+            raise RuntimeError(
+                "PyAV encoder has no streaming encoder installed, so LeRobot would stage every "
+                "frame of every camera as a ~1.5 MB PNG. This build passes streaming_encoding "
+                "unconditionally under PyAV, so reaching here means lerobot ignored it — refusing "
+                "to record rather than filling the disk mid-episode."
+            )
+
+        self._skipped_images = 0
+
+        def _skip(_self, *_args, **_kwargs) -> None:
+            self._skipped_images += 1
+
+        ds._save_image = MethodType(_skip, ds)
+        logger.info(
+            "per-frame PNG staging disabled (%s reads frames directly)",
+            "TorchCodec" if torchcodec else "the streaming encoder",
+        )
 
     def _encode_torchcodec_episode(self, video_key: str, episode_index: int) -> Path:
         frames = self._active_episode_frames
@@ -472,10 +563,6 @@ class AsyncDatasetWriter:
             self._effective_vcodec,
             self._encoding_decision.reason,
         )
-        if self._encoding_decision.effective == "torchcodec" and bool(
-            getattr(self.cfg, "streaming_encoding", False)
-        ):
-            logger.warning("TorchCodec 0.10 is batch-only; recorder.streaming_encoding is disabled")
         if self._abcdl:
             os.makedirs(self._root, exist_ok=True)
             if self.cfg.resume and os.path.isdir(self._root):
@@ -518,6 +605,12 @@ class AsyncDatasetWriter:
                     resume_local = False
 
             if resume_local:
+                # A previous run that died mid-episode leaves files the metadata never
+                # learned about, and a half-written data parquet has no footer. LeRobot
+                # globs data/ rather than reading the file list from the metadata, so that
+                # one file makes the whole dataset -- including every good episode --
+                # refuse to open. Clear the orphans before trying.
+                self._recover_from_crash()
                 LeRobotDataset = _import_lerobot_dataset()
                 enc = self._dataset_encoding_kwargs()
                 try:
@@ -557,7 +650,7 @@ class AsyncDatasetWriter:
                         features=self._features,
                         root=self._root,
                         robot_type=self.cfg.robot_type,
-                        use_videos=self.cfg.use_videos,
+                        use_videos=True,
                         **enc,
                     )
                 except TypeError:  # older/newer LeRobot without these kwargs — fall back
@@ -568,13 +661,15 @@ class AsyncDatasetWriter:
                         features=self._features,
                         root=self._root,
                         robot_type=self.cfg.robot_type,
-                        use_videos=self.cfg.use_videos,
+                        use_videos=True,
                     )
                 logger.info(
                     "dataset created at %s (repo_id=%s, vcodec=%s, batch=%s)",
                     self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
                 )
             self._configure_torchcodec_encoder()
+            self._apply_gop()
+            self._suppress_image_staging()
         else:
             if self.cfg.resume:
                 self._n_episodes = self._existing_outcome_count()
@@ -584,6 +679,31 @@ class AsyncDatasetWriter:
         self._outcome_totals = self._read_outcome_totals()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+
+    def _recover_from_crash(self) -> None:
+        """Quarantine anything a previous crash left behind, before opening the dataset.
+
+        Best-effort: if recovery itself fails we still try to open, so a bug here can only
+        cost the clear error message, never the session."""
+        try:
+            from workstation.lerobot_recorder.crash_recovery import describe, recover
+
+            summary = describe(self._root)
+            if summary == "no crash leftovers":
+                return
+            logger.warning(
+                "found leftovers from an interrupted recording — a truncated data file "
+                "would stop this dataset opening at all, so they are being moved aside:\n%s",
+                summary,
+            )
+            result = recover(self._root)
+            if result["moved"]:
+                logger.warning(
+                    "moved %d item(s) to %s — committed episodes are untouched",
+                    len(result["moved"]), result["quarantine"],
+                )
+        except Exception as e:
+            logger.error("crash recovery skipped: %s", e)
 
     def _cleanup_interrupted_image_dirs(self, episode_index: int) -> None:
         """Remove temp PNG directories for the next, not-yet-committed episode.
@@ -639,16 +759,66 @@ class AsyncDatasetWriter:
             return 0
 
     # ------------------------------------------------------------------ submit
-    def submit(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
-        """Enqueue a complete episode (list of frame dicts) for background saving."""
+    def _check_writable(self) -> None:
         if self._failed:
             raise RuntimeError(f"dataset writer stopped after a save failure: {self._last_error}")
         if self._finalized:
             raise RuntimeError("dataset writer has already been finalized")
+
+    def submit(self, frames: List[dict], outcome: Optional[str], task: str) -> None:
+        """Enqueue a complete episode (list of frame dicts) for background saving."""
+        self._check_writable()
         if frames:
-            self._queue.put((frames, outcome, task))
+            self._queue.put(("episode", frames, outcome, task))
             with self._lock:
                 self._n_submitted += 1
+
+    # -------------------------------------------------------------- streaming
+    def supports_streaming(self) -> bool:
+        """Whether frames can be handed over one at a time instead of an episode at a time.
+
+        Per-frame RL signals (success / reward / mc_return) are the exception: they are
+        computed from the episode's length and final outcome, so they cannot be attached to a
+        frame as it is captured. Those recordings keep buffering the whole episode.
+        """
+        return not (self._mock or self._abcdl or bool(getattr(self.cfg, "rl_features", False)))
+
+    def stream_frame(self, frame: dict, task: str) -> None:
+        """Hand one captured frame to the writer thread, with the task it belongs to.
+
+        The task is passed per frame rather than waiting for ``end_episode``, because LeRobot
+        wants it on every ``add_frame`` and by the time the episode ends its frames are already
+        inside the dataset. Taking it from the frame dict instead -- which carries no task --
+        silently wrote an empty string for every streamed episode.
+        
+
+        The point of this path is that no episode is ever held whole in memory. Three cameras
+        at 640x480 are ~2.8 MB a frame, so a 40 s episode buffered as a list is ~7 GB -- enough
+        to push the machine into swap and get the recorder OOM-killed mid-episode. Queued, the
+        resident set is bounded by the queue instead.
+
+        The queue is bounded and this call BLOCKS when it is full. That is deliberate: dropping
+        a frame silently is how videos end up shorter than the metadata claims. Blocking is
+        near-hypothetical anyway -- the streaming encoder measures ~196 frames/s on three
+        640x480 cameras against a 30 fps capture rate.
+        """
+        self._check_writable()
+        self._frame_queue.put(("frame", frame, task))
+
+    def end_episode(self, outcome: Optional[str], task: str) -> None:
+        """Close the streamed episode and save it.
+
+        """
+        self._check_writable()
+        self._frame_queue.put(("end", outcome, task))
+        with self._lock:
+            self._n_submitted += 1
+
+    def abort_episode(self) -> None:
+        """Throw away the streamed episode in flight (the review 'Delete')."""
+        if self._failed or self._finalized:
+            return
+        self._frame_queue.put(("abort",))
 
     @property
     def queue_depth(self) -> int:
@@ -718,12 +888,16 @@ class AsyncDatasetWriter:
 
     # ------------------------------------------------------------------ worker
     def _run(self) -> None:
-        while not (self._stop.is_set() and self._queue.empty()):
+        while not (self._stop.is_set() and self._queue.empty() and self._frame_queue.empty()):
+            # Streamed frames first: they are the live capture, and letting them wait behind a
+            # whole-episode save is what the queue exists to avoid.
+            if self._drain_frame_queue():
+                continue
             try:
-                item = self._queue.get(timeout=0.2)
+                item = self._queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            frames, outcome, task = item
+            _kind, frames, outcome, task = item
             with self._lock:
                 self._saving = True
                 self._saving_index = self._n_episodes
@@ -745,6 +919,104 @@ class AsyncDatasetWriter:
                     self._saving_index = None
                     self._saving_frames = 0
                 self._queue.task_done()
+
+    def _to_lerobot_frame(self, f: dict, task: str, extra: Optional[dict] = None) -> dict:
+        frame = {f"observation.images.{k}": v for k, v in f["images"].items()}
+        for key, val in f.items():
+            if key in ("images", "task"):
+                continue
+            array = np.asarray(val, dtype=np.float32)
+            # Declared extras go in at their declared shape; they travel flattened so nothing
+            # in between has to care what the layout is.
+            frame[key] = array.reshape(self.extra_features[key]) if key in self.extra_features else array
+        if extra:
+            for k, v in extra.items():
+                frame[k] = np.asarray([v], dtype=np.float32)
+        frame["task"] = task
+        return frame
+
+    def _drain_frame_queue(self) -> bool:
+        """Consume streamed frames / episode boundaries. True if anything was handled.
+
+        Runs on the writer thread, so the encode cost stays off the capture loop exactly as it
+        did when whole episodes were queued -- what changed is that the frames are no longer
+        all resident at once.
+        """
+        handled = False
+        while True:
+            try:
+                item = self._frame_queue.get_nowait()
+            except queue.Empty:
+                return handled
+            handled = True
+            try:
+                self._handle_stream_item(item)
+            except Exception as e:
+                logger.error("streamed episode failed: %s", e)
+                self._recover_failed_episode_buffer()
+                self._streamed_frames = 0
+                with self._lock:
+                    self._failed = True
+                    self._last_error = f"{type(e).__name__}: {e}"
+                    self._failed_episodes += 1
+                self._discard_queued_after_failure()
+                raise
+            finally:
+                self._frame_queue.task_done()
+
+    def _handle_stream_item(self, item: tuple) -> None:
+        kind = item[0]
+        if kind == "frame":
+            _, frame, task = item
+            self._ds.add_frame(self._to_lerobot_frame(frame, task))
+            self._streamed_frames += 1
+            with self._lock:
+                self._saving_frames = self._streamed_frames
+            return
+        if kind == "abort":
+            if self._streamed_frames:
+                self._ds.clear_episode_buffer()
+                logger.info("discarded %d streamed frame(s)", self._streamed_frames)
+            self._streamed_frames = 0
+            with self._lock:
+                self._saving_frames = 0
+            return
+
+        _, outcome, task = item
+        n_frames, self._streamed_frames = self._streamed_frames, 0
+        if not n_frames:
+            return
+        free = self._free_gb()
+        if free < self.cfg.min_free_gb:
+            # Frames are already inside LeRobot's buffer, so "not saved" means dropping them
+            # rather than declining to start -- say so plainly.
+            self.low_disk = True
+            self._ds.clear_episode_buffer()
+            logger.warning(
+                "LOW DISK: %.1f GB free (< %s GB) — %d streamed frame(s) DISCARDED",
+                free, self.cfg.min_free_gb, n_frames,
+            )
+            with self._lock:
+                self._saving_frames = 0
+            return
+        self.low_disk = False
+        with self._lock:
+            self._saving = True
+            self._saving_index = self._n_episodes
+        try:
+            self._ds.save_episode()
+            self._verify_episode_video(self._n_episodes)
+        finally:
+            with self._lock:
+                self._saving = False
+                self._saving_index = None
+                self._saving_frames = 0
+        self._write_rl_config_once()
+        with self._lock:
+            episode_index = self._n_episodes
+            self._n_episodes += 1
+        self._record_outcome(episode_index, outcome, task, n_frames)
+        logger.info("saved episode #%d (%d frames, outcome=%s, streamed)", episode_index, n_frames, outcome)
 
     def _recover_failed_episode_buffer(self) -> None:
         """Reset LeRobot's mutated buffer so finalize cannot raise a secondary error."""
@@ -866,13 +1138,10 @@ class AsyncDatasetWriter:
     def _encoder_remedy(self) -> str:
         """What to change in config.yaml when an encoder keeps dropping frames.
 
-        The advice depends on which backend actually encoded: telling someone to turn off
-        ``streaming_encoding`` is useless under TorchCodec, which is batch-only and already
-        disables it."""
+        The advice depends on which backend actually encoded. It never suggests turning
+        streaming off: that is the PNG-staging path, which no longer exists."""
         if self._encoding_decision.effective == "torchcodec":
             return "try recorder.encoding_backend: pyav in config.yaml."
-        if bool(getattr(self.cfg, "streaming_encoding", False)):
-            return "set recorder.streaming_encoding: false or recorder.vcodec: h264 in config.yaml."
         return "set recorder.vcodec: h264 in config.yaml (CPU encode; slower but reliable)."
 
     def _save_episode_abcdl(self, frames: List[dict], task: str, ep_index: int,

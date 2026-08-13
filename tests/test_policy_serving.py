@@ -7,12 +7,11 @@ import threading
 import numpy as np
 import pytest
 
-pytest.importorskip("msgpack_numpy")
+pytest.importorskip("msgpack")
 pytest.importorskip("websockets")
 
 from yam_policy import (
     ActionChunkBroker,
-    AsyncActionChunkBroker,
     WebsocketClientPolicy,
     WebsocketPolicyServer,
 )
@@ -51,14 +50,3 @@ def test_loopback_metadata_and_chunking():
     # pull more than one horizon -> re-queries the server without error
     for _ in range(2 * HORIZON + 3):
         assert broker.infer(obs)["actions"].shape == (14,)
-
-
-def test_async_broker_prefetch():
-    port = _serve("zeros")
-    client = WebsocketClientPolicy(host="127.0.0.1", port=port)
-    broker = AsyncActionChunkBroker(client, action_horizon=HORIZON)
-    obs = {"observation/state": np.zeros(14, dtype=np.float32)}
-    for _ in range(3 * HORIZON):
-        a = broker.infer(obs)["actions"]
-        assert a.shape == (14,)
-    broker.close()

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Convenience launcher for the workstation-side tools (recorder / replay / bridge / deploy).
+# Convenience launcher for the workstation-side tools (recorder / replay / deploy / dataset).
 #
 # Activates the workstation **conda** env (default: yam_ws) and runs a tool.
 # Inside that conda env this repo is installed with uv; you can pip/uv-install other
@@ -10,8 +10,8 @@
 #   workstation/yam-data replay [args]   # GUI replay (drive the robot from a dataset)
 #   workstation/yam-data mark-homing     # auto-annotate homing tails (control_mode=homing) from the gripper
 #   workstation/yam-data check-videos    # verify videos really hold the frames meta/ claims (--fix repairs)
-#   workstation/yam-data bridge [args]   # policy bridge (portal robot <-> websocket policy)
-#   workstation/yam-data deploy [args]   # GUI DAgger deployment + policy bridge
+#   workstation/yam-data recover         # clear what a crashed recording left behind (--fix moves it aside)
+#   workstation/yam-data deploy [args]   # policy deployment (mode + record are UI toggles; --headless for no GUI)
 #   workstation/yam-data cams            # list connected RealSense serials
 #   workstation/yam-data tune [args]     # GUI exposure/brightness tuner (match cameras)
 #   workstation/yam-data doctor [args]   # dataset stats / validation
@@ -22,6 +22,17 @@ set -eo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
+
+# Run THIS checkout's code, whichever one you launched.
+#
+# `uv pip install -e policy_serving` records an absolute path in the env's site-packages,
+# so with several worktrees of this repo the whole conda env follows whichever one ran that
+# command last — and it is per package, so `i2rt` can come from one checkout while
+# `yam_policy` comes from another. Nothing announces this: you edit a file here, run
+# yam-data, and the other worktree's copy executes. PYTHONPATH is searched before
+# site-packages, so pinning it to $REPO makes the launcher self-consistent by construction
+# and removes the need to re-run the editable install when switching worktrees.
+export PYTHONPATH="$REPO:$REPO/policy_serving${PYTHONPATH:+:$PYTHONPATH}"
 
 ENV="${YAM_WS_ENV:-yam_ws}"
 if command -v conda >/dev/null 2>&1; then
@@ -41,13 +52,16 @@ case "$cmd" in
     replay) exec python -m workstation.lerobot_recorder.replay_main "$@" ;;
     mark-homing) exec python -m workstation.lerobot_recorder.mark_homing "$@" ;;
     check-videos) exec python -m workstation.lerobot_recorder.check_videos "$@" ;;
-    bridge) exec python -m workstation.policy_bridge "$@" ;;
+    recover) exec python -m workstation.lerobot_recorder.recover_dataset "$@" ;;
+    bridge)
+        echo "yam-data bridge has moved: use 'yam-data deploy --headless' (same loop, and it can record)" >&2
+        exit 2 ;;
     deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|mark-homing|check-videos|bridge|deploy|cams|tune|doctor} [args]" >&2
+        echo "usage: yam-data {record|replay|mark-homing|check-videos|recover|deploy|cams|tune|doctor} [args]" >&2
         exit 2
         ;;
 esac

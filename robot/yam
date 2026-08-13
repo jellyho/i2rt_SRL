@@ -6,7 +6,8 @@
 # (and on first run creates) the project environment automatically.
 #
 #   robot/yam teleop  [args]   # auto home/engage bimanual teleop
-#   robot/yam dagger  [args]   # HG-DAgger: policy drives, button takeover
+#   robot/yam deploy  [args]   # a policy drives the followers, button = human takeover
+#                              # (used for plain deployment AND HG-DAgger)
 #   robot/yam wrapper [args]   # followers track an external command (replay target)
 #   robot/yam can              # interactive persistent CAN-id setup
 #   robot/yam canup            # reset/bring up CAN interfaces at 1 Mbit/s
@@ -22,6 +23,11 @@ set -eo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 export PATH="$HOME/.local/bin:$PATH"
+# Run THIS checkout's i2rt. `uv run` already resolves the project from $REPO, but the
+# YAM_NO_UV path falls back to whatever `python` has installed — which, with several
+# worktrees of this repo, is whichever one last ran an editable install. See the same
+# note in workstation/yam-data.
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 
 run() {
     if [ -n "${YAM_NO_UV:-}" ] || ! command -v uv >/dev/null 2>&1; then
@@ -34,12 +40,13 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
     teleop)  run i2rt.serving.run_robot_server teleop  "$@" ;;
-    dagger)  run i2rt.serving.run_robot_server dagger  "$@" ;;
+    deploy)  run i2rt.serving.run_robot_server deploy  "$@" ;;
+    dagger)  run i2rt.serving.run_robot_server deploy  "$@" ;;   # old name, still works
     wrapper) run i2rt.serving.run_robot_server wrapper "$@" ;;
     can)     exec bash "$REPO/robot/setup_can_ids.sh" "$@" ;;
     canup)   exec bash "$REPO/robot/reset_all_can.sh" "$@" ;;
     *)
-        echo "usage: yam {teleop|dagger|wrapper|can|canup} [args]" >&2
+        echo "usage: yam {teleop|deploy|wrapper|can|canup} [args]" >&2
         exit 2
         ;;
 esac

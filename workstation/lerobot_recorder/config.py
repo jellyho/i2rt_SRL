@@ -92,8 +92,6 @@ class RecorderConfig:
     task: str = "do the task"  # ACTIVE language instruction (persists until changed)
     tasks: List[str] = field(default_factory=list)  # quick-switch templates shown in the GUI
     fps: int = 60  # dataset / record-loop rate (matched to the 60 fps cameras)
-    robot_type: str = "yam_bimanual"
-    use_videos: bool = True
     # Output dataset format: "lerobot" (LeRobotDataset, default) or "abcdl" (the abcdl
     # MP4+binary training cache — one episode dir per save, loadable via AbcdlDataset /
     # pushable with AbcdlDataset.push_to_hub). Needs the `abcdl` package installed.
@@ -120,10 +118,17 @@ class RecorderConfig:
     # ~4 threads per camera parallelizes it (0 = synchronous; processes>0 adds subprocesses).
     image_writer_threads: int = 0
     image_writer_processes: int = 0
-    # Stream frames straight into the video encoder as they're added (patched LeRobot):
-    # no temp-PNG round-trip at all, save_episode() becomes near-instant. Needs a
-    # lerobot build with the streaming_encoding kwarg; pairs best with vcodec: auto (GPU).
-    streaming_encoding: bool = False
+    # Keyframe interval. LeRobot hard-codes 2 in its streaming encoder -- a keyframe every
+    # other frame -- which makes a random frame decode fastest and the file about 2.8x larger
+    # than the same footage at 10. Measured on this rig: 0.90 ms per random frame at g=2
+    # against 1.23 ms at g=10, a difference a dataloader worker hides, while the disk and the
+    # upload do not hide 2.8x. 10 still leaves three keyframes a second at 30 fps.
+    gop: int = 10
+    # (There is no streaming_encoding knob. Frames always stream straight into the PyAV
+    # encoder; the alternative round-trips every frame of every camera through a ~1.5 MB PNG
+    # on disk, which is not a mode worth being one config key away from. See
+    # AsyncDatasetWriter._dataset_encoding_kwargs.)
+    robot_type: str = "yam_bimanual"
     cameras: List[CameraSpec] = field(default_factory=default_cameras)
     # Robot link: the YAM robot machine running i2rt.serving.run_robot_server (portal).
     robot_host: str = "127.0.0.1"
@@ -132,9 +137,25 @@ class RecorderConfig:
     #   "teleop" -> gate on teleop_state (ENGAGED..IDLE), action = applied command
     #   "dagger" -> gate on the complete policy rollout, action = executed command;
     #               observation.control_mode marks policy vs human intervention
+    #   "eval"   -> one continuous rollout from arm to disarm, action = executed command
+    #   "deploy" -> run the policy WITHOUT recording: no dataset is created or opened and
+    #               no frames are buffered. Everything else (cameras, robot link, live
+    #               view, e-stop, human takeover) behaves exactly as in the other modes,
+    #               so a rollout can be watched and interrupted without producing data.
     record_source: str = "teleop"
+    # Which robot-server controller this tool needs ("teleop" / "dagger"); "" skips the
+    # check. The robot modes are mutually exclusive and started separately on the robot
+    # machine, so a mismatch otherwise fails *silently* — a teleop server simply ignores
+    # policy actions, and a dagger server never reports the teleop engage gate.
+    expected_robot_mode: str = ""
     resume: bool = False  # append to an existing dataset at `root` instead of creating a new one
     min_free_gb: float = 1.0  # refuse to save an episode when free disk drops below this
+    # An episode is buffered whole in RAM before it is handed to the writer, and at
+    # 640x480x3 on three cameras that is ~2.8 MB per frame -- roughly 7 GB for a 40 s
+    # episode. Past this much free memory the recorder ENDS the episode and saves it,
+    # because the alternative is the OOM killer taking the process mid-write and leaving
+    # a dataset that will not open. 0 disables the check.
+    min_free_ram_gb: float = 3.0
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)
     review_before_save: bool = True  # hold each episode for Keep/Delete instead of auto-saving
     auto_arm: bool = False  # arm collection automatically on Start (record on the next teleop engage)
@@ -147,3 +168,38 @@ class RecorderConfig:
     # live cameras only; 0.0 is the reference episode only.  This never changes
     # recorded images or policy inputs.
     reference_live_alpha: float = 0.5
+
+
+def apply_recorder_section(cfg: RecorderConfig, rec_section) -> RecorderConfig:
+    """Copy the ``recorder:`` section of config.yaml onto ``cfg``, in place.
+
+    Both entry points -- ``yam-data record`` and ``yam-data deploy`` -- build the same
+    RecorderConfig from the same YAML section, and each used to read it field by field on its
+    own. The two lists drifted: deploy read 12 keys where record read 18, so ``format``,
+    ``rl_features``, ``reward_mode``, ``discount_factor``, ``record_format`` and ``abcdl_size``
+    were silently ignored for a deployment that recorded a dataset. Nothing announced that --
+    the dataset just came out shaped differently from a recorded one.
+
+    Anything genuinely specific to one entry point (``expected_robot_mode``, the teleop button
+    map) stays with that entry point; this is only the shared part.
+    """
+    g = rec_section.get
+    cfg.record_format = str(g("format", g("record_format", cfg.record_format)))
+    cfg.abcdl_size = int(g("abcdl_size", cfg.abcdl_size))
+    # per-frame RL signals (success / reward / mc_return)
+    cfg.rl_features = bool(g("rl_features", cfg.rl_features))
+    cfg.reward_mode = str(g("reward_mode", cfg.reward_mode))
+    cfg.discount_factor = float(g("discount_factor", cfg.discount_factor))
+    # video-encoding knobs (saving speed)
+    cfg.vcodec = str(g("vcodec", cfg.vcodec))
+    cfg.encoding_backend = str(g("encoding_backend", cfg.encoding_backend))
+    cfg.torchcodec_max_used_vram_gb = float(
+        g("torchcodec_max_used_vram_gb", cfg.torchcodec_max_used_vram_gb)
+    )
+    cfg.gop = max(1, int(g("gop", cfg.gop)))
+    cfg.encoder_threads = int(g("encoder_threads", cfg.encoder_threads))
+    cfg.batch_encoding_size = int(g("batch_encoding_size", cfg.batch_encoding_size))
+    cfg.image_writer_threads = int(g("image_writer_threads", cfg.image_writer_threads))
+    cfg.image_writer_processes = int(g("image_writer_processes", cfg.image_writer_processes))
+    cfg.reference_live_alpha = min(max(float(g("reference_live_alpha", cfg.reference_live_alpha)), 0.0), 1.0)
+    return cfg

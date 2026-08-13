@@ -36,23 +36,41 @@ def test_load_rig(tmp_path, monkeypatch):
     assert load_rig(None) == {}  # no in-repo rig, no env -> empty
 
 
-def test_record_and_deploy_share_video_backend_config(tmp_path):
+def test_record_and_deploy_read_the_same_recorder_section(tmp_path):
+    """Both entry points must build the same RecorderConfig from the same YAML.
+
+    They used to parse it separately and the lists drifted: deploy read 10 keys where record
+    read 16, so a deployment that recorded a dataset silently ignored format, rl_features,
+    reward_mode, discount_factor and abcdl_size -- the dataset just came out shaped
+    differently. The fields below are exactly the ones deploy was missing, plus the encoder
+    knobs that were already shared.
+    """
     config = tmp_path / "config.yaml"
     config.write_text(
         """
 recorder:
   encoding_backend: pyav
   torchcodec_max_used_vram_gb: 6.5
-  streaming_encoding: true
+  format: abcdl
+  abcdl_size: 128
+  rl_features: true
+  reward_mode: step
+  discount_factor: 0.5
+  reference_live_alpha: 0.25
 """
     )
     record_cfg = build_config(["--config", str(config), "--mock"])
-    deploy_cfg, _ = build_deploy_configs(["--config", str(config), "--mock"])
+    deploy_cfg, *_ = build_deploy_configs(["--config", str(config), "--mock"])
 
     for cfg in (record_cfg, deploy_cfg):
         assert cfg.encoding_backend == "pyav"
         assert cfg.torchcodec_max_used_vram_gb == 6.5
-        assert cfg.streaming_encoding is True
+        assert cfg.record_format == "abcdl"
+        assert cfg.abcdl_size == 128
+        assert cfg.rl_features is True
+        assert cfg.reward_mode == "step"
+        assert cfg.discount_factor == 0.5
+        assert cfg.reference_live_alpha == 0.25
 
 
 def test_find_rig_in_repo(tmp_path, monkeypatch):
@@ -279,7 +297,7 @@ def test_reference_overlay_opacity_is_shared_by_record_and_deploy_configs(tmp_pa
     cfg_path.write_text("recorder:\n  reference_live_alpha: 0.3\n")
 
     record_cfg = build_config(["--config", str(cfg_path)])
-    deploy_cfg, _ = build_deploy_configs(["--config", str(cfg_path)])
+    deploy_cfg, *_ = build_deploy_configs(["--config", str(cfg_path)])
 
     assert record_cfg.reference_live_alpha == 0.3
     assert deploy_cfg.reference_live_alpha == 0.3

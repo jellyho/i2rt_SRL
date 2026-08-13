@@ -14,6 +14,45 @@ from workstation.lerobot_recorder.portal_bridge import PortalBridge
 from workstation.lerobot_recorder.recorder import Recorder
 
 
+class _FakeWriter(SimpleNamespace):
+    """Stand-in writer that records what the recorder streams to it.
+
+    The recorder no longer keeps an episode in memory -- frames go to the writer one at a
+    time -- so a fake that cannot receive them tests the wrong path. `frames` is the episode
+    in flight, exactly what `rec._episode` used to hold.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(
+            num_episodes=0, total_episodes=0, outcome_totals={"success": 0, "fail": 0},
+            queue_depth=0, low_disk=False, finalized=False,
+            progress={"saving": False, "queued": 0}, **kw
+        )
+        self.frames = []
+        self.tasks = []
+        self.saved = []
+
+    def supports_streaming(self):
+        return True
+
+    def stream_frame(self, frame, task=""):
+        self.frames.append(frame)
+        self.tasks.append(task)
+
+    def end_episode(self, outcome, task):
+        self.saved.append((list(self.frames), outcome, task))
+        self.frames = []
+
+    def abort_episode(self):
+        self.frames = []
+
+
+def _in_flight(rec):
+    """The frames of the episode in progress, whichever path the recorder took."""
+    writer = rec.writer
+    return getattr(writer, "frames", None) if hasattr(writer, "frames") else rec._episode
+
+
 def test_recorder_start_failure_releases_hardware(tmp_path, monkeypatch):
     cfg = RecorderConfig(repo_id="test/yam", root=str(tmp_path), mock=True)
     rec = Recorder(cfg)
@@ -205,18 +244,14 @@ def test_status_reports_dataset_outcome_totals_across_sessions(tmp_path):
         rec2.shutdown()
 
 
-def test_streaming_encoding_kwarg_flows_to_writer(tmp_path):
+def test_streaming_encoding_reaches_the_writer_without_being_asked_for(tmp_path):
+    """Both the create and the resume path stream, with nothing set in the config."""
     from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
 
-    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=True, streaming_encoding=True)
+    cfg = RecorderConfig(repo_id="t/stream", root=str(tmp_path), mock=True)
     w = AsyncDatasetWriter(cfg, [], {})
     assert w._create_encoding_kwargs().get("streaming_encoding") is True
     assert w._dataset_encoding_kwargs().get("streaming_encoding") is True  # resume path too
-
-    cfg_off = RecorderConfig(repo_id="t/nostream", root=str(tmp_path), mock=True)
-    w_off = AsyncDatasetWriter(cfg_off, [], {})
-    # omitted when disabled so stock lerobot builds (without the kwarg) keep working
-    assert "streaming_encoding" not in w_off._create_encoding_kwargs()
 
 
 def test_control_mode_in_frame():
@@ -241,14 +276,7 @@ def test_control_mode_in_frame():
 def test_recenter_pauses_appends_without_closing_episode():
     cfg = RecorderConfig(record_source="teleop", mock=True)
     rec = Recorder(cfg)
-    rec.writer = SimpleNamespace(
-        num_episodes=0,
-        total_episodes=0,
-        outcome_totals={"success": 0, "fail": 0},
-        queue_depth=0,
-        low_disk=False,
-        progress={"saving": False, "queued": 0},
-    )
+    rec.writer = _FakeWriter()
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
     snap = {
@@ -263,19 +291,19 @@ def test_recenter_pauses_appends_without_closing_episode():
     }
 
     rec._step(images, snap)
-    assert len(rec._episode) == 1
+    assert len(_in_flight(rec)) == 1
     assert rec.gate.recording is True
 
     snap["leader_recentering"] = True
     rec._step(images, snap)
     rec._step(images, snap)
-    assert len(rec._episode) == 1  # no frame, state, or action => no dataset time
+    assert len(_in_flight(rec)) == 1  # no frame, state, or action => no dataset time
     assert rec.gate.recording is True  # same episode remains open internally
     assert rec.get_status()["recording"] is False
 
     snap["leader_recentering"] = False
     rec._step(images, snap)
-    assert len(rec._episode) == 2
+    assert len(_in_flight(rec)) == 2
     assert rec.get_status()["recording"] is True
 
 
@@ -359,17 +387,8 @@ def test_finish_clears_policy_action_and_latched_rollout_request():
 def test_dagger_records_one_rollout_across_interventions():
     cfg = RecorderConfig(record_source="dagger", mock=False)
     rec = Recorder(cfg)
-    submitted = []
-    rec.writer = SimpleNamespace(
-        num_episodes=0,
-        total_episodes=0,
-        outcome_totals={"success": 0, "fail": 0},
-        queue_depth=0,
-        low_disk=False,
-        progress={"saving": False, "queued": 0},
-        finalized=False,
-        submit=lambda frames, outcome, task: submitted.append((list(frames), outcome, task)),
-    )
+    rec.writer = _FakeWriter()
+    submitted = rec.writer.saved
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
 
@@ -391,8 +410,8 @@ def test_dagger_records_one_rollout_across_interventions():
     rec._step(images, snap(intervention=True, mode=2))
     rec._step(images, snap())
     assert rec.gate.recording is True
-    assert len(rec._episode) == 3
-    assert [int(f["observation.control_mode"][0]) for f in rec._episode] == [1, 2, 1]
+    assert len(_in_flight(rec)) == 3
+    assert [int(f["observation.control_mode"][0]) for f in _in_flight(rec)] == [1, 2, 1]
     assert rec.get_status()["interventions"] == 1
 
     rec._step(images, snap(running=False, event={"seq": 1, "action": "keep"}))
@@ -407,14 +426,7 @@ def test_dagger_records_one_rollout_across_interventions():
 def test_dagger_discard_drops_the_complete_rollout():
     cfg = RecorderConfig(record_source="dagger", mock=False, review_before_save=False)
     rec = Recorder(cfg)
-    rec.writer = SimpleNamespace(
-        num_episodes=0,
-        total_episodes=0,
-        outcome_totals={"success": 0, "fail": 0},
-        queue_depth=0,
-        low_disk=False,
-        progress={"saving": False, "queued": 0},
-    )
+    rec.writer = _FakeWriter()
     rec.gate.arm()
     images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
     base = {
@@ -436,7 +448,7 @@ def test_dagger_discard_drops_the_complete_rollout():
             "last_dagger_event": {"seq": 1, "action": "discard"},
         },
     )
-    assert rec._episode == []
+    assert _in_flight(rec) == []
     assert rec.get_status()["discarded"] == 1
     assert rec.get_status()["kept"] == 0
 
@@ -480,3 +492,265 @@ def test_dagger_recorder_events_do_not_use_expert_button_map():
     assert rec._btn_outcome == "keep"
     rec._scan_dagger_event({"last_dagger_event": {"seq": 2, "action": "discard"}})
     assert rec._btn_outcome == "discard"
+
+
+# --------------------------------------------------------------- deploy (no recording)
+def test_deploy_source_opens_no_dataset(tmp_path):
+    """`deploy` runs the policy but must not create a dataset anywhere on disk."""
+    cfg = RecorderConfig(repo_id="test/deployonly", root=str(tmp_path), fps=60, mock=True,
+                         record_source="deploy")
+    rec = Recorder(cfg)
+    rec.start()
+    time.sleep(0.5)  # let the loop run — in dagger/eval this would be buffering frames
+    st = rec.get_status()
+    rec.shutdown()
+
+    assert rec.writer is None  # no writer was ever opened
+    assert not (tmp_path / "deployonly").exists()  # and nothing was written to disk
+    assert st["frames"] == 0 and st["recording"] is False and st["armed"] is False
+    assert st["robot_ok"] is True  # the robot link is live all the same
+
+
+def test_deploy_source_ignores_arm_and_save(tmp_path):
+    """Arming/saving are meaningless without a dataset; they must be safe no-ops, not crashes."""
+    cfg = RecorderConfig(repo_id="test/deploynoop", root=str(tmp_path), fps=60, mock=True,
+                         record_source="deploy")
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(0.4)
+    armed = rec.get_status()["armed"]
+    rec.save_dataset()  # would raise/AttributeError if it reached the writer
+    rec.disarm()
+    rec.shutdown()
+
+    assert armed is False  # arm() did not arm anything
+    assert rec.writer is None
+    assert not (tmp_path / "deploynoop").exists()
+
+
+def test_deploy_source_still_reports_rollout_state(tmp_path):
+    """The UI needs policy/intervention state in deploy mode — that is the whole point."""
+    cfg = RecorderConfig(repo_id="test/deploystate", root=str(tmp_path), fps=60, mock=True,
+                         record_source="deploy")
+    rec = Recorder(cfg)
+    snap = {
+        "teleop_state": "IDLE", "state": np.zeros(4), "action": np.zeros(4),
+        "policy_running": True, "intervention": True, "dagger_state": "intervention",
+        "fine_grained": False, "leader_recentering": False, "recenter_fault": False,
+        "homing": False, "estop": False, "buttons": {},
+    }
+    rec._step({}, snap)
+    st = rec.get_status()
+    assert st["policy_running"] is True
+    assert st["intervention"] is True
+    assert st["dagger_state"] == "intervention"
+    assert st["frames"] == 0  # ...but still nothing buffered
+
+
+def test_deploy_source_does_not_use_expert_button_map():
+    """Handle buttons drive the robot's rollout state machine here, not outcome labels."""
+    cfg = RecorderConfig(record_source="deploy", mock=False, button_map={"left.0": "discard"})
+    rec = Recorder(cfg)
+    rec._scan_buttons({"buttons": {"left": [1]}})
+    assert rec._btn_outcome is None
+
+
+# ------------------------------------------------------- robot-server mode mismatch
+def test_wrong_robot_mode_refuses_to_start_with_an_actionable_message(tmp_path, monkeypatch):
+    """A crossed robot server otherwise fails SILENTLY (a teleop server just ignores
+    policy actions), so starting must refuse and name the command to run."""
+    cfg = RecorderConfig(repo_id="test/mode", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="deploy")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "teleop"))
+
+    try:
+        rec.start()
+    except RuntimeError as exc:
+        assert "'teleop'" in str(exc) and "'deploy'" in str(exc)
+        assert "robot/yam deploy" in str(exc)
+    else:
+        raise AssertionError("a teleop server must not satisfy a deployment session")
+
+
+def test_matching_robot_mode_starts_normally(tmp_path, monkeypatch):
+    cfg = RecorderConfig(repo_id="test/modeok", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="deploy")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "deploy"))
+    rec.start()
+    rec.shutdown()
+    assert rec.writer is None  # deploy source: still no dataset
+
+
+def test_unknown_robot_mode_does_not_block_startup(tmp_path, monkeypatch):
+    """An older server that reports no mode must not become un-startable."""
+    cfg = RecorderConfig(repo_id="test/modenone", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="deploy")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: None))
+    rec._check_robot_mode(timeout=0.1)  # warns, does not raise
+    rec.shutdown()
+
+
+def test_mock_sessions_skip_the_mode_check(tmp_path):
+    cfg = RecorderConfig(repo_id="test/modemock", root=str(tmp_path), mock=True,
+                         record_source="deploy", expected_robot_mode="deploy")
+    rec = Recorder(cfg)
+    rec.start()  # mock has no robot at all — the check must not fire
+    rec.shutdown()
+
+
+def test_older_robot_reporting_the_pre_rename_mode_is_accepted(tmp_path, monkeypatch):
+    """The controller was renamed dagger -> deploy once it also served plain deployment.
+    An un-updated robot server still says "dagger"; that skew must not read as a mismatch."""
+    cfg = RecorderConfig(repo_id="test/modeold", root=str(tmp_path), mock=False,
+                         record_source="deploy", expected_robot_mode="deploy")
+    rec = Recorder(cfg)
+    monkeypatch.setattr(rec.cameras, "start", lambda: None)
+    monkeypatch.setattr(rec.cameras, "stop", lambda: None)
+    monkeypatch.setattr(rec.robot, "start", lambda: None)
+    monkeypatch.setattr(rec.robot, "stop", lambda: None)
+    monkeypatch.setattr(type(rec.robot), "robot_mode", property(lambda _self: "dagger"))
+    rec.start()  # must not raise
+    rec.shutdown()
+
+
+# --------------------------------------------------------------- memory guard
+def test_low_memory_refuses_to_start_an_episode(tmp_path):
+    """Better to not start than to buffer an episode there is no room for: a truncated
+    take is data nobody asked for, and the OOM kill lands mid-write."""
+    cfg = RecorderConfig(repo_id="test/ram", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False,
+                         min_free_ram_gb=1e9)  # nothing will ever satisfy this
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    st = rec.get_status()
+    rec.shutdown()
+
+    assert st["low_ram"] is True
+    assert st["armed"] is False, "arming must not proceed when the check fails"
+    assert st["recording"] is False
+
+
+def test_normal_memory_starts_as_usual(tmp_path):
+    cfg = RecorderConfig(repo_id="test/ramok", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False,
+                         min_free_ram_gb=0.001)
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(0.5)
+    st = rec.get_status()
+    rec.disarm()
+    rec.shutdown()
+    assert st["low_ram"] is False and st["armed"] is True
+
+
+def test_guard_is_off_when_the_threshold_is_zero(tmp_path):
+    cfg = RecorderConfig(repo_id="test/ramoff", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False, min_free_ram_gb=0.0)
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(0.3)
+    st = rec.get_status()
+    rec.disarm()
+    rec.shutdown()
+    assert st["low_ram"] is False and st["armed"] is True
+
+
+def test_it_is_checked_once_per_episode_not_per_frame(tmp_path, monkeypatch):
+    """One read of /proc/meminfo an episode -- the record loop should not carry it."""
+    calls = []
+    monkeypatch.setattr(Recorder, "available_ram_gb", staticmethod(lambda: calls.append(1) or 999.0))
+    cfg = RecorderConfig(repo_id="test/ramonce", root=str(tmp_path), fps=60, mock=True,
+                         record_source="eval", review_before_save=False, min_free_ram_gb=1.0)
+    rec = Recorder(cfg)
+    rec.start()
+    rec.arm()
+    time.sleep(1.0)  # ~60 frames buffered
+    n_during = len(calls)
+    rec.disarm()     # submits -> the after-episode report reads it once more
+    rec.shutdown()
+    assert n_during == 1, f"expected one check at arm, got {n_during}"
+    assert len(calls) == 2, "expected exactly one more when the episode was handed over"
+
+
+def test_available_ram_is_read_from_proc():
+    """A plausible number, and inf rather than a crash where /proc/meminfo is absent."""
+    free = Recorder.available_ram_gb()
+    assert free > 0
+    if free != float("inf"):
+        assert free < 10_000
+
+
+def test_no_episode_starts_while_the_first_inference_is_still_running():
+    """End to end through the bridge: the compile stall must not become recorded frames."""
+    from workstation.lerobot_recorder.portal_bridge import PortalBridge
+
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    bridge = PortalBridge(cfg)
+    side = {"pos": np.zeros(7), "vel": np.zeros(7), "eff": np.zeros(7), "applied": np.zeros(7)}
+
+    requested = bridge._assemble({
+        "left": side, "right": side,
+        "policy_running": True, "policy_driving": False,     # asked for, not yet driving
+    })
+    assert requested["teleop_state"] == "IDLE"
+
+    driving = bridge._assemble({
+        "left": side, "right": side,
+        "policy_running": True, "policy_driving": True,
+    })
+    assert driving["teleop_state"] == "ENGAGED"
+
+
+def test_an_older_robot_server_still_records():
+    """A server that predates `policy_driving` must not silently stop producing episodes."""
+    from workstation.lerobot_recorder.portal_bridge import PortalBridge
+
+    cfg = RecorderConfig(record_source="dagger", mock=False)
+    bridge = PortalBridge(cfg)
+    side = {"pos": np.zeros(7), "vel": np.zeros(7), "eff": np.zeros(7), "applied": np.zeros(7)}
+    old = bridge._assemble({"left": side, "right": side, "policy_running": True})
+    assert old["teleop_state"] == "ENGAGED"
+
+
+def test_the_recorder_streams_the_active_task_with_every_frame():
+    """The task the operator set has to reach the writer, or the dataset's task column is blank."""
+    cfg = RecorderConfig(record_source="dagger", mock=True, task="assemble lego blocks")
+    rec = Recorder(cfg)
+    rec.writer = _FakeWriter()
+    rec.gate.arm()
+
+    images = {"agentview": np.zeros((4, 4, 3), np.uint8)}
+    snap = {
+        "teleop_state": "ENGAGED",
+        "state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+        "leader": np.zeros(12, np.float32),
+        "eef": np.zeros(14, np.float32),
+        "control_mode": 1,
+        "buttons": {},
+        "intervention": False,
+        "leader_recentering": False,
+    }
+    for _ in range(3):
+        rec._step(images, snap)
+
+    assert rec.writer.tasks == ["assemble lego blocks"] * 3

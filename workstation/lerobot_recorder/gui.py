@@ -567,18 +567,22 @@ class RecorderGUI(QtWidgets.QWidget):
                 )
                 return
 
-        ds_dir = dataset_dir(cfg.root, cfg.repo_id)
-        info = dataset_info(ds_dir)
-        if info["exists"] and not cfg.resume:
-            if not self._confirm_overwrite(ds_dir, info["episodes"]):
-                return
-            try:
-                remove_dataset_root(ds_dir)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Delete failed", str(e))
-                return
-        elif not info["exists"]:
-            cfg.resume = False  # nothing to resume
+        # "deploy" runs the policy without recording, so there is no dataset to create,
+        # resume, or overwrite — skip the whole dataset negotiation (and never prompt to
+        # delete a folder a watch-only session would not have written to anyway).
+        if cfg.record_source != "deploy":
+            ds_dir = dataset_dir(cfg.root, cfg.repo_id)
+            info = dataset_info(ds_dir)
+            if info["exists"] and not cfg.resume:
+                if not self._confirm_overwrite(ds_dir, info["episodes"]):
+                    return
+                try:
+                    remove_dataset_root(ds_dir)
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Delete failed", str(e))
+                    return
+            elif not info["exists"]:
+                cfg.resume = False  # nothing to resume
 
         self.recorder = Recorder(cfg)
         self.start_btn.setEnabled(False)

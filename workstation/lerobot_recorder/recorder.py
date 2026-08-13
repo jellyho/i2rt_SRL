@@ -44,7 +44,11 @@ logger = logging.getLogger(__name__)
 
 
 class Recorder:
-    def __init__(self, cfg: RecorderConfig, on_status: Optional[Callable[[dict], None]] = None) -> None:
+    def __init__(
+        self,
+        cfg: RecorderConfig,
+        on_status: Optional[Callable[[dict], None]] = None,
+    ) -> None:
         self.cfg = cfg
         self.cameras = CameraManager(cfg)
         self.robot = PortalBridge(cfg)
@@ -77,36 +81,64 @@ class Recorder:
             "interventions": 0,
             "dagger_state": "stopped",
             "policy_running": False,
+            "leader_mirror": True,
             "intervention": False,
             "fine_grained": False,
             "leader_recentering": False,
             "recenter_fault": False,
             "homing": False,
             "estop": False,
+            "low_ram": False,
         }
         self._last_images: dict = {}
         self._pending = False
-        self._episode: List[dict] = []  # buffered frames for the in-progress / pending episode
+        # Frames of the in-progress / pending episode. Only ever populated on the fallback
+        # path (per-frame RL signals, which need the whole episode before any frame can be
+        # written); otherwise frames go straight to the writer and this stays empty --
+        # see _ep_add. _n_frames is the count either way.
+        self._episode: List[dict] = []
+        self._n_frames = 0
+        self._streaming_episode = False
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
         # "<side>.<index>" -> outcome (success/fail/discard); see RecorderConfig.button_map
         self._button_outcome: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in (cfg.button_map or {}).items()}
-        if cfg.record_source == "dagger":
-            self._button_outcome = {}  # DAgger buttons are handled by the robot state machine.
+        if cfg.record_source in ("dagger", "deploy"):
+            # Policy-driven modes: the handle buttons drive the robot's own rollout state
+            # machine (start/stop, takeover, home), not an episode outcome label.
+            self._button_outcome = {}
         self._last_dagger_event_seq = 0
         self._dagger_intervention_active = False
         # "eval": record a continuous rollout (policy / intervention) from arm to disarm,
         # instead of gating on the teleop engage signal.
         self._eval = cfg.record_source == "eval"
+        # "deploy": run the policy and watch it, but record NOTHING — no dataset is opened
+        # and no frames are buffered. Cameras, robot link, live view, e-stop and human
+        # takeover are unchanged, so this is the recorder minus the dataset.
+        self._deploy = cfg.record_source == "deploy"
+        self._last_ram_gb = 0.0
+        # Per-step arrays the policy declared at handshake: {name: shape} for the schema, and
+        # a callable returning this step's values. Both arrive after the policy connects, so
+        # they are set before the dataset is opened rather than at construction.
+        self._extra_features: Dict[str, tuple] = {}
+        self._extras_fn: Optional[Callable[[], Dict[str, np.ndarray]]] = None
 
     # ------------------------------------------------------------------ control
     def start(self) -> None:
-        """Open cameras + robot link + dataset and begin the record loop (gate stays disarmed)."""
+        """Open cameras + robot link + dataset and begin the record loop (gate stays disarmed).
+
+        In ``deploy`` mode no dataset is opened at all — ``self.writer`` stays None, which
+        every consumer below already treats as "nothing to record"."""
         try:
             self.cameras.start()
             self.robot.start()
-            self.writer = self._open_writer()
+            self._check_robot_mode()
+            # Not opened here when a policy drives: the schema may include columns the policy
+            # only declares at handshake, which has not happened yet. _ensure_writer_open
+            # opens it on the first recorded frame, by which time it has.
+            if not self._deploy and self.cfg.record_source not in ("dagger", "eval"):
+                self.writer = self._open_writer()
             self._stop.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
@@ -124,9 +156,47 @@ class Recorder:
             self.cameras.stop()
             raise
 
+    #: Which robot controller each tool needs -> the mode strings that satisfy it, and how
+    #: to start the right one. "deploy" also accepts "dagger": that controller was renamed
+    #: once it started serving plain deployment as well as HG-DAgger, and an older robot
+    #: server still reports the old name — a version skew must not read as a mismatch.
+    _ROBOT_MODES = {
+        "teleop": ({"teleop"}, "robot/yam teleop"),
+        "deploy": ({"deploy", "dagger"}, "robot/yam deploy"),
+    }
+
+    def _check_robot_mode(self, timeout: float = 3.0) -> None:
+        """Fail loudly when the robot server is running the wrong controller.
+
+        The robot modes are mutually exclusive and launched separately on the robot
+        machine, so getting them crossed is easy — and it fails *silently*: a ``teleop``
+        server simply ignores ``set_policy_action`` (the policy appears connected and the
+        arms never move), and a ``dagger`` server never reports the engage gate (the
+        recorder waits forever for an episode). Better to refuse to start and say which
+        command to run."""
+        want = str(getattr(self.cfg, "expected_robot_mode", "") or "")
+        if not want or self.cfg.mock:
+            return
+        deadline = time.time() + timeout
+        mode = self.robot.robot_mode
+        while mode is None and time.time() < deadline:
+            time.sleep(0.05)
+            mode = self.robot.robot_mode
+        if mode is None:
+            logger.warning("could not read the robot server mode; skipping the %s check", want)
+            return
+        accepted, hint = self._ROBOT_MODES.get(want, ({want}, want))
+        if mode not in accepted:
+            raise RuntimeError(
+                f"The robot server at {self.cfg.robot_host}:{self.cfg.robot_port} is running in "
+                f"'{mode}' mode, but this needs '{want}'.\n\n"
+                f"On the robot machine, restart it with:  {hint}"
+            )
+
     def _open_writer(self) -> AsyncDatasetWriter:
         shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}
-        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes)
+        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes,
+                                    extra_features=self._extra_features)
         writer.open(self._sample_frame())
         return writer
 
@@ -153,6 +223,8 @@ class Recorder:
             "observation.eef": np.zeros(EEF_DIM, np.float32),
             "observation.control_mode": np.zeros(1, np.float32),
             "action": np.zeros(ACTION_DIM, np.float32),
+            **{name: np.zeros(int(np.prod(shape)), np.float32)
+               for name, shape in self._extra_features.items()},
         }
 
     @staticmethod
@@ -168,10 +240,18 @@ class Recorder:
         return out
 
     def arm(self) -> None:
-        """GUI 'Start collection': begin gating (teleop/dagger) or a rollout (eval)."""
+        """GUI 'Start collection': begin gating (teleop/dagger) or a rollout (eval).
+
+        No-op in ``deploy`` mode — there is no dataset to collect into, so the concept of
+        arming does not apply and the GUI hides the control."""
+        if self._deploy:
+            return
+        if not self._ram_ok_to_start():
+            return
         self.gate.arm()
         if self._eval:  # eval: arm starts one continuous rollout
-            self._episode, self._preview, self._btn_outcome = [], [], None
+            self._reset_episode()
+            self._btn_outcome = None
             logger.info("collection armed (eval) — recording rollout until you stop")
         elif self.cfg.record_source == "dagger":
             logger.info("collection armed — each complete policy rollout is recorded as an episode")
@@ -181,12 +261,15 @@ class Recorder:
 
     def disarm(self) -> None:
         """GUI 'Stop collection'. In eval mode this ENDS the rollout and saves it
-        (or holds it for review); otherwise it just stops the gate and drops partials."""
+        (or holds it for review); otherwise it just stops the gate and drops partials.
+        No-op in ``deploy`` mode (nothing was ever armed)."""
+        if self._deploy:
+            return
         self.gate.disarm()
         if self._eval:
             if self._btn_outcome == "discard":
                 self._discard_episode(counted=True)
-            elif not self._episode:
+            elif self._ep_empty():
                 self._discard_episode()
             elif self.cfg.review_before_save and self._btn_outcome is None:
                 self._pending = True
@@ -218,21 +301,90 @@ class Recorder:
             self._discard_episode(counted=True)
             self._set(pending=False, frames=0)
 
-    def _submit(self, outcome: Optional[str]) -> None:
-        """Hand the buffered episode to the writer queue and update live stats."""
+    # ---------------------------------------------------------------- episode sink
+    def set_extra_features(self, features: Dict[str, tuple], values_fn) -> None:
+        """Declare extra per-step columns, and where to read them each frame.
+
+        Called once the policy handshake is in, which is why the dataset is not opened until
+        the first recorded frame: the schema has to include these, and nothing knows them
+        before the server says so.
+        """
+        self._extra_features = {str(k): tuple(v) for k, v in (features or {}).items()}
+        self._extras_fn = values_fn if self._extra_features else None
+        if self._extra_features:
+            logger.info("recording extra per-step features: %s", ", ".join(
+                f"{k}{v}" for k, v in self._extra_features.items()))
+
+    def _extra_values(self) -> Dict[str, np.ndarray]:
+        """This frame's extras, zero-filled when the policy did not send one.
+
+        A declared column has to exist on every frame -- LeRobot's schema is fixed -- so a
+        missing value becomes zeros rather than a hole. That is a real loss of meaning, which
+        is why _set_extras only ever drops a value it cannot use, loudly.
+        """
+        if self._extras_fn is None:
+            return {}
+        try:
+            got = self._extras_fn() or {}
+        except Exception as e:
+            logger.debug("extra features unavailable this frame: %s", e)
+            got = {}
+        out = {}
+        for name, shape in self._extra_features.items():
+            size = int(np.prod(shape))
+            value = got.get(name)
+            out[name] = (np.zeros(size, np.float32) if value is None
+                         else np.asarray(value, np.float32).reshape(-1)[:size])
+        return out
+
+    def _ep_add(self, frame: dict) -> None:
+        """Take one captured frame, either streaming it out or buffering it.
+
+        Streaming is the point: three 640x480 cameras are ~2.8 MB a frame, so holding an
+        episode as a list costs ~2.5 GB for 30 s and ~7.5 GB for 90 s -- which is what pushed
+        the machine into swap and got this process OOM-killed mid-episode. The writer takes
+        frames one at a time over a bounded queue instead.
+        """
         writer = self._ensure_writer_open()
-        writer.submit(self._episode, outcome, self.cfg.task)
+        if not self._n_frames:
+            self._streaming_episode = writer.supports_streaming()
+        if self._streaming_episode:
+            writer.stream_frame(frame, self.cfg.task)
+        else:
+            self._episode.append(frame)
+        self._n_frames += 1
+
+    def _ep_empty(self) -> bool:
+        return self._n_frames == 0
+
+    def _submit(self, outcome: Optional[str]) -> None:
+        """Close the episode out to the writer and update live stats."""
+        self._log_ram_after_episode(self._n_frames)
+        writer = self._ensure_writer_open()
+        if self._streaming_episode:
+            writer.end_episode(outcome, self.cfg.task)
+        else:
+            writer.submit(self._episode, outcome, self.cfg.task)
         with self._lock:
             self._status["kept"] += 1
             if outcome in ("success", "fail"):
                 self._status[outcome] += 1
-        self._episode, self._preview, self._pending = [], [], False
+        self._reset_episode()
 
     def _discard_episode(self, *, counted: bool = False) -> None:
         if counted:
             with self._lock:
                 self._status["discarded"] += 1
+        # A streamed episode is already inside LeRobot's buffer, so discarding it is the
+        # writer's job rather than just dropping a list.
+        if self._streaming_episode and self._n_frames and self.writer is not None:
+            self.writer.abort_episode()
+        self._reset_episode()
+
+    def _reset_episode(self) -> None:
         self._episode, self._preview, self._pending = [], [], False
+        self._n_frames = 0
+        self._streaming_episode = False
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -245,10 +397,13 @@ class Recorder:
         self._set(running=False)
 
     def save_dataset(self) -> None:
-        """Finalize saved episodes now, without closing cameras or the robot link."""
+        """Finalize saved episodes now, without closing cameras or the robot link.
+        Nothing to do in ``deploy`` mode — no dataset was ever opened."""
+        if self._deploy:
+            return
         if self._pending:
             raise RuntimeError("review the pending episode before saving the dataset")
-        if self.gate.recording or (self._eval and self.gate.armed and self._episode):
+        if self.gate.recording or (self._eval and self.gate.armed and not self._ep_empty()):
             raise RuntimeError("finish or stop the current recording before saving the dataset")
 
         was_armed = self.gate.armed
@@ -300,6 +455,10 @@ class Recorder:
         """Forward a DAgger human-intervention request."""
         self.robot.set_intervention(flag)
 
+    def set_leader_mirror(self, flag: bool) -> None:
+        """Forward whether the leader tracks the follower while the policy drives."""
+        self.robot.set_leader_mirror(flag)
+
     def finish_dagger_run(self, action: str) -> None:
         """Forward a DAgger keep/discard + home request."""
         self.robot.finish_dagger_run(action)
@@ -338,6 +497,94 @@ class Recorder:
     def get_review_frames(self) -> List[np.ndarray]:
         with self._lock:
             return list(self._preview)
+
+
+    # ------------------------------------------------------------------ memory guard
+    @staticmethod
+    def available_ram_gb() -> float:
+        """MemAvailable from /proc, i.e. what can be allocated without swapping hard.
+
+        Deliberately not psutil: this runs inside the record loop and must not add a
+        dependency or a surprise import cost. inf when the file is unreadable, so a
+        platform without it simply keeps the old behaviour."""
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) / 1e6  # kB -> GB
+        except Exception:
+            pass
+        return float("inf")
+
+    def _ram_ok_to_start(self) -> bool:
+        """Checked once as an episode begins: is there room to buffer another one?
+
+        The episode is held whole in RAM until it reaches the writer -- 2.8 MB a frame
+        across three cameras, so several GB for a normal take. Refusing to start is better
+        than stopping half way: a truncated episode is data nobody asked for, and being
+        OOM-killed mid-write is what leaves a parquet the dataset cannot open.
+
+        Only at the start, not per frame -- one read of /proc/meminfo per episode. The
+        limit of that is a single unusually long take, which can still outgrow the memory
+        that looked sufficient when it began; `min_free_ram_gb` carries the headroom for it.
+        """
+        limit = float(getattr(self.cfg, "min_free_ram_gb", 0.0) or 0.0)
+        if limit <= 0:
+            return True
+        free = self.available_ram_gb()
+        if free >= limit:
+            self._last_ram_gb = free
+            return True
+        logger.error(
+            "LOW MEMORY: %.1f GB available (< %.1f GB) — NOT starting this episode. An "
+            "episode buffers ~%.1f MB per frame in RAM, and being OOM-killed mid-write "
+            "leaves a dataset that will not open. Free some memory, or lower "
+            "recorder.min_free_ram_gb if this is too cautious.",
+            free, limit, self._frame_mb(),
+        )
+        with self._lock:
+            self._status["low_ram"] = True
+        return False
+
+    def _frame_mb(self) -> float:
+        """Bytes one buffered frame costs, so the log says why the limit is what it is."""
+        try:
+            shapes = [self.cameras.shape_of(k) for k in self.cameras.image_keys]
+            return sum(int(np.prod(s)) for s in shapes) / 1e6
+        except Exception:
+            return 0.0
+
+    def _log_ram_after_episode(self, frames: int) -> None:
+        """The other half of the pair: what the episode actually cost."""
+        limit = float(getattr(self.cfg, "min_free_ram_gb", 0.0) or 0.0)
+        if limit <= 0 or not frames:
+            return
+        free = self.available_ram_gb()
+        if self._streaming_episode:
+            logger.info(
+                "episode streamed %d frames (~%.1f GB, none of it held in RAM); "
+                "%.1f GB available now",
+                frames, frames * self._frame_mb() / 1000, free,
+            )
+        else:
+            logger.info(
+                "episode buffered %d frames (~%.1f GB); %.1f GB available now",
+                frames, frames * self._frame_mb() / 1000, free,
+            )
+        if free < limit * 1.5:
+            logger.warning(
+                "memory is getting tight (%.1f GB free, limit %.1f GB) — the next episode "
+                "may be refused", free, limit,
+            )
+
+    def _buffered_gb(self) -> float:
+        """Rough size of the in-RAM episode, for the log line that explains the stop."""
+        if not self._episode:
+            return 0.0
+        first = self._episode[0]
+        per_frame = sum(getattr(v, "nbytes", 0) for v in first.get("images", {}).values())
+        per_frame += sum(getattr(v, "nbytes", 0) for k, v in first.items() if k != "images")
+        return len(self._episode) * per_frame / 1e9
 
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
@@ -379,11 +626,30 @@ class Recorder:
             "observation.eef": self._fit(snap.get("eef"), EEF_DIM),
             "observation.control_mode": np.array([control_mode], dtype=np.float32),
             "action": self._fit(snap.get("action"), ACTION_DIM),
+            **self._extra_values(),
         }
 
     def _step(self, images: dict, snap: dict) -> None:
         self._scan_buttons(snap)
         self._scan_dagger_event(snap)
+
+        if self._deploy:
+            # Watch-only: publish liveness + rollout state for the UI and return before
+            # anything touches an episode buffer or the (absent) writer. The robot-side
+            # controller still owns policy/intervention/homing exactly as in dagger mode.
+            self._set(
+                armed=False,
+                recording=False,
+                pending=False,
+                teleop=snap["teleop_state"],
+                frames=0,
+                queue=0,
+                cam_ok=self.cameras.healthy,
+                robot_ok=self.robot.connected,
+                **self._dagger_status(snap),
+            )
+            return
+
         # Recentring is part of the same episode, but dataset time is paused:
         # append neither sensors nor actions until physical alignment completes.
         recording_paused = bool(snap.get("leader_recentering"))
@@ -396,7 +662,7 @@ class Recorder:
                 and snap["state"] is not None
                 and snap["action"] is not None
             ):
-                self._episode.append(self._frame(images, snap))
+                self._ep_add(self._frame(images, snap))
                 self._buffer_preview(images)
             self._set(
                 armed=self.gate.armed,
@@ -407,7 +673,7 @@ class Recorder:
                 episodes_total=self.writer.total_episodes,
                 success_total=self.writer.outcome_totals["success"],
                 fail_total=self.writer.outcome_totals["fail"],
-                frames=len(self._episode),
+                frames=self._n_frames,
                 queue=self.writer.queue_depth,
                 cam_ok=self.cameras.healthy,
                 robot_ok=self.robot.connected,
@@ -431,7 +697,15 @@ class Recorder:
 
         if event in (eg.EV_START, eg.EV_RECORD, eg.EV_STOP):
             if event == eg.EV_START:
-                self._episode, self._preview, self._btn_outcome = [], [], None
+                if not self._ram_ok_to_start():
+                    # Refuse the episode rather than buffer one there is no room for; the
+                    # gate is disarmed so the operator sees it stop instead of silently
+                    # recording nothing.
+                    self.gate.disarm()
+                    self._set(armed=False, recording=False)
+                    return
+                self._reset_episode()
+                self._btn_outcome = None
                 if self.cfg.record_source == "dagger":
                     logger.info("● recording DAgger rollout (policy started)")
                 else:
@@ -442,11 +716,11 @@ class Recorder:
                 and snap["action"] is not None
                 and self.cameras.healthy
             ):
-                self._episode.append(self._frame(images, snap))
+                self._ep_add(self._frame(images, snap))
                 self._buffer_preview(images)
 
         if event == eg.EV_STOP:
-            if not self._episode:
+            if self._ep_empty():
                 logger.warning(
                     "episode ended with 0 frames — nothing saved (cameras healthy? robot state/action present?)"
                 )
@@ -456,7 +730,7 @@ class Recorder:
                 self._submit(self._btn_outcome)  # button auto-label+save
             elif self.cfg.review_before_save:
                 self._pending = True  # hold for Keep/Delete
-                logger.info("episode ready for review (%d frames) — keep [S/F] or delete [D]", len(self._episode))
+                logger.info("episode ready for review (%d frames) — keep [S/F] or delete [D]", self._n_frames)
             else:
                 self._submit(None)
 
@@ -469,7 +743,7 @@ class Recorder:
             episodes_total=self.writer.total_episodes,
                 success_total=self.writer.outcome_totals["success"],
                 fail_total=self.writer.outcome_totals["fail"],
-            frames=len(self._episode),
+            frames=self._n_frames,
             queue=self.writer.queue_depth,
             cam_ok=self.cameras.healthy,
             robot_ok=self.robot.connected,
@@ -481,6 +755,7 @@ class Recorder:
         return {
             "dagger_state": snap.get("dagger_state", "stopped"),
             "policy_running": bool(snap.get("policy_running")),
+            "leader_mirror": bool(snap.get("leader_mirror", True)),
             "intervention": bool(snap.get("intervention")),
             "fine_grained": bool(snap.get("fine_grained")),
             "leader_recentering": bool(snap.get("leader_recentering")),

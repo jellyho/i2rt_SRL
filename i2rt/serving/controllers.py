@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 _HOME_TOL = 0.05  # rad; homing considered done when the ramp is within this of home
 _LEADER_HOME_TOL = 0.1  # rad; the PHYSICAL leader must also be this close (weak home_kp lags)
+# Gripper command units (0 closed .. 1 open). Recorded episodes start at ~0.003, so this is
+# loose enough to accept "already shut" without waiting on the last fraction of travel.
+_GRIP_CLOSED_TOL = 0.02
+_GRIP_CLOSE_TIMEOUT = 4.0  # s; give up waiting and start anyway (loudly)
 
 
 def _side_state(robot: Any, kin: Optional[ArmKinematics] = None) -> Dict[str, list]:
@@ -222,6 +226,7 @@ class BaseController:
     def set_policy_action(self, data: Dict) -> None: ...
     def set_intervention(self, flag: bool) -> None: ...
     def set_policy_running(self, flag: bool) -> None: ...
+    def set_leader_mirror(self, flag: bool) -> None: ...
     def finish_dagger_run(self, action: str) -> None: ...
     def command(self, data: Dict) -> None: ...
     def set_sim_engage(self, flag: bool) -> None: ...
@@ -693,7 +698,7 @@ class TeleopController(BaseController):
 # DAgger
 # ---------------------------------------------------------------------------
 @dataclass
-class DaggerConfig:
+class DeployConfig:
     sim: bool = False
     home: str = ""
     mirror_kp: float = cc.DAGGER_MIRROR_KP
@@ -724,13 +729,41 @@ class DaggerConfig:
     )
 
 
-class DaggerController(BaseController):
-    mode = "dagger"
+class DeployController(BaseController):
+    """A policy drives the followers; a human can take over with a handle button.
 
-    def __init__(self, cfg: DaggerConfig):
+    Used for plain deployment *and* for HG-DAgger — they are the same control loop,
+    differing only in what the workstation does with the run (record it or not) and
+    whether the leader mirrors. Hence "deploy" rather than "dagger".
+    """
+
+    mode = "deploy"
+
+    def __init__(self, cfg: DeployConfig):
         self.cfg = cfg
         self.command_timeout = cfg.command_timeout
         self.mirror_kp = cfg.mirror_kp
+        # Whether the leader physically follows the policy while the policy drives.
+        # Mirroring exists so a takeover starts from the follower's pose (grab the leader
+        # and it is already where the arm is). With it off the leader just hangs free, so
+        # the follower travels — rate-limited — to wherever the leader happens to be when
+        # intervention starts. Launch default comes from mirror_kp; togglable at runtime.
+        self._leader_mirror = cfg.mirror_kp > 0.0
+        # Set while the followers close their grippers at the start of a rollout; the
+        # policy does not drive until it clears (see set_policy_running).
+        self._closing_grip = False
+        self._closing_grip_t0 = 0.0
+        # Set between "finish the run" and the start of the homing travel, while the
+        # grippers open to put down whatever they are holding (see finish_dagger_run).
+        self._releasing_grip = False
+        self._releasing_grip_t0 = 0.0
+        # Latched once the policy has actually driven the followers at least once this
+        # rollout. `policy_running` says the operator asked for a rollout; this says one is
+        # under way. See the snapshot's `policy_driving`.
+        self._policy_drove = False
+        # True once the homing travel is under way, so the closing phase that follows it
+        # knows to go back to idle rather than hand control to the policy.
+        self._closing_at_home = False
         self.feedback_kp = cfg.feedback_kp
         self.home_kp = cfg.home_kp
         self.fine_grained_button = str(cfg.fine_grained_button).lower()
@@ -769,6 +802,13 @@ class DaggerController(BaseController):
         n_arm = n - 1 if self._has_grip else n
         self.home_arm, self.home_grip = self._parse_home(cfg.home, n_arm)
         self.home_full = np.concatenate([self.home_arm, [self.home_grip]]) if self._has_grip else self.home_arm.copy()
+        # The gripper is normalised 0-1 and home_grip is the shut end, so released is the other
+        # end -- derived rather than hard-coded, in case a rig ever homes to a held-open gripper.
+        # The arm travels home on this target and only shuts once it has arrived.
+        self.release_grip = 1.0 if self.home_grip <= 0.5 else 0.0
+        self.home_full_released = (
+            np.concatenate([self.home_arm, [self.release_grip]]) if self._has_grip else self.home_arm.copy()
+        )
         self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
         self._recenter_target = {
             s: np.asarray(p.follower.get_joint_pos(), dtype=float).copy() for s, p in self.pairs.items()
@@ -838,8 +878,12 @@ class DaggerController(BaseController):
                 logger.warning("[%s] bad policy_action: %s", side, e)
         self._touch_cmd()
 
+    def _in_homing_sequence(self) -> bool:
+        """Release -> travel -> close is one routine; nothing may cut into the middle of it."""
+        return bool(self._homing or self._releasing_grip or self._closing_at_home)
+
     def set_intervention(self, flag: bool) -> None:
-        if self._homing:
+        if self._in_homing_sequence():
             return
         flag = bool(flag)
         if flag == self._intervening:
@@ -853,18 +897,89 @@ class DaggerController(BaseController):
                 np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
             )
 
-    def set_policy_running(self, flag: bool) -> None:
-        if self._homing:
-            return
+    def set_leader_mirror(self, flag: bool) -> None:
+        """Turn leader mirroring on/off while the policy drives.
+
+        Off means the leader hangs free instead of tracking the follower — useful when you
+        just want to watch the policy run without the handles moving. The trade-off is on
+        takeover: with mirroring the leader is already at the follower's pose, without it
+        the follower has to travel (rate-limited by the smoother) to meet the leader.
+        """
         flag = bool(flag)
-        if flag and not self._policy_running and not self._intervening:
+        if flag == self._leader_mirror:
+            return
+        self._leader_mirror = flag
+        # Re-seed the mirror limiter from the physical leader so re-enabling mid-rollout
+        # ramps from where the leader actually is rather than a stale target.
+        for side, pair in self.pairs.items():
+            self._leader_smooth[side].reset(
+                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
+            )
+
+    def set_policy_running(self, flag: bool) -> None:
+        if self._in_homing_sequence():
+            return
+        requested = bool(flag)
+        driving = requested  # whether the policy gets control *this call*
+        if requested and not self._policy_running and not self._intervening:
             for side, pair in self.pairs.items():
                 self._leader_smooth[side].reset(
                     np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
                 )
-        self._policy_running = flag
-        if not self._policy_running:
+            # Every recorded episode begins with the gripper shut (it is what the homing
+            # tail leaves behind), so a rollout that starts on an open gripper hands the
+            # policy a first observation it never saw in training. Close it first; step()
+            # flips _policy_running once it is closed.
+            if self._has_grip and self._grip_open():
+                self._closing_grip = True
+                self._closing_grip_t0 = time.monotonic()
+                driving = False
+                # Seed the ramp from where the arm ACTUALLY is. The smoother holds what this
+                # controller last commanded, which is not the same thing after a rollout was
+                # stopped and the arm moved by hand — closing from a stale target would drag
+                # the arm there instead of only shutting the gripper.
+                for side, pair in self.pairs.items():
+                    self._smooth[side].reset(
+                        np.asarray(pair.follower.get_joint_pos(), dtype=float)
+                    )
+                logger.info("closing the gripper before starting the rollout")
+        self._policy_running = driving
+        if requested and not self._policy_running:
+            # Starting: nothing has driven yet. Cleared here as well as on stop so a rollout
+            # deferred behind the gripper close does not inherit the previous one's latch.
+            self._policy_drove = False
+        if not requested:
+            # An actual stop request, not the deferral above, cancels a pending close.
+            self._closing_grip = False
+            self._policy_drove = False
             self.set_intervention(False)
+
+    def _grip_open(self, tol: float = _GRIP_CLOSED_TOL) -> bool:
+        """True if either follower's gripper is meaningfully away from the home value."""
+        for pair in self.pairs.values():
+            try:
+                grip = float(np.asarray(pair.follower.get_joint_pos(), dtype=float)[-1])
+            except Exception:
+                continue
+            if abs(grip - self.home_grip) > tol:
+                return True
+        return False
+
+    def _grip_released(self, tol: float = _GRIP_CLOSED_TOL) -> bool:
+        """True once EVERY follower's gripper has reached the released opening.
+
+        Not the negation of :meth:`_grip_open`, which is true of any opening at all: a
+        half-open gripper can still be holding something, so the release waits for the full
+        travel rather than for "not shut".
+        """
+        for pair in self.pairs.values():
+            try:
+                grip = float(np.asarray(pair.follower.get_joint_pos(), dtype=float)[-1])
+            except Exception:
+                continue
+            if abs(grip - self.release_grip) > tol:
+                return False
+        return True
 
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
@@ -875,12 +990,33 @@ class DaggerController(BaseController):
         self._last_event = {"seq": self._event_seq, "action": action}
         self._policy_running = False
         self._intervening = False
+        self._closing_grip = False
+        self._closing_at_home = False
+        self._policy_drove = False
         self._reset_fine_grained()
+        # Put down whatever is being held BEFORE travelling, so an object is released where
+        # it was worked on rather than dragged across the workspace and dropped at home.
+        # step() starts the homing travel once the grippers are open (or time out).
+        if self._has_grip and not self._grip_released():
+            self._releasing_grip = True
+            self._releasing_grip_t0 = time.monotonic()
+            # Ramp from where the arms ACTUALLY are: the smoother holds the last commanded
+            # target, and opening from a stale one would drag the arm there mid-release.
+            for side, pair in self.pairs.items():
+                self._smooth[side].reset(np.asarray(pair.follower.get_joint_pos(), dtype=float))
+            logger.info("opening the gripper to put down before homing")
+            return
+        self._begin_homing()
+
+    def _begin_homing(self) -> None:
+        self._releasing_grip = False
         self._homing = True
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
             self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
-            self._home_d0[side] = max(float(np.linalg.norm(self._smooth[side].cur - self.home_full)), 1e-6)
+            self._home_d0[side] = max(
+                float(np.linalg.norm(self._smooth[side].cur - self.home_full_released)), 1e-6
+            )
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":
@@ -990,8 +1126,11 @@ class DaggerController(BaseController):
             self._btn_prev[side] = list(btns)
 
     def _homing_done(self) -> bool:
+        # Against the released target, not home_full: the gripper stays open for the whole
+        # travel and only shuts once the arm is home, so comparing to the shut target would
+        # never converge.
         for side in self.pairs:
-            if np.linalg.norm(self._smooth[side].cur - self.home_full) > _HOME_TOL:
+            if np.linalg.norm(self._smooth[side].cur - self.home_full_released) > _HOME_TOL:
                 return False
             if np.linalg.norm(self._leader_smooth[side].cur - self.home_arm) > _HOME_TOL:
                 return False
@@ -1025,11 +1164,19 @@ class DaggerController(BaseController):
                     pair, side, held=self._intervening and not self._leader_recentering
                 )
                 desired = None
-                if self._homing:
-                    d = float(np.linalg.norm(smoother.cur - self.home_full))
+                if self._releasing_grip:
+                    # Hold the arm exactly where it is and move only the gripper, so the
+                    # object is set down at the pose it was grasped in.
+                    meas = np.asarray(pair.follower.get_joint_pos(), dtype=float)
+                    smoother.reset(meas)
+                    smoother.max_step = self._run_step
+                    desired = meas.copy()
+                    desired[-1] = self.release_grip
+                elif self._homing:
+                    d = float(np.linalg.norm(smoother.cur - self.home_full_released))
                     p = min(max(1.0 - d / max(self._home_d0[side], 1e-6), 0.0), 1.0)
                     smoother.max_step = self._leader_smooth[side].max_step = self._home_step * self._ease_vel_scale(p)
-                    desired = smoother.step(self.home_full)
+                    desired = smoother.step(self.home_full_released)
                     self._home_leader(pair, self._leader_smooth[side].step(self.home_arm))
                 elif self._intervening:
                     smoother.max_step = self._run_step
@@ -1064,26 +1211,55 @@ class DaggerController(BaseController):
                             # feedback_kp=0: fully free leader — grav-comp idle with ZERO
                             # damping (grav_comp_kd off), not a stale PD hold from mirroring.
                             self._free_leader(pair)
+                elif self._closing_grip:
+                    # Shut the gripper before the policy gets control, holding the arm where
+                    # it is. Only the last DOF moves, so this cannot swing the arm.
+                    smoother.max_step = self._run_step
+                    desired = smoother.cur.copy()
+                    desired[-1] = self.home_grip
                 elif self._policy_running:
                     smoother.max_step = self._run_step
                     act = self._policy_action[side]
                     # ignore a stale policy action (workstation/link down) -> follower holds
                     if is_finite_vector(act, n) and self._cmd_fresh():
                         desired = act[:n]
+                        self._policy_drove = True
+                elif self._has_grip:
+                    # Stopped. Nothing used to be commanded here at all, so the gripper had
+                    # no holding force and drifted open the moment the server came up — a
+                    # rollout could then only ever start from a pose the data never contains.
+                    # Keep it shut instead, from startup onwards.
+                    #
+                    # The arm is NOT held: the target is re-seeded from the measured position
+                    # every tick, so its PD error stays ~0 and the arm remains as
+                    # back-drivable as before. Only the gripper is given a target away from
+                    # where it is, and the smoother limits how fast it travels there.
+                    meas = np.asarray(pair.follower.get_joint_pos(), dtype=float)
+                    smoother.reset(meas)
+                    smoother.max_step = self._run_step
+                    desired = meas.copy()
+                    desired[-1] = self.home_grip
 
                 if desired is not None:
                     target = desired if self._leader_recentering else smoother.step(desired)
                     applied = self._apply(pair.follower, target)
                     if not self._intervening and self._policy_running and applied is not None:
-                        # Mirror the command sent after follower smoothing/clamping.
-                        # The independent limiter prevents a PD target jump when an
-                        # offset human intervention hands control back to the policy.
-                        leader_smoother = self._leader_smooth[side]
-                        leader_smoother.max_step = self._run_step
-                        mirror_target = leader_smoother.step(
-                            np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
-                        )
-                        self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
+                        if self._leader_mirror:
+                            # Mirror the command sent after follower smoothing/clamping.
+                            # The independent limiter prevents a PD target jump when an
+                            # offset human intervention hands control back to the policy.
+                            leader_smoother = self._leader_smooth[side]
+                            leader_smoother.max_step = self._run_step
+                            mirror_target = leader_smoother.step(
+                                np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
+                            )
+                            self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
+                        else:
+                            # Mirroring off: hold the leader gravity-compensated and FREE.
+                            # Explicitly freeing it matters — simply skipping the drive
+                            # would leave whatever PD gains were last commanded, so the
+                            # leader would keep stiffly holding a stale target.
+                            self._free_leader(pair)
                 else:
                     smoother.reset(pair.follower.get_joint_pos())
 
@@ -1102,8 +1278,56 @@ class DaggerController(BaseController):
 
         self._update_recenter_state(now)
 
+        if self._releasing_grip:
+            if self._grip_released():
+                logger.info("gripper open — homing")
+                self._begin_homing()
+            elif time.monotonic() - self._releasing_grip_t0 > _GRIP_CLOSE_TIMEOUT:
+                # Jammed, or nothing to let go of. Homing still has to happen, so say what
+                # is about to travel rather than stranding the arm mid-workspace.
+                logger.warning(
+                    "gripper did not open within %.0fs — homing anyway, possibly still holding "
+                    "something", _GRIP_CLOSE_TIMEOUT,
+                )
+                self._begin_homing()
+
         if self._homing and self._homing_done():
             self._homing = False
+            # Home is reached with the gripper open; shut it so the next rollout starts from
+            # the closed pose the policy was trained on. Reuses the same closing phase as
+            # rollout start, flagged so it returns to idle instead of handing over control.
+            if self._has_grip and self._grip_open():
+                self._closing_grip = True
+                self._closing_at_home = True
+                self._closing_grip_t0 = time.monotonic()
+                for side, pair in self.pairs.items():
+                    self._smooth[side].reset(np.asarray(pair.follower.get_joint_pos(), dtype=float))
+                logger.info("home reached — closing the gripper")
+
+        if self._closing_grip:
+            if not self._grip_open():
+                self._closing_grip = False
+                if self._closing_at_home:
+                    self._closing_at_home = False
+                    logger.info("gripper closed — ready")
+                else:
+                    self._policy_running = True
+                    logger.info("gripper closed — policy rollout starting")
+            elif self._closing_at_home and time.monotonic() - self._closing_grip_t0 > _GRIP_CLOSE_TIMEOUT:
+                self._closing_grip = False
+                self._closing_at_home = False
+                logger.warning("gripper did not close at home within %.0fs", _GRIP_CLOSE_TIMEOUT)
+            elif time.monotonic() - self._closing_grip_t0 > _GRIP_CLOSE_TIMEOUT:
+                # Something is between the fingers. Start anyway rather than leaving the
+                # operator staring at a button that did nothing, but say so: the policy is
+                # about to see a first observation it was not trained on.
+                self._closing_grip = False
+                self._policy_running = True
+                logger.warning(
+                    "gripper did not close within %.0fs — starting the policy on an OPEN "
+                    "gripper, which is outside its training distribution",
+                    _GRIP_CLOSE_TIMEOUT,
+                )
 
         dagger_state = self._state_name()
         with self._lock:
@@ -1115,7 +1339,16 @@ class DaggerController(BaseController):
                 "leader_recentering": self._leader_recentering,
                 "recenter_fault": self._recenter_fault,
                 "policy_running": bool(self._policy_running),
-                "homing": bool(self._homing),
+                # Whether a rollout is actually UNDER WAY, as opposed to merely requested.
+                # The two differ for as long as the first inference takes -- a JAX compile is
+                # tens of seconds -- during which the arm holds still and no policy action
+                # exists. Recording that stretch labels a stationary arm as policy-driven.
+                # Latched, so a mid-rollout hiccup does not split the episode in two.
+                "policy_driving": bool(self._policy_drove) or bool(self._intervening),
+                "leader_mirror": bool(self._leader_mirror),
+                # Releasing and the closing tail are part of the same homing routine: report
+                # them as homing so nothing starts a rollout or streams actions mid-sequence.
+                "homing": bool(self._homing or self._releasing_grip or self._closing_at_home),
                 "dagger_state": dagger_state,
                 "last_dagger_event": dict(self._last_event) if self._last_event is not None else None,
                 "estop": self._estop,
@@ -1125,10 +1358,14 @@ class DaggerController(BaseController):
     def _state_name(self) -> str:
         if self._estop:
             return "estop"
+        if self._releasing_grip:
+            return "releasing_gripper"
         if self._homing:
             return "homing"
         if self._intervening:
             return "intervention"
+        if self._closing_grip:
+            return "closing_gripper"
         if self._policy_running:
             return "policy"
         return "stopped"
@@ -1297,3 +1534,9 @@ class WrapperController(BaseController):
                 f.close()
             except Exception:
                 pass
+
+
+# Back-compat: this controller was called "dagger" before it was also used for plain
+# deployment. Keep the old names importable so out-of-tree scripts do not break.
+DaggerConfig = DeployConfig
+DaggerController = DeployController

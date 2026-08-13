@@ -18,7 +18,7 @@ import time
 import traceback
 from typing import Dict, Optional
 
-import msgpack_numpy
+from . import msgpack_numpy
 import websockets.asyncio.server
 from websockets.frames import CloseCode
 

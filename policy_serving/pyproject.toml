@@ -10,8 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
+    # msgpack only: array (de)serialization is openpi's encoding, vendored in
+    # yam_policy/msgpack_numpy.py. The pip `msgpack-numpy` package encodes arrays
+    # differently and is NOT wire-compatible with an openpi policy server.
     "msgpack>=1.0.7",
-    "msgpack-numpy>=0.4.8",
     "websockets>=13.0",
     "pillow>=10.0",
 ]
@@ -20,6 +22,9 @@ dependencies = [
 # Install these in the POLICY SERVER env alongside your model deps.
 # openpi itself is installed separately (from its repo), not via PyPI.
 lerobot = ["lerobot>=0.4.0", "torch"]
+# Drawing what a policy predicted onto the frames it predicted from (yam_policy.viz).
+# Separate because a policy SERVER never needs kinematics, and mujoco/mink are not small.
+viz = ["mujoco>=3.0", "mink>=0.0.4"]
 
 [project.scripts]
 yam-serve = "yam_policy.serve:main"

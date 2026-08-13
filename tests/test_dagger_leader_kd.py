@@ -109,7 +109,7 @@ def _make_dagger(monkeypatch, feedback_kp: float, leader_kd: np.ndarray = None):
     pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
                        base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
-    dc = ctl.DaggerController(ctl.DaggerConfig(feedback_kp=feedback_kp))
+    dc = ctl.DeployController(ctl.DeployConfig(feedback_kp=feedback_kp))
     return dc, leader, follower
 
 
@@ -259,3 +259,202 @@ def test_enter_gravity_comp_idle_kd_override():
     assert np.allclose(r._commands.kd, GRAV_COMP_KD)  # default: configured damping
     r.enter_gravity_comp_idle(kd=np.zeros(6))
     assert np.allclose(r._commands.kd, np.zeros(6))  # per-call override
+
+
+# ------------------------------------------------------- leader mirroring on/off
+def test_mirroring_off_frees_the_leader_instead_of_driving_it(monkeypatch):
+    """Mirroring off must FREE the leader, not merely skip the drive.
+
+    Skipping alone would leave whatever PD gains were last commanded, so the handles
+    would keep stiffly holding a stale target — worse than mirroring."""
+    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc.set_policy_running(True)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    assert leader.cmd_calls, "sanity: mirroring on should command the leader"
+
+    dc.set_leader_mirror(False)
+    n_cmds, n_idle = len(leader.cmd_calls), len(leader.idle_calls)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    assert len(leader.cmd_calls) == n_cmds  # no new PD target
+    assert len(leader.idle_calls) > n_idle  # explicitly freed instead
+
+
+def test_mirroring_can_be_turned_back_on_mid_rollout(monkeypatch):
+    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc.set_policy_running(True)
+    dc.set_leader_mirror(False)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    n_cmds = len(leader.cmd_calls)
+
+    dc.set_leader_mirror(True)
+    dc.set_policy_action({"left": np.zeros(7)})
+    dc.step()
+    assert len(leader.cmd_calls) > n_cmds  # driving the leader again
+    kp, _ = leader.kp_kd_calls[-1]
+    assert np.allclose(kp, np.full(6, 10.0) * dc.mirror_kp)
+
+
+def test_mirror_state_defaults_from_mirror_kp_and_is_reported(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    assert dc._leader_mirror is True  # default mirror_kp > 0
+    dc.step()
+    assert dc.snapshot()["leader_mirror"] is True
+    dc.set_leader_mirror(False)
+    dc.step()
+    assert dc.snapshot()["leader_mirror"] is False
+
+    # launching with --mirror-kp 0 means "do not mirror" rather than a silent no-op
+    _set_free_feel(monkeypatch)
+    leader, follower = StubLeader(), StubFollower()
+    pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
+                       base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    assert ctl.DeployController(ctl.DeployConfig(mirror_kp=0.0))._leader_mirror is False
+
+
+# --------------------------------------------------- gripper closed before a rollout
+def _stateful(dc, gripper=0.6):
+    """Make the stub followers remember what they were commanded.
+
+    The default StubFollower always reports zeros, i.e. a gripper that is already shut --
+    which would make every assertion below pass for the wrong reason.
+    """
+    for pair in dc.pairs.values():
+        f = pair.follower
+        f._q = np.zeros(f.n)
+        f._q[-1] = gripper
+        f.get_joint_pos = lambda _f=f: _f._q.copy()
+
+        def _cmd(pos, _f=f):
+            arr = np.asarray(pos, dtype=float)
+            _f.cmds.append(arr.copy())  # keep the recording the real stub does
+            _f._q[:] = arr
+
+        f.command_joint_pos = _cmd
+    return dc
+
+
+def test_rollout_waits_for_the_gripper_to_close(monkeypatch):
+    """Every recorded episode starts with the gripper shut, so a rollout that begins on an
+    open one hands the policy a first observation it never saw in training."""
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+
+    dc.set_policy_running(True)
+    assert dc._closing_grip is True
+    assert dc._policy_running is False, "the policy must not drive until the gripper is shut"
+
+    for _ in range(500):
+        dc.step()
+        if not dc._closing_grip:
+            break
+    assert dc._closing_grip is False
+    assert dc._policy_running is True
+    for pair in dc.pairs.values():
+        assert abs(float(pair.follower.get_joint_pos()[-1]) - dc.home_grip) < 0.05
+
+
+def test_already_closed_gripper_starts_immediately(monkeypatch):
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.0)
+    dc.set_policy_running(True)
+    assert dc._closing_grip is False
+    assert dc._policy_running is True
+
+
+def test_closing_only_moves_the_gripper(monkeypatch):
+    """The arm must not swing while the gripper shuts."""
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    for pair in dc.pairs.values():  # put the arm somewhere non-zero
+        pair.follower._q[:-1] = np.linspace(0.1, 0.6, pair.follower.n - 1)
+    before = {s: p.follower.get_joint_pos()[:-1].copy() for s, p in dc.pairs.items()}
+
+    dc.set_policy_running(True)
+    for _ in range(500):
+        dc.step()
+        if not dc._closing_grip:
+            break
+    for side, pair in dc.pairs.items():
+        np.testing.assert_allclose(pair.follower.get_joint_pos()[:-1], before[side], atol=1e-6)
+
+
+def test_reported_state_says_it_is_closing(monkeypatch):
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    dc.set_policy_running(True)
+    dc.step()
+    assert dc.snapshot()["dagger_state"] == "closing_gripper"
+
+
+def test_stop_cancels_a_pending_close(monkeypatch):
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    dc.set_policy_running(True)
+    assert dc._closing_grip is True
+    dc.set_policy_running(False)
+    assert dc._closing_grip is False
+    assert dc._policy_running is False
+
+
+def test_blocked_gripper_starts_anyway_after_the_timeout(monkeypatch):
+    """A gripper on an object never reaches home; refusing to start would leave the
+    operator pressing a button that does nothing."""
+    from i2rt.serving import controllers as ctl
+
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.6)
+    dc.set_policy_running(True)
+    assert dc._closing_grip is True
+
+    monkeypatch.setattr(ctl, "_GRIP_CLOSE_TIMEOUT", 0.0)
+    for pair in dc.pairs.values():  # gripper physically cannot move
+        pair.follower.command_joint_pos = lambda pos, _f=pair.follower: None
+    dc.step()
+    assert dc._closing_grip is False
+    assert dc._policy_running is True
+
+
+def test_gripper_is_held_closed_from_startup(monkeypatch):
+    """The reported bug: `robot/yam deploy` came up and the gripper drifted open, because
+    the stopped state commanded nothing at all. It must close on its own, before any
+    rollout is requested."""
+    dc, _, follower = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.7)
+
+    for _ in range(500):  # just idle -- no set_policy_running anywhere
+        dc.step()
+    for pair in dc.pairs.values():
+        assert abs(float(pair.follower.get_joint_pos()[-1]) - dc.home_grip) < 0.05
+    assert dc._policy_running is False, "idling must not start a rollout"
+
+
+def test_idle_hold_does_not_stiffen_the_arm(monkeypatch):
+    """Only the gripper gets a target away from where it is; the arm's command tracks its
+    measured position, so it stays as back-drivable as it was when nothing was commanded."""
+    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    _stateful(dc, gripper=0.7)
+    for pair in dc.pairs.values():
+        pair.follower._q[:-1] = np.linspace(0.1, 0.6, pair.follower.n - 1)
+
+    for _ in range(50):
+        dc.step()
+    for pair in dc.pairs.values():
+        cmd = pair.follower.cmds[-1] if pair.follower.cmds else None
+        meas = pair.follower.get_joint_pos()
+        assert cmd is not None
+        np.testing.assert_allclose(cmd[:-1], meas[:-1], atol=1e-6)  # arm: zero PD error
+
+    # and if the operator moves the arm by hand, the command follows rather than fighting
+    for pair in dc.pairs.values():
+        pair.follower._q[:-1] += 0.3
+    dc.step()
+    for pair in dc.pairs.values():
+        np.testing.assert_allclose(
+            pair.follower.cmds[-1][:-1], pair.follower.get_joint_pos()[:-1], atol=1e-6
+        )
