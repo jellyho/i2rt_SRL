@@ -275,7 +275,12 @@ class Recorder:
                 self._pending = True
             else:
                 self._submit(self._btn_outcome)
-            self._set(armed=False, recording=False, pending=self._pending, queue=self.writer.queue_depth)
+            self._set(
+                armed=False,
+                recording=False,
+                pending=self._pending,
+                queue=self.writer.queue_depth if self.writer is not None else 0,
+            )
             return
         if self._pending:
             self._discard_episode()
@@ -669,12 +674,15 @@ class Recorder:
                 recording=self.gate.armed and not recording_paused,
                 pending=self._pending,
                 teleop=snap["teleop_state"],
-                episodes=self.writer.num_episodes,
-                episodes_total=self.writer.total_episodes,
-                success_total=self.writer.outcome_totals["success"],
-                fail_total=self.writer.outcome_totals["fail"],
+                # self.writer is opened lazily on the first appended frame (see
+                # _ensure_writer_open); it is still None on the ticks before that,
+                # e.g. while cameras/state are not yet healthy right after arming.
+                episodes=self.writer.num_episodes if self.writer is not None else 0,
+                episodes_total=self.writer.total_episodes if self.writer is not None else 0,
+                success_total=self.writer.outcome_totals["success"] if self.writer is not None else 0,
+                fail_total=self.writer.outcome_totals["fail"] if self.writer is not None else 0,
                 frames=self._n_frames,
-                queue=self.writer.queue_depth,
+                queue=self.writer.queue_depth if self.writer is not None else 0,
                 cam_ok=self.cameras.healthy,
                 robot_ok=self.robot.connected,
                 **self._dagger_status(snap),
@@ -739,12 +747,15 @@ class Recorder:
             recording=self.gate.recording and not recording_paused,
             pending=self._pending,
             teleop=snap["teleop_state"],
-            episodes=self.writer.num_episodes,
-            episodes_total=self.writer.total_episodes,
-                success_total=self.writer.outcome_totals["success"],
-                fail_total=self.writer.outcome_totals["fail"],
+            # self.writer is opened lazily on the first appended frame (see
+            # _ensure_writer_open); it is still None before that, e.g. before the
+            # first EV_START or before cameras/state are healthy.
+            episodes=self.writer.num_episodes if self.writer is not None else 0,
+            episodes_total=self.writer.total_episodes if self.writer is not None else 0,
+            success_total=self.writer.outcome_totals["success"] if self.writer is not None else 0,
+            fail_total=self.writer.outcome_totals["fail"] if self.writer is not None else 0,
             frames=self._n_frames,
-            queue=self.writer.queue_depth,
+            queue=self.writer.queue_depth if self.writer is not None else 0,
             cam_ok=self.cameras.healthy,
             robot_ok=self.robot.connected,
             **self._dagger_status(snap),
