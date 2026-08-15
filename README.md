@@ -313,7 +313,7 @@ takeovers ramp smoothly.
 | Subsystem | Path | What it is |
 |-----------|------|------------|
 | Robot serving (portal) | [`i2rt/serving/`](i2rt/serving/README.md) | teleop / DAgger / wrapper servers + `RobotClient`; snapshot contract; safety (e-stop, joint/effort limits, link-loss watchdog), EEF FK + safe resolved-rate OSC |
-| Policy serving (websocket) | [`policy_serving/`](policy_serving/README.md) | openpi-compatible `WebsocketPolicyServer`/`Client` + `serve.py` + policy templates |
+| Policy serving (websocket) | [`policy_serving/`](policy_serving/README.md) | openpi-compatible `WebsocketPolicyServer`/`Client` + `serve.py`; deploys **openpi and LeRobot checkpoints** through the same client |
 | Workstation tools | [`workstation/lerobot_recorder/`](workstation/lerobot_recorder/README.md) | LeRobot recorder (teleop/dagger/eval), replay+overlay, policy bridge; modern themed GUI with status banner, health, live stats, audio cues, success/fail/discard labeling |
 
 Quick CLIs (workstation): `workstation/yam-data {record\|replay\|bridge\|cams\|tune\|doctor}`.

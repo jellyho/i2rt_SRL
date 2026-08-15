@@ -128,7 +128,7 @@ class DeployGUI(RecorderGUI):
 
     @property
     def run_mode(self) -> str:
-        """"deploy" (watch) or "dagger" (correct) — the axis that decides mirroring."""
+        """ "deploy" (watch) or "dagger" (correct) — the axis that decides mirroring."""
         return self.mode_combo.currentText()
 
     def _sync_run_mode(self) -> None:
@@ -148,8 +148,14 @@ class DeployGUI(RecorderGUI):
         # to the robot, so switching mode mid-session re-applies it there too.
         self.mirror_check.setChecked(self.MIRROR_BY_MODE[mode])
 
-        for widget in (self.repo_combo, self.root_edit, self.resume_check, self.rl_check,
-                       self.reward_combo, self.discount_spin):
+        for widget in (
+            self.repo_combo,
+            self.root_edit,
+            self.resume_check,
+            self.rl_check,
+            self.reward_combo,
+            self.discount_spin,
+        ):
             self._set_form_row_visible(widget, recording)
         self.review_box.setVisible(recording and self.cfg.review_before_save)
         self.collect_btn.setVisible(recording)
@@ -157,25 +163,30 @@ class DeployGUI(RecorderGUI):
         self.keep_home_btn.setVisible(per_rollout_verdict)
         self.discard_home_btn.setText("Discard + Home" if per_rollout_verdict else "Stop + Home")
         self.dagger_box.setTitle(
-            {"deploy": "Policy rollout (not recording)",
-             "eval": "Policy rollout (logging to the dataset)",
-             "dagger": "DAgger rollout"}[source]
+            {
+                "deploy": "Policy rollout (not recording)",
+                "eval": "Policy rollout (logging to the dataset)",
+                "dagger": "DAgger rollout",
+            }[source]
         )
         self.hint.setText(
-            {"deploy": "policy start/stop and human intervention can use the UI or the handle "
-                       "buttons · NOTHING is recorded in this mode",
-             "eval": "Start collection begins ONE episode; Stop collection ends it · "
-                     "policy/intervention can use the UI or the handle buttons",
-             "dagger": "space toggles collection · policy/intervention/keep/discard can use UI "
-                       "or handle buttons"}[source]
+            {
+                "deploy": "policy start/stop and human intervention can use the UI or the handle "
+                "buttons · NOTHING is recorded in this mode",
+                "eval": "Start collection begins ONE episode; Stop collection ends it · "
+                "policy/intervention can use the UI or the handle buttons",
+                "dagger": "space toggles collection · policy/intervention/keep/discard can use UI or handle buttons",
+            }[source]
         )
         self.button_legend.setText(
             "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during "
             "intervention; left lower = human intervention on/off, "
-            + ("right upper = discard + home, right lower = keep + home."
-               if per_rollout_verdict else
-               "right upper or lower = stop the rollout and home."
-               + ("" if recording else " Nothing is recorded."))
+            + (
+                "right upper = discard + home, right lower = keep + home."
+                if per_rollout_verdict
+                else "right upper or lower = stop the rollout and home."
+                + ("" if recording else " Nothing is recorded.")
+            )
         )
 
     def _on_mirror_toggled(self, flag: bool) -> None:
@@ -270,7 +281,8 @@ class DeployGUI(RecorderGUI):
             # Whatever per-step data the policy declares at handshake becomes dataset columns.
             # Wired before the first frame, which is when the dataset schema is fixed.
             self.runner.on_connected = lambda: self.recorder.set_extra_features(
-                self.runner.extra_features(), self.runner.get_extras)
+                self.runner.extra_features(), self.runner.get_extras
+            )
             self.runner.start()
 
     @property
@@ -348,8 +360,7 @@ class DeployGUI(RecorderGUI):
             # The base strip is all about the dataset writer (workers, saved, queue), none
             # of which exists here — build a link-oriented one instead.
             self.health.setText(
-                f"{theme.dot(bool(st.get('robot_ok')))} robot &nbsp;&nbsp; "
-                f"{theme.dot(bool(st.get('cam_ok')))} cameras"
+                f"{theme.dot(bool(st.get('robot_ok')))} robot &nbsp;&nbsp; {theme.dot(bool(st.get('cam_ok')))} cameras"
             )
         else:
             super()._update_health(st)
@@ -357,7 +368,14 @@ class DeployGUI(RecorderGUI):
         pol = theme.dot(bool(runner.get("policy_connected")))
         stream = "streaming" if runner.get("streaming") else "idle"
         err = runner.get("last_error") or ""
+        # Name what answered on the policy port. openpi, ACRFT and a LeRobot checkpoint all speak
+        # this wire but read different observations, and the wrong one still streams a chunk of
+        # the right shape -- so "policy idle" alone cannot tell an operator they are about to run
+        # a rollout against the wrong server.
+        who = runner.get("policy_name") or ""
         extra = f" &nbsp;&nbsp; {pol} policy {stream}"
+        if who:
+            extra += f' <span style="color:{theme.MUTED};">· {who}</span>'
         if err:
             extra += f' <span style="color:{theme.WARN};">({err})</span>'
         self.health.setText(self.health.text() + extra)

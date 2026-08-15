@@ -50,6 +50,28 @@ def load_policy(spec: str, config: Dict[str, Any]) -> BasePolicy:
     return cls(**config)
 
 
+def build_metadata(policy: BasePolicy, spec: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the client learns before it sends its first observation.
+
+    Two separate jobs. **Self-configuration**: `action_horizon` and the policy's `obs_spec`
+    (image keys, image size) let one client drive any checkpoint without being hand-matched to it.
+    **Identification**: `framework` (plus whatever the policy adds through `policy_info`) says
+    which stack is behind the port. openpi, its ACRFT fork and a LeRobot checkpoint all speak this
+    wire and none of them reads the others' observations, yet all three return a well-formed chunk
+    — so the handshake is the only place the mix-up can surface.
+    """
+    metadata: Dict[str, Any] = {"policy": spec, "config": {k: str(v) for k, v in config.items()}}
+    if hasattr(policy, "action_horizon"):
+        metadata["action_horizon"] = int(policy.action_horizon)
+    if isinstance(getattr(policy, "obs_spec", None), dict):
+        metadata.update(policy.obs_spec)
+    metadata.setdefault("framework", "yam-policy")
+    # A policy that knows its own provenance overrides the generic label with it.
+    if isinstance(getattr(policy, "policy_info", None), dict):
+        metadata.update(policy.policy_info)
+    return metadata
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = argparse.ArgumentParser(description="Serve a policy over websocket (openpi-compatible).")
@@ -63,13 +85,8 @@ def main() -> None:
     logging.info("Loading policy %s with config %s", args.policy, config)
     policy = load_policy(args.policy, config)
 
-    # Advertise the obs/action spec so the bridge can self-configure (action_horizon,
-    # image keys/size). A policy declares these via attributes / an `obs_spec` dict.
-    metadata = {"policy": args.policy, "config": {k: str(v) for k, v in config.items()}}
-    if hasattr(policy, "action_horizon"):
-        metadata["action_horizon"] = int(policy.action_horizon)
-    if isinstance(getattr(policy, "obs_spec", None), dict):
-        metadata.update(policy.obs_spec)
+    metadata = build_metadata(policy, args.policy, config)
+    logging.info("Serving: %s", metadata)
 
     server = WebsocketPolicyServer(policy, host=args.host, port=args.port, metadata=metadata)
     server.serve_forever()

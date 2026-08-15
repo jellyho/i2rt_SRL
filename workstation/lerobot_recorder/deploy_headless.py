@@ -71,15 +71,17 @@ def run_headless(
         runner = DeploymentPolicyRunner(bridge_cfg, recorder_cfg, recorder.get_last_images)
         # Whatever per-step data the policy declares at handshake becomes dataset columns.
         # Wired before the first frame, which is when the dataset schema is fixed.
-        runner.on_connected = lambda: recorder.set_extra_features(
-            runner.extra_features(), runner.get_extras)
+        runner.on_connected = lambda: recorder.set_extra_features(runner.extra_features(), runner.get_extras)
         runner.start()
         recorder.set_leader_mirror(mirror)
         logger.info(
             "headless deploy up: robot=%s:%d policy=%s:%d source=%s leader=%s",
-            bridge_cfg.robot_host, bridge_cfg.robot_port,
-            bridge_cfg.policy_host, bridge_cfg.policy_port,
-            recorder_cfg.record_source, "mirroring" if mirror else "free",
+            bridge_cfg.robot_host,
+            bridge_cfg.robot_port,
+            bridge_cfg.policy_host,
+            bridge_cfg.policy_port,
+            recorder_cfg.record_source,
+            "mirroring" if mirror else "free",
         )
         if recording:
             recorder.arm()  # eval/dagger: open the gate so rollouts are captured
@@ -98,12 +100,17 @@ def run_headless(
                 st = recorder.get_status()
                 rs = runner.get_status()
                 logger.info(
-                    "state=%s policy=%s%s robot=%s cameras=%s%s",
+                    "state=%s policy=%s%s%s robot=%s cameras=%s%s",
                     st.get("dagger_state", "?"),
                     # "idle" alone cannot tell connected-but-not-running from unreachable,
                     # which is the one thing you check before starting a rollout.
-                    "streaming" if rs.get("streaming")
+                    "streaming"
+                    if rs.get("streaming")
                     else ("connected/idle" if rs.get("policy_connected") else "NOT CONNECTED"),
+                    # ...and being connected says nothing about WHICH stack answered: openpi,
+                    # ACRFT and a LeRobot checkpoint all serve this wire and read different
+                    # observations, while all three reply with a well-formed chunk.
+                    f" [{rs['policy_name']}]" if rs.get("policy_name") else "",
                     " (intervention)" if st.get("intervention") else "",
                     "up" if st.get("robot_ok") else "DOWN",
                     "ok" if st.get("cam_ok") else "FAULT",
