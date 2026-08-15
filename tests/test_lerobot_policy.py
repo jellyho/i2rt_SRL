@@ -300,6 +300,31 @@ def test_the_deploy_client_feeds_a_lerobot_policy_with_no_conversion(policy):
     actions = policy.infer(obs)["actions"]
     assert actions.shape == (CHUNK, ACTION_DIM)
 
+    # Every non-image column this recorder writes, because LeRobot's trainer takes all of them
+    # as policy inputs -- a checkpoint asking for one the client never sends cannot be deployed
+    # at all, and this was found by training on real data rather than by reading the code.
+    for column in ("observation.state", "observation.leader", "observation.eef", "observation.control_mode"):
+        assert column in obs or column.replace(".", "/", 1) in obs, column
+
+
+def test_a_checkpoint_that_reads_the_leader_is_flagged_at_load(caplog):
+    """`observation.leader` is the teleop command itself, so a policy given it can copy the
+    answer -- and nothing downstream can tell: the loss is excellent for that very reason. Load
+    time is the last cheap moment to say so."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        LeRobotPolicy._warn_about_leaking_inputs({"observation.state": 1, "observation.leader": 1})
+    assert any("observation.leader" in r.getMessage() for r in caplog.records)
+
+
+def test_an_ordinary_checkpoint_is_not_warned_about(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        LeRobotPolicy._warn_about_leaking_inputs({"observation.state": 1, "observation.eef": 1})
+    assert not caplog.records
+
 
 def test_torch_is_not_left_in_training_mode(policy):
     """Dropout at deploy time would make the robot's actions non-deterministic."""

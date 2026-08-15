@@ -113,8 +113,37 @@ class LeRobotPolicy(BasePolicy):
             [k for k in self._input_features if k not in self._image_features],
             self.action_horizon,
         )
+        self._warn_about_leaking_inputs(self._input_features)
+
+    #: Columns this recorder writes that must not be policy inputs, and why.
+    LEAKING_INPUTS = {
+        "observation.leader": (
+            "the teleop leader pose, which in a teleop dataset IS the action "
+            "(measured at 2e-4 rad apart) -- a policy given this input can copy the answer, "
+            "and at deploy the leader is either hanging free or mirroring the follower"
+        ),
+        "observation.control_mode": (
+            "a provenance label, constant within a teleop dataset -- it teaches nothing and "
+            "takes a different value during deployment"
+        ),
+    }
 
     # ------------------------------------------------------------------ setup
+    @classmethod
+    def _warn_about_leaking_inputs(cls, input_features: Dict) -> None:
+        """Say so when the checkpoint reads something it should not have been trained on.
+
+        LeRobot's trainer takes EVERY column in the dataset as an input feature, and this
+        recorder writes more than the policy-relevant ones. Nothing downstream can detect the
+        result: training loss is excellent precisely because the answer was an input, and the
+        deployed policy then behaves badly for no visible reason. The one moment it is cheap to
+        notice is when the checkpoint is loaded, so it is said here rather than left to be
+        inferred from a bad rollout.
+        """
+        for key, why in cls.LEAKING_INPUTS.items():
+            if key in input_features:
+                logger.warning("this checkpoint reads %s -- %s. See policy_serving/README.md.", key, why)
+
     @staticmethod
     def _resolve_device(device: str) -> str:
         import torch

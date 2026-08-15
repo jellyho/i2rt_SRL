@@ -103,6 +103,38 @@ driving from a black frame and reporting nothing wrong.
 closed-loop LeRobot rollout consumes before replanning — this stack replans on its own schedule.
 Use `--config actions_per_chunk=N` to serve less.
 
+### Before training: drop `observation.leader`
+
+**LeRobot's trainer takes every column in the dataset as a policy input**, and this recorder
+writes more columns than a policy should see. On a teleop dataset the leader pose *is* the action
+— measured at **2e-4 rad** apart on `yam_cable_tie_v4` — so a policy handed `observation.leader`
+can copy the answer straight out of its input. Training loss looks excellent for exactly that
+reason, and the checkpoint is useless at deploy, where the leader is either hanging free or
+mirroring the follower. `observation.control_mode` is worth dropping too: it is constant within a
+teleop dataset, so it teaches nothing.
+
+Name the inputs you want in the training config. The dataset is not touched — LeRobot only infers
+features when `input_features` is empty (`policies/factory.py`: `if not cfg.input_features`), so
+setting it wins:
+
+```bash
+lerobot-train ... --tolerance_s=1e-3 \
+    --policy.input_features='{
+        "observation.state":               {"type": "STATE",  "shape": [42]},
+        "observation.images.wrist_left":   {"type": "VISUAL", "shape": [3, 480, 640]},
+        "observation.images.wrist_right":  {"type": "VISUAL", "shape": [3, 480, 640]},
+        "observation.images.agentview":    {"type": "VISUAL", "shape": [3, 480, 640]}}'
+```
+
+List every input you *do* want — this replaces the inferred set rather than subtracting from it.
+`output_features` is always derived from the dataset, so `action` needs no mention. Add
+`observation.eef` if you want it; it is a real signal and available at deploy.
+
+The server warns at load if a checkpoint reads a leaking column, since nothing later can: such a
+policy trains beautifully and simply behaves badly on the robot. The deploy client does send all
+of these columns, so an already-trained checkpoint still runs — it just runs with a leader signal
+that no longer means what it meant during collection.
+
 The inference path deliberately mirrors LeRobot's own `async_inference.policy_server`, whose two
 easy mistakes are silent: the pre/post processors need an explicit device override or the batch
 stays on the CPU while the model sits on the GPU, and the postprocessor unnormalises one
