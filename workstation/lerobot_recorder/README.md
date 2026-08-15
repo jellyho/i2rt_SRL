@@ -91,6 +91,23 @@ Recorded at **60 fps** (matched to the cameras). Uses the official v3.0 API
 (`create` / `add_frame` with a `task` key / `save_episode` / `clear_episode_buffer`
 / **`finalize`**); the version-sensitive calls live in `dataset_writer.py`.
 
+### Training on one of these: pass `--tolerance_s=1e-3`
+
+```bash
+lerobot-train --dataset.root=~/lerobot_data/<name> ... --tolerance_s=1e-3
+```
+
+Without it, training dies partway through with `FrameTimestampError: One or several query
+timestamps unexpectedly violate the tolerance (tensor([0.0001]) > tolerance_s=0.0001)`.
+
+Nothing is wrong with the dataset, and re-recording will not help — it is arithmetic. v3.0
+timestamps are `float32` and v3.0 packs many episodes into one mp4, so the file-relative query
+time climbs into the hundreds of seconds. Past **t = 1024 s** the gap between adjacent `float32`
+values is 1.22e-4 s, which is already larger than the 1e-4 default tolerance: no frame can satisfy
+it, however well the data was collected. Any sufficiently long v3.0 dataset hits this.
+
+`1e-3` is still 3% of a frame at 30 fps, so it rejects a genuinely wrong frame just as well.
+
 ---
 
 # One-time setup
