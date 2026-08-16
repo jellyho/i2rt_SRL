@@ -272,10 +272,18 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.pair_label.setStyleSheet(f"color:{theme.MUTED};")
         root.addWidget(self.pair_label)
 
-        self.result_label = QtWidgets.QLabel("not solved yet")
-        self.result_label.setStyleSheet("font-size:16px;")
-        self.result_label.setWordWrap(True)
-        root.addWidget(self.result_label)
+        # Read-only scrolling log, not a QLabel: the solve report grows past a screenful
+        # (per-arm wrist + shared + vs-CAD + per-arm agentview + offset + unified), and a
+        # QLabel just clips it with no way to scroll. Monospace so the aligned columns
+        # (RMS / vs CAD / spread) line up.
+        self.result_label = QtWidgets.QPlainTextEdit("not solved yet")
+        self.result_label.setReadOnly(True)
+        self.result_label.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.result_label.setMinimumHeight(180)
+        mono = QtGui.QFont("monospace", 12)
+        mono.setStyleHint(QtGui.QFont.Monospace)
+        self.result_label.setFont(mono)
+        root.addWidget(self.result_label, 1)
 
         # What the last successful _solve_and_report found -- what _on_save actually writes.
         self._last_wrist: Dict[str, WristExtrinsicResult] = {}  # per-arm independent hand-eye
@@ -503,7 +511,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(
                     self, "Not enough captures", f"Need at least 2 captures for some arm; have {counts}."
                 )
-            self.result_label.setText("not solved yet -- capture at least 2 per arm")
+            self.result_label.setPlainText("not solved yet -- capture at least 2 per arm")
             self.save_btn.setEnabled(False)
             return
 
@@ -610,7 +618,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 f"{unified.cross_check_rotation_deg:.3f} deg"
             )
 
-        self.result_label.setText("\n".join(lines) if lines else "not solved yet")
+        self.result_label.setPlainText("\n".join(lines) if lines else "not solved yet")
 
         self._last_wrist = wrist
         self._last_results = results
