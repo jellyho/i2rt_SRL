@@ -15,11 +15,15 @@ so this needs neither an ACRFT checkout nor matplotlib -- just PIL, which the re
 depends on. If a critic-scored dashboard is ever wanted here too, that is a reason to import the
 real ``hud.Dashboard`` for THAT case, not to route this one through it.
 
-What it needs on disk: a LeRobot dataset recorded with ``yam-data deploy --num-samples N``
-against an ACRFT server started with ``serve_policy.py --num-samples N`` (the SAME N on both
-sides -- the dataset schema is fixed at handshake, see ``MultiSamplePolicy.extra_features``).
-That gives every recorded frame an ``action_samples`` column: one ``[N, 14]`` two-arm
-candidate-action snapshot per control tick, candidate 0 always the one actually executed.
+Two sources of the overlaid path, ``--source``:
+  * ``samples`` (default): the multi-candidate deploy FAN. Needs a LeRobot dataset recorded with
+    ``yam-data deploy --num-samples N`` against an ACRFT server started with
+    ``serve_policy.py --num-samples N`` (the SAME N on both sides -- schema fixed at handshake,
+    see ``MultiSamplePolicy.extra_features``): every frame carries an ``action_samples`` column,
+    one ``[N, 14]`` candidate-action snapshot per tick, candidate 0 the one actually executed.
+  * ``action``: the ONE executed trajectory from the plain ``action`` column, drawn as a single
+    path (no fan). This works on ANY LeRobot recording -- teleop, demo, replay -- so you can see
+    what the robot did in a dataset without a multi-sample deploy. No ``--candidates`` needed.
 
 What it does:
   1. Groups an episode's ticks into replans of ``--horizon`` consecutive frames -- the chunk
@@ -43,6 +47,10 @@ What it does:
     workstation/yam-data render-samples \\
         --repo-id my_deploy_run --episode 0 --arm left --horizon 30 --candidates 8 \\
         --out .scratch/deploy_samples.mp4
+    # any dataset, executed trajectory only (no action_samples needed):
+    workstation/yam-data render-samples \\
+        --repo-id my_demo --episode 0 --arm left --source action --horizon 16 \\
+        --out .scratch/executed_path.mp4
 
 The WRIST intrinsics default to the same placeholder ``tests/test_wrist_view.py`` uses ("roughly
 a D405 at 640x480"); the AGENTVIEW ones to a rough D455 placeholder (``--agent-fx`` etc). The
@@ -93,6 +101,21 @@ def _load_replan_chunk(
             return None
         steps.append(snap)
     return np.stack(steps, axis=1)  # [N, H, 14]
+
+
+def _load_action_chunk(reader: "DatasetReader", episode: int, start: int, horizon: int) -> Optional[np.ndarray]:
+    """[1, H, 14] from the plain ``action`` column -- the ONE executed trajectory over the next H
+    ticks, shaped as a single-candidate chunk so it flows through the same project/draw path.
+
+    This is what makes the overlay work on ANY LeRobot recording (teleop, demo, replay), not just a
+    multi-sample deploy: there is no fan, just the path the robot actually took from ``start``."""
+    steps = []
+    for k in range(horizon):
+        a = reader.get_action(episode, start + k)
+        if a is None:
+            return None
+        steps.append(np.asarray(a, dtype=float).reshape(-1))
+    return np.stack(steps)[None]  # [1, H, 14]
 
 
 def _project_fixed(points_base: np.ndarray, cam_t_base: np.ndarray, intr: "CameraIntrinsics") -> np.ndarray:
@@ -339,12 +362,21 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     if not starts:
         raise SystemExit(f"episode has {n_frames} frames, shorter than --horizon {args.horizon}")
 
+    # "samples" = the multi-candidate deploy fan (action_samples column); "action" = the single
+    # executed trajectory from the plain action column, so it works on ANY LeRobot recording.
+    fan_word = "fan" if args.source == "samples" else "path"
+
     frames = []
     step = 0
     for replan_idx, start in enumerate(starts[: args.replans] if args.replans else starts):
-        chunk = _load_replan_chunk(reader, args.episode, start, args.horizon, args.candidates)
+        if args.source == "samples":
+            chunk = _load_replan_chunk(reader, args.episode, start, args.horizon, args.candidates)
+            missing = "no action_samples recorded here"
+        else:
+            chunk = _load_action_chunk(reader, args.episode, start, args.horizon)
+            missing = "no action column here"
         if chunk is None:
-            print(f"replan at frame {start}: no action_samples recorded here, skipping", file=sys.stderr)
+            print(f"replan at frame {start}: {missing}, skipping", file=sys.stderr)
             continue
         state = reader.get_state(args.episode, start)
         if state is None:
@@ -372,7 +404,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             agent_sq = _draw_fan(agent_sq, av_paths, chosen=0, colors=_FAN_COLORS.get(arm, _FAN_COLORS["left"]))
         wrist_fan = _draw_fan(_to_square(wrist, camera_size), paths, chosen=0, colors=_FAN_COLORS[args.arm])
         agent_label = (
-            f"agentview -- {'+'.join(agent_extrinsics)} fan" if agent_extrinsics else "agentview (no extrinsic)"
+            f"agentview -- {'+'.join(agent_extrinsics)} {fan_word}" if agent_extrinsics else "agentview (no extrinsic)"
         )
         composed = _compose_frame(
             agent_sq,
@@ -381,7 +413,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             step,
             camera_size,
             agent_label=agent_label,
-            wrist_label=f"wrist {args.arm} -- candidate fan",
+            wrist_label=f"wrist {args.arm} -- candidate {fan_word}",
         )
 
         for _ in range(max(1, args.hold)):
@@ -389,7 +421,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             step += 1
 
     if not frames:
-        raise SystemExit("nothing to render -- no replan had both action_samples and images")
+        raise SystemExit("nothing to render -- no replan had both action/action_samples and images")
 
     import imageio
 
@@ -416,8 +448,21 @@ def main() -> None:
         help="which arms' candidate fans to overlay on agentview (default both; each uses its own "
         "calibrated base_T_agentview -- arms without one are skipped)",
     )
-    p.add_argument("--horizon", type=int, required=True, help="action_horizon the server was started with")
-    p.add_argument("--candidates", type=int, required=True, help="the --num-samples the server was started with")
+    p.add_argument(
+        "--source",
+        choices=["samples", "action"],
+        default="samples",
+        help="'samples' overlays the multi-candidate deploy fan (needs an action_samples column); "
+        "'action' overlays the single executed trajectory from the plain action column, so it works "
+        "on ANY LeRobot recording (teleop/demo/replay), not just a --num-samples deploy run",
+    )
+    p.add_argument("--horizon", type=int, required=True, help="how many future ticks to draw (deploy: action_horizon)")
+    p.add_argument(
+        "--candidates",
+        type=int,
+        default=None,
+        help="the --num-samples the server was started with (required for --source samples; ignored for action)",
+    )
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
     p.add_argument("--hold", type=int, default=5, help="frames to hold each replan on screen")
     p.add_argument("--fps", type=int, default=10)
@@ -437,7 +482,10 @@ def main() -> None:
     p.add_argument("--agent-fy", type=float, default=390.0)
     p.add_argument("--agent-cx", type=float, default=320.0)
     p.add_argument("--agent-cy", type=float, default=240.0)
-    render(p.parse_args())
+    args = p.parse_args()
+    if args.source == "samples" and args.candidates is None:
+        p.error("--candidates is required with --source samples (the --num-samples the server used)")
+    render(args)
 
 
 if __name__ == "__main__":
