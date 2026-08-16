@@ -15,6 +15,10 @@
 #   workstation/yam-data cams            # list connected RealSense serials
 #   workstation/yam-data tune [args]     # GUI exposure/brightness tuner (match cameras)
 #   workstation/yam-data doctor [args]   # dataset stats / validation
+#   workstation/yam-data render-samples [args]
+#       offline: render the candidate-chunk fan for a dataset recorded with `deploy --num-samples N`
+#       (needs `pip install policy_serving[viz]` in this env, for mujoco/mink -- a policy server
+#       never needs them, so they are not installed by setup_workstation_env.sh by default)
 #
 # Override the conda env:  YAM_WS_ENV=my_env workstation/yam-data record ...
 # (Fallback: if conda is absent but LEROBOT_ENV points to a venv, that is used.)
@@ -60,8 +64,9 @@ case "$cmd" in
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
+    render-samples) exec python -m workstation.lerobot_recorder.render_deploy_samples "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|mark-homing|check-videos|recover|deploy|cams|tune|doctor} [args]" >&2
+        echo "usage: yam-data {record|replay|mark-homing|check-videos|recover|deploy|cams|tune|doctor|render-samples} [args]" >&2
         exit 2
         ;;
 esac

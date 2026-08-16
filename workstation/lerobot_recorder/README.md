@@ -496,21 +496,49 @@ where it fails → retrain.
 
 ## D. Replay a dataset onto the robot
 
-```bash
-# 1. [robot]   wrapper server so the followers track an external command
-robot/yam canup
-robot/yam wrapper
+Replay is deployment with the actions read from a dataset, so it runs on **the deploy stack** —
+same robot server, same UI, same safeguards. There is no `wrapper` server and no separate GUI.
 
-# 2. [workstation]   open the replay GUI
-workstation/yam-data replay --robot-host <ROBOT_IP> --repo-id user/yam_pick --root ~/lerobot_data
+```bash
+# 1. [policy]  serve the episode
+python -m yam_policy.serve \
+    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
+    --config root=~/lerobot_data/yam_pick --config episode=3
+
+# 2. [robot]
+robot/yam canup && robot/yam deploy
+
+# 3. [workstation]
+workstation/yam-data deploy --robot-host <ROBOT_IP> --policy-host <POLICY_IP>
 ```
 
-In the replay GUI: **Load** → pick an **episode** → tick **Send to robot** →
-**Play**. It first ramps the robot from its current pose to the first frame (no
-jump), then streams each frame's `action` to the robot via portal. Untick "Send to
-robot" to just preview the video. **Pause** / **Stop** / **speed** as needed.
+- The **past-demonstration overlay** follows the replay automatically: same episode, at the rate
+  it was recorded, paused whenever the rollout is not streaming.
+- Everything deployment has applies — takeover, e-stop, the follower smoother (so there is no
+  separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
+- `--config speed=2` / `speed=0.5` / `loop=true`; see
+  [`policy_serving/README.md`](../../policy_serving/README.md).
 
-Dry run: `workstation/yam-data replay --mock`.
+The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
+robot (`--mock` for no robot at all).
+
+## E. Render the candidate fan offline
+
+For a run recorded with `deploy --num-samples N` against a server started with the same N, the
+`action_samples` column can be drawn back onto the recorded frames:
+
+```bash
+workstation/yam-data render-samples \
+    --repo-id my_deploy_run --episode 0 --arm left \
+    --horizon 30 --candidates 8 \
+    --acrft-root ~/jellyho/ACRFT --out .scratch/fan.mp4
+```
+
+Offline on purpose — a live per-tick overlay was built and dropped, because watching the spread
+go past at 30 fps was not worth much; the analysis belongs with the dataset.
+
+**Needs ACRFT checked out** (for its dashboard renderer) **and `matplotlib`**, which the
+workstation env does not install by default: `pip install matplotlib`.
 
 ---
 
