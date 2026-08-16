@@ -530,15 +530,40 @@ For a run recorded with `deploy --num-samples N` against a server started with t
 ```bash
 workstation/yam-data render-samples \
     --repo-id my_deploy_run --episode 0 --arm left \
-    --horizon 30 --candidates 8 \
-    --acrft-root ~/jellyho/ACRFT --out .scratch/fan.mp4
+    --horizon 30 --candidates 8 --out .scratch/fan.mp4
 ```
 
 Offline on purpose — a live per-tick overlay was built and dropped, because watching the spread
 go past at 30 fps was not worth much; the analysis belongs with the dataset.
 
-**Needs ACRFT checked out** (for its dashboard renderer) **and `matplotlib`**, which the
-workstation env does not install by default: `pip install matplotlib`.
+No extra checkout and no `matplotlib`: the fan drawing is vendored (PIL only), so this needs
+nothing the recorder env does not already have.
+
+## F. Calibrate agentview's extrinsic
+
+`render-samples`' fan is drawn on the wrist view because that camera's pose is already known
+(published extrinsic + FK). agentview's is not — nothing ties it to the robot base by default.
+`calibrate-agentview` gets it from a ChArUco board left sitting on the desk (never moved, never
+attached to the robot), using a wrist camera's known pose as the bridge:
+
+```bash
+workstation/yam-data calibrate-agentview --out ~/lerobot_data/calibration/agentview_extrinsic.json
+workstation/yam-data calibrate-agentview --mock     # GUI shell only, no hardware
+```
+
+Print a ChArUco board (default 8x6 squares, 30mm/22mm — pass `--squares-x/-y`,
+`--square-length-m`, `--marker-length-m` to match a different one; **measure the printed squares,
+don't trust the page-fit scale**) and set it on the desk in view of agentview. Both wrist cameras
+bridge by default (YAM is bimanual — `--arms left` to use only one); move either arm so its wrist
+camera also sees the board, **Capture**, then move to a few more poses and capture again at each
+— the board itself never moves. **Solve** pools every capture (whichever wrist it came from) and
+reports how much they disagree with each other in mm/degrees, which is the calibration's own
+confidence number rather than a separate validation step; **Save** writes the result next to the
+intrinsics it was solved against.
+
+Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
+separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
+`CharucoDetector`/`matchImagePoints` API) — see requirements.txt.
 
 ---
 

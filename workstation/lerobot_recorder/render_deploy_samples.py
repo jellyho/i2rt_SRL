@@ -5,14 +5,21 @@ Offline analysis, not a live overlay -- on purpose. A live per-tick overlay was 
 30fps turned out not to be worth much... visualisation belongs with the analysis, which reads
 the dataset." This is that analysis, for real recorded data.
 
-What it needs on disk:
-  * A LeRobot dataset recorded with ``yam-data deploy --num-samples N`` against an ACRFT
-    server started with ``serve_policy.py --num-samples N`` (the SAME N on both sides -- the
-    dataset schema is fixed at handshake, see ``MultiSamplePolicy.extra_features``). That gives
-    every recorded frame an ``action_samples`` column: one ``[N, 14]`` two-arm candidate-action
-    snapshot per control tick, candidate 0 always the one actually executed.
-  * ACRFT checked out somewhere reachable, to import its dashboard renderer
-    (``examples/robocasa/hud.py``) -- pass ``--acrft-root`` or set ``$ACRFT_ROOT``.
+Self-contained: earlier versions imported ACRFT's ``examples/robocasa/hud.py`` for its camera
+compositing, which pulled in a whole critic-decision dashboard (a matplotlib Q-grid panel, a
+value-trace panel) that a plain multi-sample recording -- no critic, just the sampled spread --
+never uses; ``hud.Dashboard.frame`` was always called with ``info=None`` here, which is the code
+path that skips both panels. What actually got used was one thing: the path-overlay drawing
+(``_draw_paths``, PIL-only, no matplotlib in it). ``_draw_fan`` below is that logic, vendored,
+so this needs neither an ACRFT checkout nor matplotlib -- just PIL, which the recorder already
+depends on. If a critic-scored dashboard is ever wanted here too, that is a reason to import the
+real ``hud.Dashboard`` for THAT case, not to route this one through it.
+
+What it needs on disk: a LeRobot dataset recorded with ``yam-data deploy --num-samples N``
+against an ACRFT server started with ``serve_policy.py --num-samples N`` (the SAME N on both
+sides -- the dataset schema is fixed at handshake, see ``MultiSamplePolicy.extra_features``).
+That gives every recorded frame an ``action_samples`` column: one ``[N, 14]`` two-arm
+candidate-action snapshot per control tick, candidate 0 always the one actually executed.
 
 What it does:
   1. Groups an episode's ticks into replans of ``--horizon`` consecutive frames -- the chunk
@@ -27,12 +34,11 @@ What it does:
      (``WristCameraGeometry``) and projects into that arm's wrist camera (``WristProjector``),
      using the joint state at the start of the replan -- the camera rides the wrist, so a later
      pose does not describe where these candidates were projected from.
-  4. Draws the fan on the recorded wrist frame with ``hud.Dashboard`` (``info=None`` -- there is
-     no critic here, just the sampled spread) and writes an mp4.
+  4. Draws the fan on the recorded wrist frame (``_draw_fan``) and writes an mp4.
 
     workstation/yam-data render-samples \\
-        --repo-id my_deploy_run --episode 0 --arm left --horizon 30 \\
-        --acrft-root ~/jellyho/ACRFT --out .scratch/deploy_samples.mp4
+        --repo-id my_deploy_run --episode 0 --arm left --horizon 30 --candidates 8 \\
+        --out .scratch/deploy_samples.mp4
 
 The camera intrinsics default to the same placeholder ``tests/test_wrist_view.py`` uses
 ("roughly a D405 at 640x480") -- pass ``--fx/--fy/--cx/--cy`` once the wrist camera is actually
@@ -43,7 +49,6 @@ position is not.
 from __future__ import annotations
 
 import argparse
-import os
 import pathlib
 import sys
 from typing import TYPE_CHECKING, List, Optional
@@ -51,6 +56,9 @@ from typing import TYPE_CHECKING, List, Optional
 import numpy as np
 
 if TYPE_CHECKING:
+    from PIL.Image import Image as PILImage
+    from PIL.ImageFont import FreeTypeFont, ImageFont
+
     from workstation.lerobot_recorder.dataset_reader import DatasetReader
 
 
@@ -81,22 +89,145 @@ def _load_replan_chunk(
 
 
 def _to_square(img: np.ndarray, size: int) -> np.ndarray:
-    """Match the non-uniform squash ``hud.Dashboard.frame`` applies internally.
+    """Squash a frame to ``size x size`` (non-uniform if the source is not already square).
 
-    Dashboard resizes whatever it is handed to a square ``_CAM x _CAM`` canvas with one scalar
-    factor for both axes (``hud._draw_paths``'s ``k``), which is only correct if the source was
-    already square -- the recorded wrist frame (D405, 640x480) is not. Doing the same squash here
-    first, and scaling the intrinsics to match (see ``CameraIntrinsics.scaled_to``), makes the two
-    non-uniform transforms cancel out, so a projected point still lands where the visible pixel
-    it names actually is."""
+    Doing this ourselves, once, and scaling the intrinsics to match with the same factor (see
+    ``CameraIntrinsics.scaled_to``) makes the two non-uniform transforms cancel out, so a
+    projected point still lands where the visible pixel it names actually is -- the recorded
+    wrist frame (D405, 640x480) is not square, and projecting at one aspect ratio while drawing
+    at another silently shifts every point."""
     from PIL import Image
 
     return np.asarray(Image.fromarray(img).resize((size, size), Image.LANCZOS))
 
 
+def _finite_prefix(path: np.ndarray) -> Optional[list]:
+    """A projected [H, 2] path, up to its first invisible point, as a list of (x, y) pairs.
+
+    ``WristProjector`` marks a point NaN once it is behind the lens or off the sensor; drawing
+    past that would either crash (PIL rejects NaN coordinates) or, worse, silently interpolate
+    through it and invent geometry the camera never saw. None if the path starts invisible.
+    """
+    a = np.asarray(path, dtype=np.float64)
+    finite = np.isfinite(a).all(axis=1)
+    if not finite[0]:
+        return None
+    n = int(np.argmin(finite)) if not finite.all() else len(a)
+    pts = [(float(x), float(y)) for x, y in a[:n]]
+    return pts if len(pts) >= 2 else None
+
+
+def _draw_fan(wrist_rgb: np.ndarray, paths: list, chosen: int = 0) -> np.ndarray:
+    """Overlay every candidate's projected path onto one wrist frame.
+
+    Ported from ACRFT's ``examples/robocasa/hud.py`` (``Dashboard._draw_paths``, PIL-only) and
+    trimmed to what a plain multi-sample recording needs: no ``exec_steps``/committed-prefix
+    split, since that is CriticSelectPolicy's partial-commit concept and MultiSamplePolicy always
+    executes the whole chunk. The chosen candidate draws bright with a time gradient (so its
+    direction of travel reads without an arrowhead); the rest draw translucent, drawn first so
+    the chosen one stays on top.
+    """
+    from PIL import Image, ImageDraw
+
+    base = Image.fromarray(np.ascontiguousarray(wrist_rgb)).convert("RGBA")
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+
+    for i, path in enumerate(paths):
+        if i == chosen:
+            continue
+        pts = _finite_prefix(path)
+        if pts is None:
+            continue
+        d.line(pts, fill=(150, 175, 200, 120), width=3)
+        d.ellipse([pts[-1][0] - 2.5, pts[-1][1] - 2.5, pts[-1][0] + 2.5, pts[-1][1] + 2.5], fill=(150, 175, 200, 170))
+
+    if 0 <= chosen < len(paths):
+        pts = _finite_prefix(paths[chosen])
+        if pts is not None:
+            c0, c1 = (20, 140, 95), (190, 255, 225)
+            n = len(pts) - 1
+            for i in range(n):
+                t = i / max(n - 1, 1)
+                col = tuple(int(a + (b - a) * t) for a, b in zip(c0, c1, strict=True))
+                d.line([pts[i], pts[i + 1]], fill=(*col, 255), width=5, joint="curve")
+            ex, ey = pts[-1]
+            d.ellipse([ex - 4, ey - 4, ex + 4, ey + 4], fill=(*c1, 255))
+
+    return np.asarray(Image.alpha_composite(base, layer).convert("RGB"))
+
+
+def _font(size: int) -> "FreeTypeFont | ImageFont":
+    """A monospace TTF if one is on disk, else PIL's built-in bitmap font.
+
+    Same font-discovery *idea* as hf-utils' dataset render (``hfutil/dataset/video.find_font``)
+    -- try common paths, degrade rather than fail -- reimplemented without matplotlib, which that
+    one leans on as a last-resort source: pulling in matplotlib for a font path is the exact
+    dependency this module exists to avoid (see the module docstring).
+    """
+    from PIL import ImageFont
+
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "C:/Windows/Fonts/consola.ttf",
+    ):
+        if pathlib.Path(path).is_file():
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _label(
+    canvas: "PILImage",
+    xy: tuple,
+    text: str,
+    font: "FreeTypeFont | ImageFont",
+    *,
+    fill: tuple = (235, 238, 233),
+    anchor: str = "la",
+) -> None:
+    """Draw ``text`` on a translucent black box, hf-utils' dataset-render look
+    (``drawtext``'s ``boxcolor=black@0.5``) so a label reads on any footage behind it instead of
+    only on the plain background this used to assume."""
+    from PIL import Image, ImageDraw
+
+    pad = 4
+    probe = ImageDraw.Draw(canvas)
+    l, t, r, b = probe.textbbox((0, 0), text, font=font, anchor="la")
+    w, h = r - l, b - t
+    x, y = xy
+    if "r" in anchor:
+        x -= w
+    box = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    ImageDraw.Draw(box).rectangle([x - pad, y - pad, x + w + pad, y + h + pad], fill=(0, 0, 0, 140))
+    canvas.paste(Image.alpha_composite(canvas.convert("RGBA"), box).convert("RGB"), (0, 0))
+    ImageDraw.Draw(canvas).text((x, y), text, font=font, fill=fill, anchor="la")
+
+
+def _compose_frame(agent_sq: np.ndarray, wrist_sq: np.ndarray, replan: int, step: int, cam: int) -> np.ndarray:
+    """Agent view + fan-overlaid wrist view, hstacked flush (hf-utils' dataset-render layout),
+    each panel bottom-left labelled on a translucent box instead of a separate header strip.
+
+    No analytics column: there is no critic here to explain a decision with, only the sampled
+    spread the fan already shows. ``hud.Dashboard``'s Q-grid/value-trace panels are exactly the
+    part that does not apply -- see the module docstring for why they are not vendored too.
+    """
+    from PIL import Image
+
+    canvas = Image.fromarray(np.concatenate([agent_sq, wrist_sq], axis=1))
+    f_sm, f_md = _font(13), _font(15)
+    _label(canvas, (8, 8), f"replan {replan}   step {step}", f_md)
+    _label(canvas, (8, cam - 24), "agentview", f_sm)
+    _label(canvas, (cam + 8, cam - 24), "wrist -- candidate fan", f_sm, fill=(178, 214, 197))
+    return np.asarray(canvas)
+
+
 def render(args: argparse.Namespace) -> pathlib.Path:
-    sys.path.insert(0, str(pathlib.Path(args.acrft_root).expanduser() / "examples" / "robocasa"))
-    import hud
     from yam_policy.viz import CameraIntrinsics, WristCameraGeometry, WristProjector
 
     from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
@@ -109,8 +240,8 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         raise SystemExit(f"episode {args.episode} not found (or empty) in {args.repo_id}")
 
     geometry = WristCameraGeometry(combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310))
-    # Native-resolution intrinsics, rescaled to the square canvas Dashboard/_draw_paths assumes
-    # (see _to_square) -- not the recorded frame's own (non-square) resolution.
+    # Native-resolution intrinsics, rescaled to the square canvas we draw on (see _to_square) --
+    # not the recorded frame's own (non-square) resolution.
     camera_size = 256
     intrinsics = CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy, width=640, height=480).scaled_to(
         camera_size, camera_size
@@ -123,7 +254,6 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     wrist_key = "wrist_left" if args.arm == "left" else "wrist_right"
 
     projector = WristProjector(geometry, intrinsics, arm_slice=arm_slice)
-    dash = hud.Dashboard(mode="samples", horizon=args.horizon, camera_size=camera_size)
 
     starts = _replan_starts(n_frames, args.horizon)
     if not starts:
@@ -131,7 +261,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
     frames = []
     step = 0
-    for start in starts[: args.replans] if args.replans else starts:
+    for replan_idx, start in enumerate(starts[: args.replans] if args.replans else starts):
         chunk = _load_replan_chunk(reader, args.episode, start, args.horizon, args.candidates)
         if chunk is None:
             print(f"replan at frame {start}: no action_samples recorded here, skipping", file=sys.stderr)
@@ -146,16 +276,17 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         images = reader.get_images(args.episode, start)
         agent = images.get("agentview")
         wrist = images.get(wrist_key)
-        if agent is None:
-            print(f"replan at frame {start}: no agentview image recorded here, skipping", file=sys.stderr)
+        if agent is None or wrist is None:
+            print(f"replan at frame {start}: missing agentview/wrist image, skipping", file=sys.stderr)
             continue
-        # Pre-squash the wrist frame ourselves (see _to_square) so it lines up with the
-        # already-square-scaled intrinsics above; the agent view carries no overlay, so
-        # Dashboard's own resize is fine for it as-is.
-        wrist_sq = _to_square(wrist, camera_size) if wrist is not None else None
+        # Pre-squash both frames ourselves (see _to_square) so the wrist one lines up with the
+        # already-square-scaled intrinsics above.
+        agent_sq = _to_square(agent, camera_size)
+        wrist_fan = _draw_fan(_to_square(wrist, camera_size), paths, chosen=0)
+        composed = _compose_frame(agent_sq, wrist_fan, replan_idx, step, camera_size)
 
         for _ in range(max(1, args.hold)):
-            frames.append(np.asarray(dash.frame(agent, wrist_sq, None, step, wrist_paths=paths, chosen=0)))
+            frames.append(composed)
             step += 1
 
     if not frames:
@@ -182,9 +313,6 @@ def main() -> None:
     p.add_argument("--hold", type=int, default=5, help="frames to hold each replan on screen")
     p.add_argument("--fps", type=int, default=10)
     p.add_argument("--out", default=".scratch/deploy_samples.mp4")
-    p.add_argument(
-        "--acrft-root", default=os.environ.get("ACRFT_ROOT", "~/jellyho/ACRFT"), help="checkout holding hud.py"
-    )
     # Uncalibrated placeholder -- same numbers tests/test_wrist_view.py uses. The fan's shape is
     # meaningful before calibration; its exact pixel position is not (see module docstring).
     p.add_argument("--fx", type=float, default=430.0)

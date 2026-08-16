@@ -12,7 +12,6 @@ uses, so the test also pins the column layout the renderer reads back.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -26,10 +25,6 @@ pytest.importorskip("imageio")
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "policy_serving"))
-
-ACRFT_ROOT = Path(os.environ.get("ACRFT_ROOT", "~/jellyho/ACRFT")).expanduser()
-if not (ACRFT_ROOT / "examples" / "robocasa" / "hud.py").is_file():
-    pytest.skip("needs ACRFT's hud.py (set $ACRFT_ROOT)", allow_module_level=True)
 
 from workstation.lerobot_recorder.config import ACTION_DIM, STATE_DIM, RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
@@ -89,7 +84,6 @@ def _args(dataset: Path, out: Path, **over) -> argparse.Namespace:
         hold=2,
         fps=10,
         out=str(out),
-        acrft_root=str(ACRFT_ROOT),
         fx=430.0,
         fy=430.0,
         cx=320.0,
