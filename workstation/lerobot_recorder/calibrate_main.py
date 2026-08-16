@@ -17,8 +17,10 @@ force homing, the fine button starts recentering), so a press there would move t
 capture. ``--capture-button <side>.<index>`` opts into a handle trigger only if you are running a
 robot mode that leaves the handles free.
 
-The result is written into ``config.yaml`` itself (the same file ``--config`` points at, or the
-auto-discovered one -- see :func:`i2rt.serving.rig_config.find_rig`), not a separate file: THE
+The robot host/port come from config.yaml's ``robot.host``/``robot.port`` when the flags are not
+passed (``--robot-host``/``--robot-port`` override), so a configured rig needs neither -- same
+precedence deploy uses. The result is written back into ``config.yaml`` itself (the same file, or
+the auto-discovered one -- see :func:`i2rt.serving.rig_config.find_rig`), not a separate file: THE
 single source of truth for the rig already lives there (camera serials, robot host, button map,
 ...), so this is the one place any tool that already calls ``load_rig()`` would look.
 """
@@ -31,7 +33,7 @@ import logging
 import sys
 from typing import Optional, Sequence
 
-from i2rt.serving.rig_config import apply_camera_serials, find_rig, load_rig
+from i2rt.serving.rig_config import Resolver, apply_camera_serials, find_rig, load_rig
 from i2rt.serving.robot_client import RobotClient
 from workstation.lerobot_recorder.charuco import BoardSpec
 from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
@@ -43,8 +45,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     p.add_argument("--config", default=None, help="config.yaml (cameras); auto-discovered by default")
     p.add_argument("--mock", action="store_true", help="GUI shell with synthetic frames, no hardware")
-    p.add_argument("--robot-host", default="127.0.0.1")
-    p.add_argument("--robot-port", type=int, default=11331)
+    # Defaults left at the built-ins; config.yaml's robot.host/port fills in when the flag is not
+    # passed (see Resolver below) -- so a configured rig needs no --robot-host, same as deploy.
+    p.add_argument("--robot-host", default="127.0.0.1", help="overrides config.yaml robot.host")
+    p.add_argument("--robot-port", type=int, default=11331, help="overrides config.yaml robot.port")
     p.add_argument(
         "--arms",
         nargs="+",
@@ -102,7 +106,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     robot = None
     if not args.mock:
-        robot = RobotClient(host=args.robot_host, port=args.robot_port, timeout=2.0)
+        # CLI flag wins; otherwise config.yaml's robot.host/port; otherwise the built-in default.
+        rob = Resolver(args, p, rig.get("robot", {}))
+        robot = RobotClient(
+            host=rob.get("robot_host", key="host"), port=int(rob.get("robot_port", key="port")), timeout=2.0
+        )
 
     # Same combined arm+gripper model, and the same published wrist extrinsic, that
     # render_deploy_samples.py's candidate fan uses -- one source of truth for "where is the
