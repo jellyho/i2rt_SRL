@@ -1,14 +1,23 @@
-"""ChArUco board detection + pose math for calibrating a fixed (non-wrist) camera.
+"""ChArUco board detection + pose math for calibrating the whole camera rig from one desk board.
 
-Built for exactly one job: recover an agentview extrinsic from a ChArUco board sitting still on
-the desk, with NO physical attachment to the robot and NO separate intrinsic-calibration step.
+One board sitting still on the desk (NO physical attachment to the robot, NO separate
+intrinsic-calibration step) recovers three things, in order, each feeding the next:
 
-The trick is a chain, not a direct measurement. Nothing ties the board to a robot-relative frame
-by itself, but a WRIST camera does: its pose is already known at every instant via forward
-kinematics (``WristCameraGeometry``, published extrinsic + the arm's own MJCF -- see that
-module). So at any arm pose that has the board in the wrist camera's view:
+1. **Each wrist camera's own extrinsic** (``gripper_T_camera``) -- eye-in-hand hand-eye
+   calibration (``solve_wrist_extrinsic``). ``WristCameraGeometry`` ships a CAD value for this
+   (``T_GRIPPER_CAMERA``) but it was never checked against the built hardware; a real mount error
+   there leaks into everything downstream, so we solve it ourselves and USE the solved value
+   below instead of trusting the CAD one.
+2. **Each agentview extrinsic** (``frame_T_agentview``, per arm) -- ``solve_agentview_extrinsic``.
+3. **The left<->right arm offset** (``left_T_right``) -- ``solve_arm_offset``.
 
-    frame_T_board = frame_T_wrist(q) @ wrist_T_board      (wrist_T_board from a PnP solve)
+The bridge for (2) and (3) is a chain, not a direct measurement. Nothing ties the board to a
+robot-relative frame by itself, but a wrist camera does once (1) is known: the FLANGE pose is
+known at every instant from forward kinematics (``WristCameraGeometry.flange_pose`` -- joint
+encoders + the arm MJCF, independent of any camera mount), and ``flange @ gripper_T_camera``
+places the camera. So at any arm pose that has the board in the wrist camera's view:
+
+    frame_T_board = flange_pose(q) @ gripper_T_camera @ wrist_T_board   (wrist_T_board from PnP)
 
 and the same board, seen by agentview from wherever IT sits:
 
@@ -20,7 +29,13 @@ give the one thing being solved for:
 
 Move the arm to a few different poses (the board stays put) and average -- see
 ``solve_agentview_extrinsic`` -- both to smooth out per-shot PnP noise and to catch a bad
-capture (a wildly different pose than the others) before it goes in the answer.
+capture (a wildly different pose than the others) before it goes in the answer. Hand-eye (1)
+additionally needs those poses to differ in ORIENTATION, not just position, or the rotation part
+of ``gripper_T_camera`` is unconstrained -- see ``solve_wrist_extrinsic``.
+
+Captures store the extrinsic-free ``base_t_flange`` (pure FK), NOT ``flange @ extrinsic``, so the
+same captures can be re-solved against the freshly hand-eye'd extrinsic rather than baking the
+CAD one in at capture time.
 
 **"frame_T_wrist" is per-arm, not a shared robot frame -- there is no cross-arm transform
 anywhere in this codebase.** ``WristCameraGeometry`` builds FK from ONE arm's own MJCF
@@ -86,6 +101,27 @@ class BoardSpec:
     square_length_m: float = 0.030
     marker_length_m: float = 0.022
     dictionary: str = "DICT_4X4_50"
+
+    def to_config_dict(self) -> dict:
+        """As a plain dict for writing under config.yaml's ``calibration.board`` (see
+        ``splice_board``). Keys match ``from_config``'s so a round trip is lossless."""
+        return {
+            "squares_x": self.squares_x,
+            "squares_y": self.squares_y,
+            "square_length_m": self.square_length_m,
+            "marker_length_m": self.marker_length_m,
+            "dictionary": self.dictionary,
+        }
+
+    @classmethod
+    def from_config(cls, board: Optional[dict]) -> "BoardSpec":
+        """Build from a config.yaml ``calibration.board`` mapping, falling back to the class
+        defaults for any key it omits (so a partial or absent block is fine). Unknown keys are
+        ignored rather than raising -- a config carrying extra provenance (``calibrated_at``) that
+        this writes back should still load."""
+        board = board or {}
+        d = cls().to_config_dict()
+        return cls(**{k: board.get(k, v) for k, v in d.items()})
 
 
 def make_board(spec: BoardSpec) -> "cv2.aruco.CharucoBoard":
@@ -211,19 +247,97 @@ def _rms(values: Sequence[float]) -> float:
 
 @dataclasses.dataclass
 class Capture:
-    """One calibration sample: the arm pose a wrist camera saw the board from, plus both
-    cameras' independent board detections at (as close to) that same instant.
+    """One calibration sample: the arm's FK pose plus both cameras' independent board detections
+    at (as close to) that same instant.
 
-    ``arm`` records which wrist camera / FK model ``base_t_wrist`` came from -- required so
+    ``arm`` records which wrist camera / FK model ``base_t_flange`` came from -- required so
     ``solve_agentview_extrinsic`` can refuse to mix frames it has no business averaging (see the
-    module docstring)."""
+    module docstring).
 
-    arm: str  # "left" | "right" -- whichever WristCameraGeometry built base_t_wrist
-    base_t_wrist: np.ndarray  # 4x4, from WristCameraGeometry.camera_pose(q) at capture time
-    wrist_t_board: np.ndarray  # 4x4
-    agentview_t_board: np.ndarray  # 4x4
+    ``base_t_flange`` is the EXTRINSIC-FREE flange pose (``WristCameraGeometry.flange_pose``),
+    not ``flange @ extrinsic``: it is both what hand-eye needs as the gripper pose, and what lets
+    the agentview solve be re-run against a freshly hand-eye'd extrinsic instead of the CAD one
+    baked in at capture time."""
+
+    arm: str  # "left" | "right" -- whichever WristCameraGeometry built base_t_flange
+    base_t_flange: np.ndarray  # 4x4, WristCameraGeometry.flange_pose(q) -- FK only, no extrinsic
+    wrist_t_board: np.ndarray  # 4x4, wrist camera PnP (camera_T_board)
+    agentview_t_board: np.ndarray  # 4x4, agentview PnP
     wrist_reproj_error_px: float
     agentview_reproj_error_px: float
+
+
+@dataclasses.dataclass
+class WristExtrinsicResult:
+    arm: str
+    gripper_t_camera: np.ndarray  # 4x4, the answer -- drop-in for WristCameraGeometry's CAD extrinsic
+    n_captures: int
+    # Consistency residual: with the solved extrinsic, base_T_board should be the SAME (the board
+    # did not move) across every capture. How far the per-capture base_T_board estimates sit from
+    # their mean is the honest end-to-end error of the hand-eye solve + the FK behind it. NOT a
+    # pure hand-eye reprojection -- it folds in FK error too, which is exactly what you want to
+    # know before trusting this extrinsic downstream.
+    translation_rms_mm: float
+    rotation_rms_deg: float
+    per_capture_translation_mm: List[float]
+    per_capture_rotation_deg: List[float]
+
+
+def solve_wrist_extrinsic(captures: Sequence[Capture]) -> WristExtrinsicResult:
+    """``gripper_T_camera`` for ONE arm, by eye-in-hand hand-eye calibration off the fixed board.
+
+    Solves AX = XB (``cv2.calibrateHandEye``, Tsai-Lenz) from the arm's own FK flange poses
+    (``base_t_flange``, the "gripper2base" input) and the wrist camera's board detections
+    (``wrist_t_board``, the "target2cam" input). The board being bolted to nothing and never
+    moving is what makes it a valid stationary target.
+
+    Needs at least 3 captures, and -- unlike the agentview solve -- those poses must differ in
+    ORIENTATION, not just position: a pure translation between two poses leaves the rotation part
+    of X unconstrained (AX = XB degenerates), so a set of captures all at the same wrist tilt can
+    return a confident-looking but wrong extrinsic. The reported RMS residual (board-in-base
+    consistency, see ``WristExtrinsicResult``) is the check on whether the poses were varied
+    enough; a tight residual with too-similar poses is the one failure it cannot catch, same
+    caveat as the agentview convergence trend.
+    """
+    import cv2
+
+    if len(captures) < 3:
+        raise ValueError("hand-eye needs at least 3 captures (2 relative motions) to solve X")
+    arms = {c.arm for c in captures}
+    if len(arms) > 1:
+        raise ValueError(f"captures span more than one arm ({sorted(arms)}) -- each arm's mount is its own solve")
+    (arm,) = arms
+
+    r_g2b = [c.base_t_flange[:3, :3] for c in captures]
+    t_g2b = [c.base_t_flange[:3, 3] for c in captures]
+    r_t2c = [c.wrist_t_board[:3, :3] for c in captures]
+    t_t2c = [c.wrist_t_board[:3, 3] for c in captures]
+    r_x, t_x = cv2.calibrateHandEye(r_g2b, t_g2b, r_t2c, t_t2c, method=cv2.CALIB_HAND_EYE_TSAI)
+    x = np.eye(4)
+    x[:3, :3] = r_x
+    x[:3, 3] = np.asarray(t_x).reshape(3)
+
+    # base_T_board per capture, which should be identical if X (and the FK) are right.
+    boards = [c.base_t_flange @ x @ c.wrist_t_board for c in captures]
+    _mean, per_t, per_r = _average_poses(boards)
+    return WristExtrinsicResult(
+        arm=arm,
+        gripper_t_camera=x,
+        n_captures=len(captures),
+        translation_rms_mm=_rms(per_t),
+        rotation_rms_deg=_rms(per_r),
+        per_capture_translation_mm=per_t,
+        per_capture_rotation_deg=per_r,
+    )
+
+
+def solve_wrist_extrinsic_per_arm(captures: Sequence[Capture]) -> Dict[str, WristExtrinsicResult]:
+    """Group captures by ``arm`` and hand-eye-solve each; an arm with fewer than 3 is skipped
+    (returned dict just omits it), the same lenient behaviour as ``solve_agentview_extrinsic_per_arm``."""
+    by_arm: Dict[str, List[Capture]] = {}
+    for c in captures:
+        by_arm.setdefault(c.arm, []).append(c)
+    return {arm: solve_wrist_extrinsic(group) for arm, group in by_arm.items() if len(group) >= 3}
 
 
 @dataclasses.dataclass
@@ -237,8 +351,14 @@ class CalibrationResult:
     per_capture_rotation_deg: List[float]
 
 
-def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
+def solve_agentview_extrinsic(captures: Sequence[Capture], *, wrist_extrinsic: np.ndarray) -> CalibrationResult:
     """Chain each capture into an independent extrinsic estimate, then average.
+
+    ``wrist_extrinsic`` (``gripper_T_camera``) places the camera on the flange: the per-capture
+    bridge is ``base_t_flange @ wrist_extrinsic @ wrist_t_board``. Pass the hand-eye result
+    (``solve_wrist_extrinsic``) to use the measured mount, or ``WristCameraGeometry``'s CAD
+    ``T_GRIPPER_CAMERA`` to fall back to the unverified spec -- the caller decides which, and this
+    is exactly the value hand-eye exists to replace.
 
     Averaging AFTER the chain (not averaging ``frame_T_board`` first) means a single bad capture
     -- an arm pose where the wrist camera grazed the board at a steep, noisy angle -- shows up as
@@ -262,7 +382,7 @@ def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
 
     estimates = []
     for c in captures:
-        base_t_board = c.base_t_wrist @ c.wrist_t_board
+        base_t_board = c.base_t_flange @ wrist_extrinsic @ c.wrist_t_board
         estimates.append(base_t_board @ np.linalg.inv(c.agentview_t_board))
 
     out, per_t, per_r = _average_poses(estimates)
@@ -277,7 +397,9 @@ def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
     )
 
 
-def solve_agentview_extrinsic_per_arm(captures: Sequence[Capture]) -> Dict[str, CalibrationResult]:
+def solve_agentview_extrinsic_per_arm(
+    captures: Sequence[Capture], *, wrist_extrinsics: Dict[str, np.ndarray]
+) -> Dict[str, CalibrationResult]:
     """Group captures by ``arm`` and solve each group independently.
 
     This -- not ``solve_agentview_extrinsic`` directly -- is the entry point for a session that
@@ -286,11 +408,18 @@ def solve_agentview_extrinsic_per_arm(captures: Sequence[Capture]) -> Dict[str, 
     cannot be pooled). An arm with fewer than 2 captures is silently skipped rather than raising
     -- a caller collecting from both wrists but so far only succeeding on one should still get
     that one back, the same way a mixed collection session naturally produces uneven counts.
+
+    ``wrist_extrinsics`` maps arm -> ``gripper_T_camera`` (hand-eye solve or CAD fallback); an arm
+    absent from it is skipped too, since there is no camera placement to chain through.
     """
     by_arm: Dict[str, List[Capture]] = {}
     for c in captures:
         by_arm.setdefault(c.arm, []).append(c)
-    return {arm: solve_agentview_extrinsic(group) for arm, group in by_arm.items() if len(group) >= 2}
+    return {
+        arm: solve_agentview_extrinsic(group, wrist_extrinsic=wrist_extrinsics[arm])
+        for arm, group in by_arm.items()
+        if len(group) >= 2 and arm in wrist_extrinsics
+    }
 
 
 @dataclasses.dataclass
@@ -306,10 +435,10 @@ class ArmPairCapture:
     moved.
     """
 
-    left_t_wrist: np.ndarray  # 4x4, left WristCameraGeometry.camera_pose(q_left)
-    left_wrist_t_board: np.ndarray  # 4x4
-    right_t_wrist: np.ndarray  # 4x4, right WristCameraGeometry.camera_pose(q_right)
-    right_wrist_t_board: np.ndarray  # 4x4
+    left_t_flange: np.ndarray  # 4x4, left WristCameraGeometry.flange_pose(q_left) -- FK only
+    left_wrist_t_board: np.ndarray  # 4x4, left wrist camera PnP
+    right_t_flange: np.ndarray  # 4x4, right WristCameraGeometry.flange_pose(q_right) -- FK only
+    right_wrist_t_board: np.ndarray  # 4x4, right wrist camera PnP
     left_reproj_error_px: float
     right_reproj_error_px: float
 
@@ -325,8 +454,15 @@ class ArmOffsetResult:
     per_capture_rotation_deg: List[float]
 
 
-def solve_arm_offset(captures: Sequence[ArmPairCapture]) -> ArmOffsetResult:
+def solve_arm_offset(
+    captures: Sequence[ArmPairCapture], *, left_extrinsic: np.ndarray, right_extrinsic: np.ndarray
+) -> ArmOffsetResult:
     """``left_T_right`` from moments both wrist cameras saw the same still board at once.
+
+    Each side places its camera with its OWN ``gripper_T_camera`` (``left_extrinsic`` /
+    ``right_extrinsic`` -- hand-eye results or CAD fallback), so a mount error on either arm feeds
+    straight into the offset: this is why solving the wrist extrinsics first, and passing the
+    measured ones here, matters rather than trusting CAD on both.
 
     Same "chain each capture independently, then average" pattern as
     ``solve_agentview_extrinsic`` -- here BOTH sides of the chain are FK-bridged rather than one
@@ -338,8 +474,8 @@ def solve_arm_offset(captures: Sequence[ArmPairCapture]) -> ArmOffsetResult:
 
     estimates = []
     for c in captures:
-        left_t_board = c.left_t_wrist @ c.left_wrist_t_board
-        right_t_board = c.right_t_wrist @ c.right_wrist_t_board
+        left_t_board = c.left_t_flange @ left_extrinsic @ c.left_wrist_t_board
+        right_t_board = c.right_t_flange @ right_extrinsic @ c.right_wrist_t_board
         estimates.append(left_t_board @ np.linalg.inv(right_t_board))
 
     out, per_t, per_r = _average_poses(estimates)
@@ -444,6 +580,21 @@ def format_arm_offset_yaml(result: ArmOffsetResult, *, calibrated_at: str, inden
     ]
 
 
+def format_wrist_extrinsic_yaml(result: WristExtrinsicResult, *, calibrated_at: str, indent: int = 6) -> List[str]:
+    """The body of one wrist camera's ``extrinsic`` entry -- ready under
+    ``cameras.wrist_<arm>.extrinsic`` (see ``splice_wrist_extrinsic``). ``matrix`` is
+    ``gripper_T_camera``, the hand-eye replacement for ``WristCameraGeometry``'s CAD constant."""
+    pad = " " * indent
+    return [
+        f"{pad}matrix:",
+        *_format_matrix_yaml(result.gripper_t_camera, indent + 2),
+        f"{pad}n_captures: {result.n_captures}",
+        f"{pad}translation_rms_mm: {result.translation_rms_mm:.3f}",
+        f"{pad}rotation_rms_deg: {result.rotation_rms_deg:.4f}",
+        f'{pad}calibrated_at: "{calibrated_at}"',
+    ]
+
+
 def format_unified_yaml(result: UnifiedRigCalibration, *, calibrated_at: str, indent: int = 8) -> List[str]:
     """The body of ``cameras.agentview.extrinsic.unified`` (see ``splice_agentview_unified``).
 
@@ -459,6 +610,18 @@ def format_unified_yaml(result: UnifiedRigCalibration, *, calibrated_at: str, in
     if result.cross_check_rotation_deg is not None:
         lines.append(f"{pad}cross_check_rotation_deg: {result.cross_check_rotation_deg:.4f}")
     lines.append(f'{pad}calibrated_at: "{calibrated_at}"')
+    return lines
+
+
+def format_board_yaml(spec: BoardSpec, indent: int = 4) -> List[str]:
+    """The body of the ``calibration.board`` entry (see ``splice_board``) -- the physical board's
+    geometry, so the next calibration auto-loads it and every result records which board it used."""
+    pad = " " * indent
+    b = spec.to_config_dict()
+    lines = [f"{pad}squares_x: {b['squares_x']}", f"{pad}squares_y: {b['squares_y']}"]
+    lines.append(f"{pad}square_length_m: {b['square_length_m']:g}")
+    lines.append(f"{pad}marker_length_m: {b['marker_length_m']:g}")
+    lines.append(f'{pad}dictionary: "{b["dictionary"]}"')
     return lines
 
 
@@ -497,6 +660,33 @@ def _locate_path(lines: List[str], parents: Sequence[str]) -> tuple:
         key_line, indent, block_end = found
         search = range(key_line + 1, block_end)
     return indent, block_end, search
+
+
+def _expand_scalar_camera(text: str, cam_key: str) -> str:
+    """Rewrite ``cameras.<cam_key>: "<serial>"`` (the shorthand form) into the mapping form
+    ``cameras.<cam_key>:\\n    serial: "<serial>"`` so an ``extrinsic`` child can be added under it.
+
+    config.yaml documents both forms for a camera (a bare serial string, or a map with
+    ``serial:`` + options); ``apply_camera_serials`` treats the scalar as the serial. A scalar
+    node cannot also carry child keys, so writing an extrinsic under one would produce invalid
+    YAML -- this converts it first, losing nothing (the serial moves onto its own line, any
+    trailing comment is kept). No-op if the entry is already a mapping.
+    """
+    lines = text.splitlines()
+    _pi, _pe, search = _locate_path(lines, ("cameras",))
+    found = _locate_block(lines, search, cam_key)
+    if found is None:
+        raise ValueError(f"no '{cam_key}:' entry under 'cameras:' in config.yaml")
+    key_line, indent, _block_end = found
+    after = lines[key_line].split(":", 1)[1]
+    value, comment = (after.split("#", 1) + [""])[:2]
+    if not value.strip():
+        return text  # already a mapping (nothing but maybe a comment after the colon)
+    header = f"{' ' * indent}{cam_key}:" + (f"  #{comment}" if comment else "")
+    serial_line = f"{' ' * (indent + 2)}serial: {value.strip()}"
+    out = lines[:key_line] + [header, serial_line] + lines[key_line + 1 :]
+    result = "\n".join(out)
+    return result + "\n" if text.endswith("\n") and not result.endswith("\n") else result
 
 
 def _ensure_section(text: str, parents: Sequence[str], key: str, *, comment: str = "") -> str:
@@ -554,7 +744,7 @@ def splice_agentview_extrinsic(text: str, arm: str, result: CalibrationResult, *
         ("cameras", "agentview"),
         "extrinsic",
         comment="base_T_agentview per arm's own FK frame (no shared robot-base frame -- see "
-        "workstation/yam-data calibrate-agentview)",
+        "workstation/yam-data calibrate)",
     )
     block = format_extrinsic_yaml(result, calibrated_at=calibrated_at, indent=8)
     return _splice_leaf(text, ("cameras", "agentview", "extrinsic"), arm, block)
@@ -575,7 +765,7 @@ def splice_agentview_unified(text: str, result: UnifiedRigCalibration, *, calibr
         ("cameras", "agentview"),
         "extrinsic",
         comment="base_T_agentview per arm's own FK frame (no shared robot-base frame -- see "
-        "workstation/yam-data calibrate-agentview)",
+        "workstation/yam-data calibrate)",
     )  # no-op if already there (see splice_agentview_extrinsic, which usually creates it first)
     block = format_unified_yaml(result, calibrated_at=calibrated_at, indent=8)
     return _splice_leaf(
@@ -592,5 +782,44 @@ def splice_arm_offset(text: str, result: ArmOffsetResult, *, calibrated_at: str)
     """Insert/replace the top-level ``robot.arm_offset`` block in a config.yaml."""
     block = format_arm_offset_yaml(result, calibrated_at=calibrated_at, indent=4)
     return _splice_leaf(
-        text, ("robot",), "arm_offset", block, comment="left_T_right -- see workstation/yam-data calibrate-agentview"
+        text, ("robot",), "arm_offset", block, comment="left_T_right -- see workstation/yam-data calibrate"
+    )
+
+
+def splice_wrist_extrinsic(text: str, arm: str, result: WristExtrinsicResult, *, calibrated_at: str) -> str:
+    """Insert/replace ``cameras.wrist_<arm>.extrinsic`` (``gripper_T_camera``) in a config.yaml.
+
+    Writing this OVER the CAD default is the whole point of hand-eye: a consumer building a
+    ``WristCameraGeometry`` should read this back instead of the hardcoded ``T_GRIPPER_CAMERA``
+    when it exists. ``cameras.wrist_<arm>`` must already exist (it does -- every rig config lists
+    the wrist cameras by serial); this only adds/replaces its ``extrinsic`` child.
+    """
+    cam_key = f"wrist_{arm}"
+    text = _expand_scalar_camera(text, cam_key)  # so a scalar "wrist_x: serial" can take a child
+    block = format_wrist_extrinsic_yaml(result, calibrated_at=calibrated_at, indent=6)
+    return _splice_leaf(
+        text,
+        ("cameras", cam_key),
+        "extrinsic",
+        block,
+        comment="gripper_T_camera, hand-eye solved -- overrides the CAD default in "
+        "yam_policy.viz.geometry (see workstation/yam-data calibrate)",
+    )
+
+
+def splice_board(text: str, spec: BoardSpec, *, calibrated_at: str = "") -> str:
+    """Insert/replace the top-level ``calibration.board`` block -- the ChArUco geometry the
+    calibration used, so ``BoardSpec.from_config`` auto-loads it next time and every saved
+    result records which physical board produced it. Creates the ``calibration:`` section if the
+    file has none yet.
+
+    ``calibrated_at`` is appended only when given (on a save that records provenance); a caller
+    that just wants to persist the geometry can omit it.
+    """
+    text = _ensure_section(text, (), "calibration", comment="workstation/yam-data calibrate settings")
+    block = format_board_yaml(spec, indent=4)
+    if calibrated_at:
+        block = [*block, f'    calibrated_at: "{calibrated_at}"']
+    return _splice_leaf(
+        text, ("calibration",), "board", block, comment="ChArUco board geometry -- MUST match the printed board"
     )

@@ -19,7 +19,7 @@ pytest.importorskip("PyQt5")
 
 from PyQt5 import QtWidgets
 
-from workstation.lerobot_recorder.calibrate_agentview_gui import CalibrateAgentviewWindow, _convergence_note
+from workstation.lerobot_recorder.calibrate_gui import CalibrateAgentviewWindow, _convergence_note
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.charuco import BoardSpec, Detection
 from workstation.lerobot_recorder.config import CameraSpec, RecorderConfig
@@ -31,7 +31,9 @@ def qapp():
 
 
 class _FakeGeometry:
-    def camera_pose(self, q):
+    # flange_pose is what captures store now (FK only, no extrinsic); a fixed identity is fine
+    # for the GUI-wiring tests here -- the extrinsic math is charuco.py's job to test.
+    def flange_pose(self, q):
         return np.eye(4)
 
 
@@ -195,6 +197,8 @@ def test_save_writes_into_config_yaml_not_a_separate_file(window, config_file, m
     written = config_file.read_text()
     assert "extrinsic:" in written
     assert "left:" in written and "right:" in written
+    # the board geometry is recorded too (provenance + auto-load next time)
+    assert "calibration:" in written and "board:" in written
     # nothing else invented alongside it
     assert not list(config_file.parent.glob("*.json"))
 
@@ -245,3 +249,24 @@ def test_save_button_disabled_until_something_has_solved(window):
     window._on_capture()
     window._on_capture()
     assert window.save_btn.isEnabled() is True
+
+
+def test_save_writes_the_wrist_extrinsic_when_hand_eye_solved(window, config_file, monkeypatch):
+    """Hand-eye needs 3+ VARIED poses, which the identity-pose fixture can't produce, so inject a
+    solved WristExtrinsicResult directly and confirm _on_save routes it to cameras.wrist_*.extrinsic
+    (the hand-eye math itself is covered in test_charuco.py)."""
+    from workstation.lerobot_recorder.charuco import WristExtrinsicResult
+
+    _confirm_yes(monkeypatch)
+    window.config_path = str(config_file)
+    m = np.eye(4)
+    m[0, 3] = 0.05
+    window._last_wrist = {"left": WristExtrinsicResult("left", m, 8, 0.4, 0.05, [0.3], [0.04])}
+    window.save_btn.setEnabled(True)
+
+    window._on_save()
+
+    written = config_file.read_text()
+    assert "wrist_left:" in written
+    # the extrinsic child landed under wrist_left, and its serial survived the scalar->mapping expand
+    assert "extrinsic:" in written and "352122271652" in written

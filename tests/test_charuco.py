@@ -26,6 +26,8 @@ from workstation.lerobot_recorder.charuco import (
     solve_agentview_extrinsic,
     solve_agentview_extrinsic_per_arm,
     solve_arm_offset,
+    solve_wrist_extrinsic,
+    solve_wrist_extrinsic_per_arm,
     unify_rig_calibration,
 )
 
@@ -69,6 +71,84 @@ def test_rotation_angle_deg_matches_the_angle_it_was_built_from():
 
 
 # --------------------------------------------------------------------------------------- #
+# solve_wrist_extrinsic: eye-in-hand hand-eye, against known ground truth
+# --------------------------------------------------------------------------------------- #
+def _wrist_captures(true_g_t_c, base_t_board, n=8, seed=0):
+    """Captures generated FORWARD from a known gripper_T_camera + fixed board, with varied
+    orientation (hand-eye needs that or the rotation part of X is unconstrained)."""
+    rng = np.random.default_rng(seed)
+    caps = []
+    for i in range(n):
+        base_t_flange = _pose(rng.uniform(-0.2, 0.2, 3), axis=("x", "y", "z")[i % 3], deg=float(rng.uniform(-40, 40)))
+        cam_t_board = np.linalg.inv(base_t_flange @ true_g_t_c) @ base_t_board
+        caps.append(Capture("left", base_t_flange, cam_t_board, np.eye(4), 0.1, 0.1))
+    return caps
+
+
+def test_hand_eye_recovers_the_true_wrist_extrinsic():
+    """The whole reason this tool exists over the CAD constant: solve gripper_T_camera from FK +
+    board detections, and get the real mount back."""
+    true_g_t_c = _pose((0.02, -0.03, 0.05), axis="y", deg=25.0)
+    board = _pose((0.5, 0.1, 0.0), axis="z", deg=10.0)
+    result = solve_wrist_extrinsic(_wrist_captures(true_g_t_c, board))
+
+    assert result.arm == "left"
+    assert np.allclose(result.gripper_t_camera, true_g_t_c, atol=1e-8)
+    assert result.n_captures == 8
+    assert result.translation_rms_mm < 1e-6  # noiseless -> board-in-base is dead consistent
+    assert result.rotation_rms_deg < 1e-4
+
+
+def test_hand_eye_refuses_fewer_than_three_captures():
+    """Two poses is one relative motion -- not enough to pin both rotation and translation of X."""
+    caps = _wrist_captures(_pose((0.02, 0, 0)), _pose((0.4, 0, 0)), n=2)
+    with pytest.raises(ValueError, match="at least 3"):
+        solve_wrist_extrinsic(caps)
+
+
+def test_hand_eye_refuses_mixed_arms():
+    caps = _wrist_captures(_pose((0.02, 0, 0)), _pose((0.4, 0, 0)), n=3)
+    caps[-1] = Capture("right", caps[-1].base_t_flange, caps[-1].wrist_t_board, np.eye(4), 0.1, 0.1)
+    with pytest.raises(ValueError, match="more than one arm"):
+        solve_wrist_extrinsic(caps)
+
+
+def test_hand_eye_per_arm_skips_an_arm_below_three():
+    board = _pose((0.4, 0.0, 0.0))
+    left = _wrist_captures(_pose((0.02, 0, 0), axis="y", deg=10), board, n=4)
+    right = _wrist_captures(_pose((-0.02, 0, 0), axis="y", deg=10), board, n=2)
+    right = [Capture("right", c.base_t_flange, c.wrist_t_board, c.agentview_t_board, 0.1, 0.1) for c in right]
+    out = solve_wrist_extrinsic_per_arm([*left, *right])
+    assert set(out) == {"left"}  # right had only 2, below the hand-eye minimum
+
+
+def test_agentview_uses_the_wrist_extrinsic_it_is_given():
+    """A wrong wrist extrinsic must change the agentview answer -- proof the chain actually
+    routes through it, so hand-eye replacing CAD genuinely matters."""
+    true_base_t_agent = _pose((1.0, 0.0, 0.5))
+    g_t_c = _pose((0.03, 0.0, 0.0))  # camera offset from flange
+    board = _pose((0.4, 0.0, 0.0))
+    caps = []
+    for wt in ((0.0, 0.0, 0.0), (0.02, 0.0, 0.0)):
+        base_t_flange = _pose(wt)
+        base_t_cam = base_t_flange @ g_t_c
+        caps.append(
+            Capture(
+                "left",
+                base_t_flange,
+                np.linalg.inv(base_t_cam) @ board,  # camera_T_board consistent with g_t_c
+                np.linalg.inv(true_base_t_agent) @ board,
+                0.1,
+                0.1,
+            )
+        )
+    right = solve_agentview_extrinsic(caps, wrist_extrinsic=g_t_c)
+    wrong = solve_agentview_extrinsic(caps, wrist_extrinsic=np.eye(4))
+    assert np.allclose(right.base_t_agentview, true_base_t_agent, atol=1e-8)
+    assert not np.allclose(wrong.base_t_agentview, true_base_t_agent, atol=1e-3)
+
+
+# --------------------------------------------------------------------------------------- #
 # solve_agentview_extrinsic: the transform chain, against known ground truth
 # --------------------------------------------------------------------------------------- #
 def test_recovers_the_true_extrinsic_from_noiseless_captures():
@@ -82,13 +162,13 @@ def test_recovers_the_true_extrinsic_from_noiseless_captures():
     captures = []
     for _ in range(4):
         # A different arm pose each time -- the board does not move, the wrist camera does.
-        base_t_wrist = _pose(rng.uniform(-0.1, 0.1, 3), axis="x", deg=float(rng.uniform(-20, 20)))
-        wrist_t_board = np.linalg.inv(base_t_wrist) @ board_pose_in_base
+        base_t_flange = _pose(rng.uniform(-0.1, 0.1, 3), axis="x", deg=float(rng.uniform(-20, 20)))
+        wrist_t_board = np.linalg.inv(base_t_flange) @ board_pose_in_base
         agent_t_board = np.linalg.inv(true_base_t_agent) @ board_pose_in_base
         captures.append(
             Capture(
                 arm="left",
-                base_t_wrist=base_t_wrist,
+                base_t_flange=base_t_flange,
                 wrist_t_board=wrist_t_board,
                 agentview_t_board=agent_t_board,
                 wrist_reproj_error_px=0.1,
@@ -96,7 +176,7 @@ def test_recovers_the_true_extrinsic_from_noiseless_captures():
             )
         )
 
-    result = solve_agentview_extrinsic(captures)
+    result = solve_agentview_extrinsic(captures, wrist_extrinsic=np.eye(4))
     assert result.arm == "left"
     assert np.allclose(result.base_t_agentview, true_base_t_agent, atol=1e-8)
     assert result.translation_rms_mm < 1e-3
@@ -112,17 +192,17 @@ def test_disagreeing_captures_show_up_as_nonzero_spread_not_silently_averaged_aw
 
     def make_capture(wrist_t: tuple, detection_error: np.ndarray | None = None) -> Capture:
         # wrist_t moves the ARM to a different (still internally-consistent) pose -- by itself
-        # this cancels out of the chain exactly (base_t_wrist @ inv(base_t_wrist) @ board_pose),
+        # this cancels out of the chain exactly (base_t_flange @ inv(base_t_flange) @ board_pose),
         # regardless of where the arm is, which is the whole reason averaging several arm poses
         # is trustworthy. Only `detection_error` -- a wrong PnP READ, not a different truth --
         # can make one capture actually disagree with the rest.
-        base_t_wrist = _pose(wrist_t)
-        wrist_t_board = np.linalg.inv(base_t_wrist) @ board_pose_in_base
+        base_t_flange = _pose(wrist_t)
+        wrist_t_board = np.linalg.inv(base_t_flange) @ board_pose_in_base
         if detection_error is not None:
             wrist_t_board = wrist_t_board @ detection_error
         return Capture(
             arm="left",
-            base_t_wrist=base_t_wrist,
+            base_t_flange=base_t_flange,
             wrist_t_board=wrist_t_board,
             agentview_t_board=np.linalg.inv(true_base_t_agent) @ board_pose_in_base,
             wrist_reproj_error_px=0.1,
@@ -130,14 +210,14 @@ def test_disagreeing_captures_show_up_as_nonzero_spread_not_silently_averaged_aw
         )
 
     agreeing = [make_capture((0.0, 0.0, 0.0)), make_capture((0.01, 0.0, 0.0)), make_capture((0.0, 0.01, 0.0))]
-    clean = solve_agentview_extrinsic(agreeing)
+    clean = solve_agentview_extrinsic(agreeing, wrist_extrinsic=np.eye(4))
     assert clean.translation_rms_mm < 1.0
 
     # A 5cm error in ONE capture's DETECTED board pose (a bad PnP read, not just a different arm
     # pose) -- solve_agentview_extrinsic cannot know it is wrong (no independent ground truth
     # either), so it must show up as spread instead of vanishing into the mean.
     outlier = [*agreeing, make_capture((0.0, 0.0, 0.0), detection_error=_pose((0.05, 0.0, 0.0)))]
-    dirty = solve_agentview_extrinsic(outlier)
+    dirty = solve_agentview_extrinsic(outlier, wrist_extrinsic=np.eye(4))
     assert dirty.translation_rms_mm > clean.translation_rms_mm
     assert max(dirty.per_capture_translation_mm) > 10.0  # the outlier itself is findable in the list
 
@@ -147,7 +227,7 @@ def test_refuses_to_solve_from_a_single_capture():
     compare it against, which is the entire point of averaging several."""
     c = Capture("left", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
     with pytest.raises(ValueError, match="at least 2"):
-        solve_agentview_extrinsic([c])
+        solve_agentview_extrinsic([c], wrist_extrinsic=np.eye(4))
 
 
 # --------------------------------------------------------------------------------------- #
@@ -160,7 +240,7 @@ def test_refuses_to_solve_captures_from_two_different_arms_together():
     c_left = Capture("left", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
     c_right = Capture("right", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
     with pytest.raises(ValueError, match="more than one arm"):
-        solve_agentview_extrinsic([c_left, c_right, c_left])
+        solve_agentview_extrinsic([c_left, c_right, c_left], wrist_extrinsic=np.eye(4))
 
 
 def test_per_arm_solves_each_arm_independently_and_reports_which_is_which():
@@ -169,11 +249,11 @@ def test_per_arm_solves_each_arm_independently_and_reports_which_is_which():
     board_pose = _pose((0.4, 0.0, 0.0))
 
     def make(arm: str, true_t_agent: np.ndarray, wrist_t: tuple) -> Capture:
-        base_t_wrist = _pose(wrist_t)
+        base_t_flange = _pose(wrist_t)
         return Capture(
             arm=arm,
-            base_t_wrist=base_t_wrist,
-            wrist_t_board=np.linalg.inv(base_t_wrist) @ board_pose,
+            base_t_flange=base_t_flange,
+            wrist_t_board=np.linalg.inv(base_t_flange) @ board_pose,
             agentview_t_board=np.linalg.inv(true_t_agent) @ board_pose,
             wrist_reproj_error_px=0.1,
             agentview_reproj_error_px=0.1,
@@ -186,7 +266,7 @@ def test_per_arm_solves_each_arm_independently_and_reports_which_is_which():
         make("right", true_right_t_agent, (0.0, -0.02, 0.0)),
     ]
 
-    results = solve_agentview_extrinsic_per_arm(captures)
+    results = solve_agentview_extrinsic_per_arm(captures, wrist_extrinsics={"left": np.eye(4), "right": np.eye(4)})
 
     assert set(results) == {"left", "right"}
     assert np.allclose(results["left"].base_t_agentview, true_left_t_agent, atol=1e-8)
@@ -202,18 +282,18 @@ def test_per_arm_skips_an_arm_with_too_few_captures_instead_of_raising():
     board_pose = _pose((0.4, 0.0, 0.0))
 
     def make(arm: str, wrist_t: tuple) -> Capture:
-        base_t_wrist = _pose(wrist_t)
+        base_t_flange = _pose(wrist_t)
         return Capture(
             arm=arm,
-            base_t_wrist=base_t_wrist,
-            wrist_t_board=np.linalg.inv(base_t_wrist) @ board_pose,
+            base_t_flange=base_t_flange,
+            wrist_t_board=np.linalg.inv(base_t_flange) @ board_pose,
             agentview_t_board=np.linalg.inv(left_pose) @ board_pose,
             wrist_reproj_error_px=0.1,
             agentview_reproj_error_px=0.1,
         )
 
     captures = [make("left", (0.0, 0.0, 0.0)), make("left", (0.01, 0.0, 0.0)), make("right", (0.0, 0.0, 0.0))]
-    results = solve_agentview_extrinsic_per_arm(captures)
+    results = solve_agentview_extrinsic_per_arm(captures, wrist_extrinsics={"left": np.eye(4), "right": np.eye(4)})
     assert set(results) == {"left"}
 
 
@@ -227,25 +307,25 @@ def test_recovers_the_true_arm_offset_and_its_distance():
     rng = np.random.default_rng(2)
     captures = []
     for _ in range(4):
-        left_t_wrist = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
-        right_t_wrist = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
-        left_t_board_true = np.linalg.inv(left_t_wrist) @ board_pose
+        left_t_flange = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
+        right_t_flange = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
+        left_t_board_true = np.linalg.inv(left_t_flange) @ board_pose
         # right's board pose, EXPRESSED IN right's own frame -- board_pose is in "left's frame"
         # here only because that is the ground truth we picked; right sees it through the
         # (also ground-truth) arm offset.
-        right_t_board_true = np.linalg.inv(right_t_wrist) @ np.linalg.inv(true_left_t_right) @ board_pose
+        right_t_board_true = np.linalg.inv(right_t_flange) @ np.linalg.inv(true_left_t_right) @ board_pose
         captures.append(
             ArmPairCapture(
-                left_t_wrist=left_t_wrist,
+                left_t_flange=left_t_flange,
                 left_wrist_t_board=left_t_board_true,
-                right_t_wrist=right_t_wrist,
+                right_t_flange=right_t_flange,
                 right_wrist_t_board=right_t_board_true,
                 left_reproj_error_px=0.1,
                 right_reproj_error_px=0.1,
             )
         )
 
-    result = solve_arm_offset(captures)
+    result = solve_arm_offset(captures, left_extrinsic=np.eye(4), right_extrinsic=np.eye(4))
     assert np.allclose(result.left_t_right, true_left_t_right, atol=1e-8)
     assert np.isclose(result.distance_m, float(np.linalg.norm(true_left_t_right[:3, 3])), atol=1e-8)
     assert result.n_captures == 4
@@ -255,7 +335,7 @@ def test_recovers_the_true_arm_offset_and_its_distance():
 def test_arm_offset_refuses_a_single_capture():
     c = ArmPairCapture(np.eye(4), np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
     with pytest.raises(ValueError, match="at least 2"):
-        solve_arm_offset([c])
+        solve_arm_offset([c], left_extrinsic=np.eye(4), right_extrinsic=np.eye(4))
 
 
 # --------------------------------------------------------------------------------------- #
@@ -280,7 +360,8 @@ def test_unify_fuses_agreeing_estimates_with_a_small_cross_check():
                 0.1,
                 0.1,
             ),
-        ]
+        ],
+        wrist_extrinsic=np.eye(4),
     )
     right_result = solve_agentview_extrinsic(
         [
@@ -293,7 +374,8 @@ def test_unify_fuses_agreeing_estimates_with_a_small_cross_check():
                 0.1,
                 0.1,
             ),
-        ]
+        ],
+        wrist_extrinsic=np.eye(4),
     )
     arm_offset = ArmOffsetResult(
         true_left_t_right, float(np.linalg.norm(true_left_t_right[:3, 3])), 4, 0.0, 0.0, [], []
@@ -323,7 +405,8 @@ def test_unify_falls_back_to_whichever_single_arm_is_available():
                 0.1,
                 0.1,
             ),
-        ]
+        ],
+        wrist_extrinsic=np.eye(4),
     )
     arm_offset = ArmOffsetResult(np.eye(4), 0.0, 2, 0.0, 0.0, [], [])
 

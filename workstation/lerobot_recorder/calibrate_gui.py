@@ -1,9 +1,12 @@
-"""Calibrate agentview's extrinsic against a ChArUco board sitting on the desk.
+"""Calibrate the whole camera rig against one ChArUco board sitting on the desk.
 
-See :mod:`workstation.lerobot_recorder.charuco` for the geometry this drives: the board never
-moves, and a wrist camera's pose is already known at every instant (published extrinsic + that
-arm's own FK, the same ``WristCameraGeometry`` the candidate-fan renderer uses), so it stands in
-for a ruler between the board and that arm's own frame.
+From a single board (never moved, never attached to the robot) this recovers, per re-solve, in
+order -- see :mod:`workstation.lerobot_recorder.charuco` for the geometry:
+
+1. **each wrist camera's own extrinsic** (``gripper_T_camera``), by eye-in-hand hand-eye
+   calibration -- so the mount is measured, not trusted from the unverified CAD constant;
+2. **each agentview extrinsic**, chained through that arm's (now measured) wrist extrinsic;
+3. **the left<->right arm offset**, and the fused/cross-checked shared-frame answer.
 
 YAM is bimanual, so BOTH wrist cameras can bridge -- whichever one currently has the board in
 view. Live preview of agentview + both wrists with the board outline drawn when found; hit
@@ -13,44 +16,30 @@ pose is worth capturing, so a keyboard is not always reachable), or click Captur
 gated by the exact same readiness check, so none of them can capture out of a bad state. Grabs one
 sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not have to be
 posed at once, and when they are, one press banks two independent estimates instead of one). Move
-the arm(s) to a few different poses that keep the board in view and capture at each.
-Whenever a press happens to catch BOTH wrist cameras seeing the board AT ONCE, it also banks an
-``ArmPairCapture`` for free -- no separate button, no extra step -- towards the arm-to-arm offset
-(see below); this needs both arms actually posed together for at least a couple of presses, which
-the single-arm agentview captures do not require.
+the arm(s) to a few different poses -- **varying wrist TILT, not just position**, which hand-eye
+needs -- and capture at each. Whenever a press happens to catch BOTH wrist cameras seeing the
+board AT ONCE, it also banks an ``ArmPairCapture`` for free towards the arm-to-arm offset; this
+needs both arms actually posed together for at least a couple of presses.
 
 The solve re-runs automatically after every capture -- no need to click "Solve" and wait; watch
-the numbers on screen while you work instead of guessing how many more poses to collect. It
-produces ONE extrinsic PER ARM, not one pooled answer: each arm's ``WristCameraGeometry`` is its
-own MJCF loaded in isolation, with no known transform to the other arm's -- there is no shared
-"robot base" frame anywhere in this codebase (see ``charuco``'s module docstring). Mixing left-
-and right-wrist captures into one solve would silently average two different questions' answers
-together, so ``solve_agentview_extrinsic_per_arm`` groups by arm first. Each arm's result reports
-how much ITS OWN captures disagree with each other (this calibration's confidence number, not a
-separate validation step) alongside a **convergence trend**: the RMS from the last several
-re-solves, so "still dropping" (keep capturing) reads differently on screen from "flat for the
-last 3" (this arm is done) -- see ``_convergence_note``.
-
-When at least 2 paired captures exist too, the live solve ALSO recovers ``left_T_right`` (the
-physical offset between the two arms -- distance included) and, when both single-arm extrinsics
-solved, fuses them into one shared-frame answer with a cross-check: bridge the right-arm
-extrinsic through ``left_T_right`` and compare it to the direct left-arm one, which is an
-end-to-end confidence number on all three calibrations at once (see
-``charuco.unify_rig_calibration``). "Solve" (the button) forces an immediate re-run and, if
-nothing has been captured yet, is the one that actually complains about it.
+the numbers on screen while you work instead of guessing how many more poses to collect. Hand-eye
+(step 1) needs 3+ varied-orientation captures per arm; until an arm reaches that, steps 2-3 fall
+back to the CAD wrist extrinsic (and say so) so they still produce an early, less-trustworthy
+answer. Everything is PER ARM, never pooled: each arm's ``WristCameraGeometry`` is its own MJCF
+with no known transform to the other's -- there is no shared "robot base" frame anywhere in this
+codebase (see ``charuco``'s module docstring), which is exactly what the arm offset (step 3)
+recovers. Each line carries a **convergence trend** (the RMS from the last several re-solves) so
+"still dropping" reads differently from "flat for the last 3".
 
 "Save" writes into ``config.yaml`` -- THE single source of truth for the rig (camera serials,
-robot host, button map, ... all already live there; see its own header comment). A confirmation
-dialog names the file first, a ``.bak`` copy is kept before writing, and only the touched blocks
-change -- ``cameras.agentview.extrinsic.<arm>`` per arm, ``robot.arm_offset`` if solved, and
-``cameras.agentview.extrinsic.unified`` (the fused answer, recommended for a consumer that does
-not want to redo the fusion itself) whenever both arms solved together -- via a line-range splice
-(see ``charuco.splice_agentview_extrinsic``/``splice_arm_offset``/``splice_agentview_unified``),
-not a YAML load/dump round trip: config.yaml is heavily commented and a round trip would strip
-every comment and reflow the whole document. ``unified`` is derived from the other two, but safe
-to store anyway: every save recomputes and writes all three from the SAME live solve in one call,
-so there is no window where this tool's own writes could disagree -- only a config.yaml
-hand-edited afterward could make them drift.
+robot host, button map, ... all already live there). A confirmation dialog names the file first,
+a ``.bak`` copy is kept before writing, and only the touched blocks change --
+``cameras.wrist_<arm>.extrinsic`` (the hand-eye mount, overriding CAD), ``cameras.agentview
+.extrinsic.<arm>`` per arm, ``cameras.agentview.extrinsic.unified`` (the fused answer) when both
+arms solved, and ``robot.arm_offset`` -- via a line-range splice (see ``charuco.splice_*``), not
+a YAML load/dump round trip that would strip every comment and reflow the whole document. All
+blocks are written from the SAME live solve in one call, so nothing this tool writes can disagree
+with anything else it writes.
 """
 
 from __future__ import annotations
@@ -61,6 +50,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
+from yam_policy.viz import T_GRIPPER_CAMERA
 
 from i2rt.serving.teleop_common import handle_button_pressed
 from workstation.lerobot_recorder import theme
@@ -72,12 +62,16 @@ from workstation.lerobot_recorder.charuco import (
     CalibrationResult,
     Capture,
     UnifiedRigCalibration,
+    WristExtrinsicResult,
     detect_board_pose,
     solve_agentview_extrinsic_per_arm,
     solve_arm_offset,
+    solve_wrist_extrinsic_per_arm,
     splice_agentview_extrinsic,
     splice_agentview_unified,
     splice_arm_offset,
+    splice_board,
+    splice_wrist_extrinsic,
     unify_rig_calibration,
 )
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -145,7 +139,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         capture_buttons: Sequence[str] = ("left.1", "right.1"),
     ) -> None:
         super().__init__()
-        self.setWindowTitle("Calibrate agentview -- board via wrist_left / wrist_right")
+        self.setWindowTitle("Calibrate rig -- wrist extrinsics, agentview, arm offset (one desk board)")
         self.cams = cams
         self.robot = robot
         self.geometries = geometries
@@ -170,6 +164,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         # One (n_captures, translation_rms_mm, rotation_rms_deg) appended per re-solve that
         # actually added a new capture -- see _convergence_note and _record.
         self._history: Dict[str, List[tuple]] = {arm: [] for arm in self.arms}
+        self._wrist_history: Dict[str, List[tuple]] = {arm: [] for arm in self.arms}
         self._offset_history: List[tuple] = []
 
         self._build_ui()
@@ -237,6 +232,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.result_label)
 
         # What the last successful _solve_and_report found -- what _on_save actually writes.
+        self._last_wrist: Dict[str, WristExtrinsicResult] = {}
         self._last_results: Dict[str, CalibrationResult] = {}
         self._last_arm_offset: Optional[ArmOffsetResult] = None
         self._last_unified: Optional[UnifiedRigCalibration] = None
@@ -335,10 +331,11 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             q = self._last_q.get(arm)
             if det is None or q is None:
                 continue
-            base_t_wrist = self.geometries[arm].camera_pose(q)
             cap = Capture(
                 arm=arm,
-                base_t_wrist=base_t_wrist,
+                # FK ONLY (no camera extrinsic) -- so the solve can hand-eye the mount itself and
+                # apply the measured value, not the CAD one baked in here. See charuco docstring.
+                base_t_flange=self.geometries[arm].flange_pose(q),
                 wrist_t_board=det.cam_t_board,
                 agentview_t_board=self._last_agent_det.cam_t_board,
                 wrist_reproj_error_px=det.reproj_error_px,
@@ -357,9 +354,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             if left_det is not None and right_det is not None and left_q is not None and right_q is not None:
                 self.pair_captures.append(
                     ArmPairCapture(
-                        left_t_wrist=self.geometries["left"].camera_pose(left_q),
+                        left_t_flange=self.geometries["left"].flange_pose(left_q),
                         left_wrist_t_board=left_det.cam_t_board,
-                        right_t_wrist=self.geometries["right"].camera_pose(right_q),
+                        right_t_flange=self.geometries["right"].flange_pose(right_q),
                         right_wrist_t_board=right_det.cam_t_board,
                         left_reproj_error_px=left_det.reproj_error_px,
                         right_reproj_error_px=right_det.reproj_error_px,
@@ -410,32 +407,56 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             self.result_label.setText("not solved yet -- capture at least 2 per arm")
             self.save_btn.setEnabled(False)
             return
-        results = solve_agentview_extrinsic_per_arm(self.captures)
 
         lines = []
+
+        # Step 1: each arm's own wrist-camera extrinsic (gripper_T_camera), by hand-eye. Needs 3+
+        # captures with varied ORIENTATION; until then the agentview/offset solves below fall
+        # back to the CAD constant so they still produce a (less trustworthy) answer early on.
+        wrist = solve_wrist_extrinsic_per_arm(self.captures)
+        extrinsics = {}
+        for arm in self.arms:
+            if arm in wrist:
+                w = wrist[arm]
+                extrinsics[arm] = w.gripper_t_camera
+                self._record(self._wrist_history[arm], w.n_captures, w.translation_rms_mm, w.rotation_rms_deg)
+                quality = "good" if w.rotation_rms_deg < 1.0 and w.translation_rms_mm < 10.0 else "CHECK POSES"
+                lines.append(
+                    f"[wrist {arm}] hand-eye n={w.n_captures}  board-consistency RMS "
+                    f"{w.translation_rms_mm:.2f} mm / {w.rotation_rms_deg:.3f} deg  -- {quality}  "
+                    f"{_convergence_note(self._wrist_history[arm])}"
+                )
+            elif counts.get(arm):
+                extrinsics[arm] = T_GRIPPER_CAMERA  # CAD fallback until 3+ varied captures exist
+                lines.append(f"[wrist {arm}] {counts[arm]} capture(s) -- need 3+ (varied tilt) to hand-eye; using CAD")
+
+        # Step 2: agentview extrinsic per arm, chained through each arm's wrist extrinsic (solved
+        # above, or CAD fallback).
+        results = solve_agentview_extrinsic_per_arm(self.captures, wrist_extrinsics=extrinsics)
         for arm, result in results.items():
             self._record(self._history[arm], result.n_captures, result.translation_rms_mm, result.rotation_rms_deg)
             quality = (
                 "good" if result.rotation_rms_deg < 1.0 and result.translation_rms_mm < 10.0 else "CHECK CAPTURES"
             )
+            via = "hand-eye" if arm in wrist else "CAD extrinsic"
             lines.append(
-                f"[{arm}] n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
-                f"rotation RMS {result.rotation_rms_deg:.3f} deg  -- {quality}  "
+                f"[agentview {arm}] n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
+                f"rotation RMS {result.rotation_rms_deg:.3f} deg  ({via})  -- {quality}  "
                 f"{_convergence_note(self._history[arm])}"
             )
         for arm, n in counts.items():
             if arm not in results and n:
-                lines.append(f"[{arm}] {n} capture(s) -- need at least 2 to solve")
+                lines.append(f"[agentview {arm}] {n} capture(s) -- need at least 2 to solve")
 
-        # The arm-to-arm offset, and (once both single-arm extrinsics AND the offset exist) the
-        # fused/cross-checked shared-frame answer -- see charuco.py's module docstring for why
-        # this needs simultaneous both-wrists-see-the-board captures, not just any two captures.
-        # Both get written to config.yaml too (see _on_save) -- the fused one is recomputable
-        # from the other two, but every save writes all three together from this same live
-        # solve, so there is no window for them to disagree (see splice_agentview_unified).
+        # Step 3: the arm-to-arm offset, and (once both single-arm extrinsics AND the offset
+        # exist) the fused/cross-checked shared-frame answer -- see charuco.py's module docstring
+        # for why this needs simultaneous both-wrists-see-the-board captures. The offset bridges
+        # through each arm's wrist extrinsic too, so it also improves once hand-eye replaces CAD.
         arm_offset = None
-        if len(self.pair_captures) >= 2:
-            arm_offset = solve_arm_offset(self.pair_captures)
+        if len(self.pair_captures) >= 2 and "left" in extrinsics and "right" in extrinsics:
+            arm_offset = solve_arm_offset(
+                self.pair_captures, left_extrinsic=extrinsics["left"], right_extrinsic=extrinsics["right"]
+            )
             self._record(
                 self._offset_history, arm_offset.n_captures, arm_offset.translation_rms_mm, arm_offset.rotation_rms_deg
             )
@@ -457,17 +478,18 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
 
         self.result_label.setText("\n".join(lines) if lines else "not solved yet")
 
+        self._last_wrist = wrist
         self._last_results = results
         self._last_arm_offset = arm_offset
         self._last_unified = unified
-        self.save_btn.setEnabled(bool(results))
+        self.save_btn.setEnabled(bool(results) or bool(wrist))
 
     def _on_save(self) -> None:
         """Write the last solve into config.yaml -- see the module docstring for why this is a
-        line-range splice (charuco.splice_agentview_extrinsic/splice_arm_offset) rather than a
-        YAML load/dump round trip, and mirrors tuner_gui.py's ``_write_config`` (confirm dialog
-        naming the file, a ``.bak`` kept before writing, only the touched blocks change)."""
-        if not self._last_results and self._last_arm_offset is None:
+        line-range splice (charuco.splice_*) rather than a YAML load/dump round trip, and mirrors
+        tuner_gui.py's ``_write_config`` (confirm dialog naming the file, a ``.bak`` kept before
+        writing, only the touched blocks change)."""
+        if not self._last_results and self._last_arm_offset is None and not self._last_wrist:
             return
         if not self.config_path:
             QtWidgets.QMessageBox.critical(self, "No config.yaml", "No config.yaml was found to write into.")
@@ -476,8 +498,8 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             self,
             "Write config.yaml?",
             f"Write the solved extrinsic(s) into\n{self.config_path}\n\n"
-            "Only cameras.agentview.extrinsic and robot.arm_offset change; the rest of the file "
-            "(comments included) is left alone. A .bak copy of the current file is kept first.",
+            "Only cameras.wrist_*/agentview.extrinsic and robot.arm_offset change; the rest of the "
+            "file (comments included) is left alone. A .bak copy of the current file is kept first.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
@@ -490,9 +512,12 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             with open(self.config_path, encoding="utf-8") as fh:
                 original = fh.read()
             updated = original
+            for arm, w in self._last_wrist.items():
+                updated = splice_wrist_extrinsic(updated, arm, w, calibrated_at=calibrated_at)
+                written.append(f"wrist_{arm}.extrinsic")
             for arm, result in self._last_results.items():
                 updated = splice_agentview_extrinsic(updated, arm, result, calibrated_at=calibrated_at)
-                written.append(f"extrinsic.{arm}")
+                written.append(f"agentview.extrinsic.{arm}")
             if self._last_arm_offset is not None:
                 updated = splice_arm_offset(updated, self._last_arm_offset, calibrated_at=calibrated_at)
                 written.append("arm_offset")
@@ -502,6 +527,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 # it safe to store despite being recomputable.
                 updated = splice_agentview_unified(updated, self._last_unified, calibrated_at=calibrated_at)
                 written.append("extrinsic.unified")
+            # Record which physical board produced all of the above -- provenance, and so the next
+            # calibration auto-loads it (BoardSpec.from_config) without re-passing the flags.
+            updated = splice_board(updated, self.board, calibrated_at=calibrated_at)
+            written.append("calibration.board")
             # keep a .bak so a bad write is always recoverable -- same safety net tuner_gui's
             # own config.yaml writer uses.
             with open(self.config_path + ".bak", "w", encoding="utf-8") as fh:

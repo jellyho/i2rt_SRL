@@ -91,6 +91,17 @@ class WristCameraGeometry:
         """4x4 pose of the grasp point in the arm's base frame."""
         return self._frame(q, GRASP_SITE, "site")
 
+    def flange_pose(self, q: Sequence[float]) -> np.ndarray:
+        """4x4 pose of the flange body in the arm's base frame -- FK ONLY, no camera extrinsic.
+
+        This is ``camera_pose`` without ``@ self._extrinsic``: the frame the extrinsic is
+        measured *from*. Hand-eye calibration needs it as the "gripper" pose, precisely because
+        it is independent of the extrinsic being solved for (it comes from joint encoders + the
+        arm MJCF, neither of which knows or cares where the camera is mounted) -- see
+        ``charuco.solve_wrist_extrinsic``.
+        """
+        return self._frame(q, FLANGE_BODY, "body")
+
     def camera_pose(self, q: Sequence[float]) -> np.ndarray:
         """4x4 pose of the wrist camera's optical frame in the arm's base frame."""
         return self._frame(q, FLANGE_BODY, "body") @ self._extrinsic

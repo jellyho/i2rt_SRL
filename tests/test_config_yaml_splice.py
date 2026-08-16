@@ -13,14 +13,18 @@ import pytest
 
 from workstation.lerobot_recorder.charuco import (
     ArmOffsetResult,
+    BoardSpec,
     CalibrationResult,
     UnifiedRigCalibration,
+    WristExtrinsicResult,
     format_arm_offset_yaml,
     format_extrinsic_yaml,
     format_unified_yaml,
     splice_agentview_extrinsic,
     splice_agentview_unified,
     splice_arm_offset,
+    splice_board,
+    splice_wrist_extrinsic,
 )
 
 CONFIG = """\
@@ -235,6 +239,83 @@ def test_unified_omits_cross_check_fields_when_none():
     lines = format_unified_yaml(UnifiedRigCalibration(np.eye(4), np.eye(4), 0.0, None, None), calibrated_at="t")
     text = "\n".join(lines)
     assert "cross_check" not in text
+
+
+# --------------------------------------------------------------------------------------- #
+# splice_wrist_extrinsic -- the hand-eye mount, under cameras.wrist_<arm>.extrinsic
+# --------------------------------------------------------------------------------------- #
+def _wrist(t=(0.02, -0.03, 0.05)) -> WristExtrinsicResult:
+    m = np.eye(4)
+    m[:3, 3] = t
+    return WristExtrinsicResult(
+        arm="left",
+        gripper_t_camera=m,
+        n_captures=8,
+        translation_rms_mm=0.4,
+        rotation_rms_deg=0.05,
+        per_capture_translation_mm=[0.3, 0.5],
+        per_capture_rotation_deg=[0.04, 0.06],
+    )
+
+
+def test_wrist_extrinsic_expands_a_scalar_camera_and_adds_the_child():
+    """CONFIG's wrist_left is the scalar shorthand ("<serial>"); the splice must convert it to a
+    mapping (serial preserved) so an extrinsic child is valid YAML, not a scalar with children."""
+    yaml = pytest.importorskip("yaml")
+    out = splice_wrist_extrinsic(CONFIG, "left", _wrist((0.01, 0.02, 0.03)), calibrated_at="t")
+    parsed = yaml.safe_load(out)
+    node = parsed["cameras"]["wrist_left"]
+    assert node["serial"] == "352122271652"  # serial survived the scalar->mapping expansion
+    got = np.asarray(node["extrinsic"]["matrix"], dtype=np.float64)
+    assert np.allclose(got[:3, 3], [0.01, 0.02, 0.03], atol=1e-6)
+
+
+def test_wrist_extrinsic_works_on_a_mapping_form_camera_too():
+    yaml = pytest.importorskip("yaml")
+    out = splice_wrist_extrinsic(CONFIG, "left", _wrist(), calibrated_at="t")  # agentview is mapping-form
+    out = splice_wrist_extrinsic(out, "left", _wrist((0.09, 0.0, 0.0)), calibrated_at="t2")  # now wrist_left is too
+    parsed = yaml.safe_load(out)
+    got = np.asarray(parsed["cameras"]["wrist_left"]["extrinsic"]["matrix"], dtype=np.float64)
+    assert np.allclose(got[:3, 3], [0.09, 0.0, 0.0], atol=1e-6)  # re-splice replaced, not duplicated
+
+
+def test_wrist_extrinsic_leaves_the_other_wrist_and_agentview_alone():
+    out = splice_wrist_extrinsic(CONFIG, "left", _wrist(), calibrated_at="t")
+    assert "409122274199" in out  # wrist_right serial untouched
+    assert "246322303794" in out  # agentview serial untouched
+
+
+# --------------------------------------------------------------------------------------- #
+# splice_board -- the ChArUco geometry, under a top-level calibration.board
+# --------------------------------------------------------------------------------------- #
+def test_board_round_trips_through_config_and_from_config():
+    yaml = pytest.importorskip("yaml")
+    spec = BoardSpec(squares_x=7, squares_y=5, square_length_m=0.025, marker_length_m=0.018, dictionary="DICT_5X5_100")
+    out = splice_board(CONFIG, spec, calibrated_at="t")
+    parsed = yaml.safe_load(out)
+    assert BoardSpec.from_config(parsed["calibration"]["board"]) == spec
+
+
+def test_board_creates_the_calibration_section_when_absent_then_reuses_it():
+    out = splice_board(CONFIG, BoardSpec(), calibrated_at="t1")
+    out = splice_board(out, BoardSpec(squares_x=9), calibrated_at="t2")
+    assert sum(1 for ln in out.splitlines() if ln.strip().startswith("calibration:")) == 1
+    assert sum(1 for ln in out.splitlines() if ln.strip().startswith("board:")) == 1
+    assert '"t1"' not in out and '"t2"' in out
+
+
+def test_board_omits_calibrated_at_when_not_given():
+    """A caller that just wants to persist the geometry (not record a solve) should not get a
+    misleading timestamp."""
+    out = splice_board(CONFIG, BoardSpec())
+    assert "calibrated_at" not in out.split("board:", 1)[1]
+
+
+def test_from_config_falls_back_to_defaults_for_missing_keys():
+    partial = BoardSpec.from_config({"squares_x": 10})
+    assert partial.squares_x == 10
+    assert partial.squares_y == BoardSpec().squares_y  # the rest defaulted
+    assert BoardSpec.from_config(None) == BoardSpec()  # absent block -> all defaults
 
 
 # --------------------------------------------------------------------------------------- #

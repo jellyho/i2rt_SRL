@@ -539,67 +539,62 @@ go past at 30 fps was not worth much; the analysis belongs with the dataset.
 No extra checkout and no `matplotlib`: the fan drawing is vendored (PIL only), so this needs
 nothing the recorder env does not already have.
 
-## F. Calibrate agentview's extrinsic
+## F. Calibrate the camera rig
 
-`render-samples`' fan is drawn on the wrist view because that camera's pose is already known
-(published extrinsic + FK). agentview's is not — nothing ties it to either arm's frame by
-default, and **there is no shared "robot base" frame between the two arms either** (each
-`WristCameraGeometry` loads its arm's MJCF in isolation; left and right have no known transform
-between them anywhere in this codebase). `calibrate-agentview` gets agentview's extrinsic *per
-arm* from a ChArUco board left sitting on the desk (never moved, never attached to the robot),
-using that arm's wrist camera as the bridge:
+`render-samples`' fan is drawn on the wrist view because that camera's pose is "known" from FK +
+a **CAD** wrist extrinsic (`T_GRIPPER_CAMERA`) that was never checked against the built hardware;
+agentview's pose is not known at all; and **there is no shared "robot base" frame between the two
+arms either** (each `WristCameraGeometry` loads its arm's MJCF in isolation, with no known
+transform to the other). `calibrate` fixes all of that from ONE ChArUco board left sitting on the
+desk (never moved, never attached to the robot), recovering — per arm where applicable:
+
+1. **each wrist camera's own extrinsic** (`gripper_T_camera`), by eye-in-hand hand-eye
+   calibration — so the mount is *measured*, replacing the unverified CAD constant;
+2. **each agentview extrinsic**, chained through that arm's now-measured wrist extrinsic;
+3. **the left↔right arm offset** (`left_T_right`, with straight-line distance), and a fused,
+   cross-checked shared-frame answer.
 
 ```bash
-workstation/yam-data calibrate-agentview
-workstation/yam-data calibrate-agentview --arms left     # only the left wrist bridges
-workstation/yam-data calibrate-agentview --mock          # GUI shell only, no hardware
+workstation/yam-data calibrate
+workstation/yam-data calibrate --arms left     # only the left wrist bridges
+workstation/yam-data calibrate --mock          # GUI shell only, no hardware
 ```
 
-Print a ChArUco board (default 8x6 squares, 30mm/22mm — pass `--squares-x/-y`,
-`--square-length-m`, `--marker-length-m` to match a different one; **measure the printed squares,
-don't trust the page-fit scale**) and set it on the desk in view of agentview. Both wrist cameras
-bridge by default (YAM is bimanual — `--arms left` to use only one); move either arm so its wrist
-camera also sees the board, then **capture** — press **Space**, the **lower button on either
-leader handle** (`left.1`/`right.1` by default; `--capture-button left.0` to use a different one,
-or `--capture-button` with no value to disable the handle trigger and keep Space only), or click
-the on-screen button — all three are gated by the exact same readiness check. Move to a few more
-poses and capture again at each — the board itself never moves; **the solve re-runs after every
-capture automatically**, no separate step, and shows a live convergence trend (the RMS from the
-last several re-solves) so you can watch it settle instead of guessing how many poses are enough.
-It produces one extrinsic *per arm* — never pooled across arms, since that would silently average
-two unrelated coordinate frames together — and each one reports how much its own arm's captures
-disagree with each other in mm/degrees.
+Set the ChArUco board on the desk in view of agentview. Board geometry comes from
+`config.yaml`'s `calibration.board` (auto-loaded, and written back after each calibration);
+override per-run with `--squares-x/-y`, `--square-length-m`, `--marker-length-m`, `--dictionary`.
+**Measure the printed squares — don't trust the page-fit scale.** Both wrist cameras bridge by
+default (YAM is bimanual — `--arms left` to use only one); move an arm so its wrist camera also
+sees the board, then **capture** — press **Space**, the **lower button on either leader handle**
+(`left.1`/`right.1` by default; `--capture-button left.0` for a different one, or
+`--capture-button` with no value to keep Space only), or click the on-screen button — all gated
+by the same readiness check. Capture at several poses, **varying wrist TILT, not just position**,
+which hand-eye needs (a set all at the same tilt returns a confident-looking but wrong mount).
 
-**Also recovers the arm-to-arm offset, for free, off the same board.** Whenever a capture happens
-to catch BOTH wrist cameras seeing the (unmoved) board at once — pose both arms toward it
-together for a couple of captures — it also banks a sample toward `left_T_right`: the physical
-transform, and straight-line distance, between the two arms' own FK origins (recovered from the
-board, not measured with a ruler). Once at least 2 such paired samples exist, the live solve
-reports that offset alongside the per-arm results, and — when both single-arm extrinsics also
-solved — cross-checks them: bridge the right-arm extrinsic through the offset and compare it to
-the direct left-arm one. A small cross-check number is an end-to-end confidence check on all
-three calibrations (left-agentview, right-agentview, left-right) at once, not a separate
-validation step.
+**The solve re-runs after every capture automatically**, no separate step, with a live
+convergence trend (RMS over the last few re-solves) per line so you can watch it settle. Hand-eye
+(step 1) needs **3+ varied captures** per arm; until an arm reaches that, steps 2–3 fall back to
+the CAD wrist extrinsic and say so on screen. Everything is *per arm*, never pooled across arms
+(that would silently average two unrelated frames). The arm-offset sample is banked for free
+whenever a capture catches BOTH wrists seeing the board at once — pose both arms toward it
+together for a couple of captures. When both arms and the offset have solved, the fused answer's
+**cross-check** (bridge the right extrinsic through the offset, compare to the direct left one) is
+an end-to-end confidence number on all three calibrations at once, not a separate step.
 
-**Save writes into `config.yaml` itself** — the file `--config` points at, or the
-auto-discovered one — not a separate output file: that is already THE single source of truth for
-the rig (camera serials, robot host, button map, ...), so it is the one place any tool that
-already calls `load_rig()` would look for this too. A confirmation dialog names the file first, a
-`.bak` copy of the untouched original is kept before writing, and only the touched blocks change
-— `cameras.agentview.extrinsic.<arm>` per arm that solved, `robot.arm_offset` if solved, and
-`cameras.agentview.extrinsic.unified` (the fused answer — the one to actually use unless a
-consumer specifically needs a single arm's own frame) whenever both arms solved together — via a
-line-range splice, the same technique `workstation/yam-data tune`'s "write config.yaml" button
-already uses: **not** a `yaml.safe_load`/dump round trip, which would strip every comment and
-reflow the whole heavily-commented file. Re-running the calibration later replaces just that
-arm's entry, without disturbing the other arm's previously-saved one.
-
-`unified` IS recomputable from `extrinsic.left`/`.right` + `arm_offset` — but it is written
-anyway, not left "deliberately redundant": every save recomputes and writes all three from the
-same live solve in one call, so there is no window for this tool's own writes to disagree with
-each other. The only way they could drift is a `config.yaml` hand-edited afterward — the same
-risk any derived value in a hand-editable file carries, and a smaller one than making every
-consumer redo the fusion math itself and risk getting it wrong.
+**Save writes into `config.yaml` itself** — the file `--config` points at, or the auto-discovered
+one — not a separate output file: that is already THE single source of truth for the rig, so it
+is the one place any tool that calls `load_rig()` would look. A confirmation dialog names the file
+first, a `.bak` of the untouched original is kept, and only the touched blocks change:
+`cameras.wrist_<arm>.extrinsic` (the hand-eye mount, overriding the CAD default a
+`WristCameraGeometry` consumer would otherwise use), `cameras.agentview.extrinsic.<arm>` +
+`.unified` (the fused answer — use this one unless you specifically need a single arm's frame),
+`robot.arm_offset`, and `calibration.board` (which board produced all of the above). It is a
+line-range splice — the same technique `workstation/yam-data tune`'s "write config.yaml" button
+uses — **not** a `yaml.safe_load`/dump round trip, which would strip every comment and reflow the
+whole heavily-commented file. Re-running later replaces just the entries it re-solved, leaving
+the other arm's (and everything else) intact. `unified` is recomputable from its parts but stored
+anyway: every save writes all blocks from the same live solve in one call, so nothing this tool
+writes can disagree with anything else it writes.
 
 Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
 separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
