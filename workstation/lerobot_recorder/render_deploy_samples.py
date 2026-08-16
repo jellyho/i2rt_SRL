@@ -34,16 +34,22 @@ What it does:
      (``WristCameraGeometry``) and projects into that arm's wrist camera (``WristProjector``),
      using the joint state at the start of the replan -- the camera rides the wrist, so a later
      pose does not describe where these candidates were projected from.
-  4. Draws the fan on the recorded wrist frame (``_draw_fan``) and writes an mp4.
+  4. Also projects each arm's candidates into the FIXED agentview, through that arm's calibrated
+     ``base_T_agentview`` (config, board-on-gripper solve): agentview does not ride the arm, so
+     this needs no joint pose, no arm_offset, and no shared frame -- each arm's chunk lives in its
+     own base frame and its own extrinsic places it (left fan green, right fan amber).
+  5. Draws the fans on the recorded frames (``_draw_fan``) and writes an mp4.
 
     workstation/yam-data render-samples \\
         --repo-id my_deploy_run --episode 0 --arm left --horizon 30 --candidates 8 \\
         --out .scratch/deploy_samples.mp4
 
-The camera intrinsics default to the same placeholder ``tests/test_wrist_view.py`` uses
-("roughly a D405 at 640x480") -- pass ``--fx/--fy/--cx/--cy`` once the wrist camera is actually
-calibrated; until then the fan's *shape* (tight vs. spread) is meaningful, its exact pixel
-position is not.
+The WRIST intrinsics default to the same placeholder ``tests/test_wrist_view.py`` uses ("roughly
+a D405 at 640x480"); the AGENTVIEW ones to a rough D455 placeholder (``--agent-fx`` etc). The
+agentview EXTRINSIC is real (from config), so for its fan to line up exactly, pass the D455's own
+factory intrinsics -- the same ones the board-on-gripper solve read. Until then the fan's *shape*
+is meaningful, its exact pixel position is not. ``--agentview-arms`` picks which arms' fans to draw
+(default both; an arm with no calibrated extrinsic is skipped with a note).
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ import numpy as np
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
     from PIL.ImageFont import FreeTypeFont, ImageFont
+    from yam_policy.viz import CameraIntrinsics
 
     from workstation.lerobot_recorder.dataset_reader import DatasetReader
 
@@ -86,6 +93,52 @@ def _load_replan_chunk(
             return None
         steps.append(snap)
     return np.stack(steps, axis=1)  # [N, H, 14]
+
+
+def _project_fixed(points_base: np.ndarray, cam_t_base: np.ndarray, intr: "CameraIntrinsics") -> np.ndarray:
+    """[H, 3] base-frame points -> [H, 2] pixels in a FIXED camera, NaN where behind the lens.
+
+    The agentview counterpart of ``WristCameraGeometry.project``: that one derives the camera pose
+    from the current joints (the camera rides the wrist), but agentview is bolted to the world, so
+    the extrinsic is a constant ``cam_t_base`` (= ``agentview_T_base`` = ``inv(base_T_agentview)``,
+    the calibrated pose from config) that does not depend on the arm pose at all. NaN (not the
+    finite pixel the perspective divide would give) for points behind the lens, so a drawing
+    routine skips them instead of plotting a mirrored path -- same contract as the wrist projector.
+    """
+    points_base = np.asarray(points_base, dtype=float).reshape(-1, 3)
+    homo = np.concatenate([points_base, np.ones((len(points_base), 1))], axis=1)
+    cam = (cam_t_base @ homo.T).T[:, :3]
+    z = cam[:, 2]
+    in_front = z > 1e-6
+    safe_z = np.where(in_front, z, 1.0)
+    u = intr.fx * cam[:, 0] / safe_z + intr.cx
+    v = intr.fy * cam[:, 1] / safe_z + intr.cy
+    px = np.stack([u, v], axis=1)
+    px[~in_front] = np.nan
+    return px
+
+
+def _load_agentview_extrinsics(config_path: Optional[str], arms: List[str]) -> dict:
+    """{arm: agentview_T_base (4x4)} for each requested arm that has a calibrated extrinsic in
+    config.yaml (``cameras.agentview.extrinsic.<arm>.matrix`` is ``base_T_agentview``; inverted
+    here to project base-frame points INTO agentview). Arms without one are omitted, with a note --
+    the overlay just skips them rather than drawing a fan at a wrong pose."""
+    from i2rt.serving.rig_config import find_rig, load_rig
+
+    rig = load_rig(config_path)
+    extr = ((rig.get("cameras") or {}).get("agentview") or {}).get("extrinsic") or {}
+    out = {}
+    for arm in arms:
+        m = (extr.get(arm) or {}).get("matrix")
+        if m is None:
+            print(
+                f"agentview: no calibrated extrinsic for '{arm}' in {find_rig(config_path)} "
+                f"(run 'yam-data calibrate --board-on-gripper --arms {arm}') -- skipping its agentview fan",
+                file=sys.stderr,
+            )
+            continue
+        out[arm] = np.linalg.inv(np.asarray(m, dtype=float))
+    return out
 
 
 def _to_square(img: np.ndarray, size: int) -> np.ndarray:
@@ -117,15 +170,29 @@ def _finite_prefix(path: np.ndarray) -> Optional[list]:
     return pts if len(pts) >= 2 else None
 
 
-def _draw_fan(wrist_rgb: np.ndarray, paths: list, chosen: int = 0) -> np.ndarray:
-    """Overlay every candidate's projected path onto one wrist frame.
+# Per-arm fan colours (chosen-candidate gradient start/end). Left keeps the original green; right
+# gets an amber so both arms' fans read apart when drawn on the SAME agentview frame.
+_FAN_COLORS = {
+    "left": ((20, 140, 95), (190, 255, 225)),
+    "right": ((170, 95, 20), (255, 205, 140)),
+}
+
+
+def _draw_fan(
+    wrist_rgb: np.ndarray, paths: list, chosen: int = 0, *, colors: tuple = _FAN_COLORS["left"]
+) -> np.ndarray:
+    """Overlay every candidate's projected path onto one frame (wrist OR agentview).
 
     Ported from ACRFT's ``examples/robocasa/hud.py`` (``Dashboard._draw_paths``, PIL-only) and
     trimmed to what a plain multi-sample recording needs: no ``exec_steps``/committed-prefix
     split, since that is CriticSelectPolicy's partial-commit concept and MultiSamplePolicy always
     executes the whole chunk. The chosen candidate draws bright with a time gradient (so its
     direction of travel reads without an arrowhead); the rest draw translucent, drawn first so
-    the chosen one stays on top.
+    the chosen one stays on top. ``colors`` is ``(gradient_start, gradient_end)`` for the chosen
+    candidate -- per arm, so a left and a right fan on one agentview frame stay distinguishable.
+
+    Composited onto whatever is already on ``wrist_rgb``, so calling it twice (once per arm) layers
+    the second arm's fan over the first rather than erasing it.
     """
     from PIL import Image, ImageDraw
 
@@ -145,7 +212,7 @@ def _draw_fan(wrist_rgb: np.ndarray, paths: list, chosen: int = 0) -> np.ndarray
     if 0 <= chosen < len(paths):
         pts = _finite_prefix(paths[chosen])
         if pts is not None:
-            c0, c1 = (20, 140, 95), (190, 255, 225)
+            c0, c1 = colors
             n = len(pts) - 1
             for i in range(n):
                 t = i / max(n - 1, 1)
@@ -209,7 +276,9 @@ def _label(
     ImageDraw.Draw(canvas).text((x, y), text, font=font, fill=fill, anchor="la")
 
 
-def _compose_frame(agent_sq: np.ndarray, wrist_sq: np.ndarray, replan: int, step: int, cam: int) -> np.ndarray:
+def _compose_frame(
+    agent_sq: np.ndarray, wrist_sq: np.ndarray, replan: int, step: int, cam: int, *, agent_label: str, wrist_label: str
+) -> np.ndarray:
     """Agent view + fan-overlaid wrist view, hstacked flush (hf-utils' dataset-render layout),
     each panel bottom-left labelled on a translucent box instead of a separate header strip.
 
@@ -222,8 +291,8 @@ def _compose_frame(agent_sq: np.ndarray, wrist_sq: np.ndarray, replan: int, step
     canvas = Image.fromarray(np.concatenate([agent_sq, wrist_sq], axis=1))
     f_sm, f_md = _font(13), _font(15)
     _label(canvas, (8, 8), f"replan {replan}   step {step}", f_md)
-    _label(canvas, (8, cam - 24), "agentview", f_sm)
-    _label(canvas, (cam + 8, cam - 24), "wrist -- candidate fan", f_sm, fill=(178, 214, 197))
+    _label(canvas, (8, cam - 24), agent_label, f_sm)
+    _label(canvas, (cam + 8, cam - 24), wrist_label, f_sm, fill=(178, 214, 197))
     return np.asarray(canvas)
 
 
@@ -246,14 +315,25 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     intrinsics = CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy, width=640, height=480).scaled_to(
         camera_size, camera_size
     )
-    # Which 7 of the 14 recorded action dims are this arm's (see workstation.lerobot_recorder
+    # Which 7 of the 14 recorded action dims are each arm's (see workstation.lerobot_recorder
     # .config: joints 0..6 left, 7..13 right), and where in `observation.state`'s 42-d layout
-    # this arm's joint POSITIONS sit (pos block only -- vel/eff do not describe the pose).
-    arm_slice = slice(0, 7) if args.arm == "left" else slice(7, 14)
+    # each arm's joint POSITIONS sit (pos block only -- vel/eff do not describe the pose).
+    action_slices = {"left": slice(0, 7), "right": slice(7, 14)}
+    arm_slice = action_slices[args.arm]
     state_slice = slice(0, 7) if args.arm == "left" else slice(21, 28)
     wrist_key = "wrist_left" if args.arm == "left" else "wrist_right"
 
     projector = WristProjector(geometry, intrinsics, arm_slice=arm_slice)
+
+    # Agentview overlay: a FIXED third-person camera, so each arm's fan projects through its
+    # calibrated base_T_agentview (config, board-on-gripper solve) -- no wrist ride, no arm_offset,
+    # no shared frame needed: each arm's chunk lives in its own base frame and its own extrinsic
+    # places it. Arms without a calibrated extrinsic are skipped (see _load_agentview_extrinsics).
+    agentview_arms = list(dict.fromkeys(args.agentview_arms))
+    agent_extrinsics = _load_agentview_extrinsics(args.config, agentview_arms)
+    agent_intr = CameraIntrinsics(
+        fx=args.agent_fx, fy=args.agent_fy, cx=args.agent_cx, cy=args.agent_cy, width=640, height=480
+    ).scaled_to(camera_size, camera_size)
 
     starts = _replan_starts(n_frames, args.horizon)
     if not starts:
@@ -282,8 +362,27 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         # Pre-squash both frames ourselves (see _to_square) so the wrist one lines up with the
         # already-square-scaled intrinsics above.
         agent_sq = _to_square(agent, camera_size)
-        wrist_fan = _draw_fan(_to_square(wrist, camera_size), paths, chosen=0)
-        composed = _compose_frame(agent_sq, wrist_fan, replan_idx, step, camera_size)
+        # Each calibrated arm's candidate fan, projected into the fixed agentview and layered on
+        # (drawn per arm so left/right stay their own colour -- see _draw_fan / _FAN_COLORS).
+        for arm, cam_t_base in agent_extrinsics.items():
+            av_paths = [
+                _project_fixed(geometry.chunk_to_path(cand[:, action_slices[arm]]), cam_t_base, agent_intr)
+                for cand in chunk
+            ]
+            agent_sq = _draw_fan(agent_sq, av_paths, chosen=0, colors=_FAN_COLORS.get(arm, _FAN_COLORS["left"]))
+        wrist_fan = _draw_fan(_to_square(wrist, camera_size), paths, chosen=0, colors=_FAN_COLORS[args.arm])
+        agent_label = (
+            f"agentview -- {'+'.join(agent_extrinsics)} fan" if agent_extrinsics else "agentview (no extrinsic)"
+        )
+        composed = _compose_frame(
+            agent_sq,
+            wrist_fan,
+            replan_idx,
+            step,
+            camera_size,
+            agent_label=agent_label,
+            wrist_label=f"wrist {args.arm} -- candidate fan",
+        )
 
         for _ in range(max(1, args.hold)):
             frames.append(composed)
@@ -305,8 +404,18 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo-id", required=True, help="dataset repo id, as recorded (e.g. user/my_deploy_run)")
     p.add_argument("--root", default="~/lerobot_data")
+    p.add_argument("--config", default=None, help="config.yaml for agentview extrinsics; auto-discovered by default")
     p.add_argument("--episode", type=int, default=0)
-    p.add_argument("--arm", choices=["left", "right"], default="left")
+    p.add_argument("--arm", choices=["left", "right"], default="left", help="which wrist camera panel to show")
+    p.add_argument(
+        "--agentview-arms",
+        dest="agentview_arms",
+        nargs="*",
+        choices=["left", "right"],
+        default=["left", "right"],
+        help="which arms' candidate fans to overlay on agentview (default both; each uses its own "
+        "calibrated base_T_agentview -- arms without one are skipped)",
+    )
     p.add_argument("--horizon", type=int, required=True, help="action_horizon the server was started with")
     p.add_argument("--candidates", type=int, required=True, help="the --num-samples the server was started with")
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
@@ -319,6 +428,15 @@ def main() -> None:
     p.add_argument("--fy", type=float, default=430.0)
     p.add_argument("--cx", type=float, default=320.0)
     p.add_argument("--cy", type=float, default=240.0)
+    # Agentview (D455) intrinsics. The board-on-gripper solve USED the device's own factory
+    # intrinsics, so for the agentview fan to line up exactly, pass THAT camera's numbers here
+    # (rs-enumerate-devices, or the intrinsics the recorder logged). The defaults are a rough D455
+    # placeholder at 640x480 -- the fan's shape is meaningful with them, its exact pixel position
+    # is not, same caveat as the wrist intrinsics above.
+    p.add_argument("--agent-fx", type=float, default=390.0)
+    p.add_argument("--agent-fy", type=float, default=390.0)
+    p.add_argument("--agent-cx", type=float, default=320.0)
+    p.add_argument("--agent-cy", type=float, default=240.0)
     render(p.parse_args())
 
 
