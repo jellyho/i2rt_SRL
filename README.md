@@ -50,7 +50,7 @@ cameras: { agentview: "<D455>", wrist_left: "<D405>", wrist_right: "<D405>" }
 ```bash
 # 🤖 robot
 robot/yam canup                       # bring up the 4 CAN interfaces (after each boot)
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 # lift both gellos to engage; bring both home to stop & auto-return.
 ```
 
@@ -99,7 +99,7 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ### C · Deployment / DAgger (policy + human takeover)
 
 ```bash
-robot/yam deploy --mirror-kp 0.2 --feedback-kp 0.0      # 🤖 robot
+robot/yam deploy                                         # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
 workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
 # Left upper starts/stops rollout, or toggles fine control during intervention.

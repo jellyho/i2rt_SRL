@@ -99,13 +99,18 @@ def leader_arm_overrides() -> dict:
     return out
 
 
-# --- DAgger leader gains (separate for the two phases) -----------------------
-# Intervention is TOGGLED by a handle button (press once to take over, press again
-# to hand back). While intervening the human drives the follower with a free,
-# gravity-compensated leader (FEEDBACK=0); otherwise the policy drives and the
-# leader mirrors the applied policy command (MIRROR gain).
-DAGGER_MIRROR_KP: float = 0.2  # leader stiffness while the POLICY drives (leader mirrors policy)
-DAGGER_FEEDBACK_KP: float = 0.0  # human intervention stays gravity-compensated/free
+# --- DAgger leader gains ------------------------------------------------------
+# There are no DAgger-specific gains. The two phases each reuse a gain that already
+# exists, so there is one number to reason about per behaviour instead of four:
+#
+#   policy driving (leader MIRRORS the command)  -> the leader's own nominal PD, i.e.
+#       the yam.yml kp/kd it was built with. Leader and follower are the same arm and
+#       share that file, so mirroring under the same gains is what makes the leader
+#       track the way the follower does rather than lagging behind a softer spring.
+#
+#   human intervening (leader is HELD)           -> BILATERAL_KP above, the same
+#       constant teleop uses for the identical situation: a human holding the leader
+#       while the follower tracks. At 0 the leader is fully free (grav-comp idle).
 
 
 # --- Wrist payload for gravity compensation (e.g. a D405 camera) -------------

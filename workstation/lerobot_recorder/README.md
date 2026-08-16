@@ -250,7 +250,7 @@ component runs locally).
 ```bash
 # [robot]
 robot/yam canup                 # bring up the 4 CAN interfaces (after boot)
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 # lift both gellos to engage; bring both home to stop & auto-return.
 ```
 
@@ -259,7 +259,7 @@ robot/yam teleop --bilateral-kp 0.15
 ```bash
 # 1. [robot]   start the teleop server (serves state/action/gate over portal)
 robot/yam canup
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 
 # 2. [workstation]   start the recorder GUI
 workstation/yam-data record \
@@ -361,7 +361,7 @@ which are CAN-bus utilities rather than modes.
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
 robot/yam canup
-robot/yam deploy --mirror-kp 0.2
+robot/yam deploy
 
 # 2. [policy]   serve your policy (own env; openpi-compatible websocket)
 #               see policy_serving/README.md
@@ -400,7 +400,7 @@ no dataset is created, opened, or resumed and no frames are buffered.
 
 Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
 (it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /
-`--no-leader-mirror` only set the initial values; `robot/yam deploy --mirror-kp 0` makes
+`--no-leader-mirror` only set the initial values; `robot/yam deploy --no-leader-mirror` makes
 "no mirroring" the robot's own default. The mirror setting is latched workstation-side and
 re-applied on reconnect, so the robot never silently reverts mid-session.
 

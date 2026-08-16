@@ -23,7 +23,6 @@ policy:
 
 control:                     # overrides i2rt/serving/control_config (robot server)
   bilateral_kp: 0.0
-  dagger_feedback_kp: 0.0    # human teleop/intervention stays gravity-compensated/free
   fine_grained_scale: 0.4    # left.0 toggle: move leader 2.5x for 1x follower motion
   fine_grained_button: left.0
   fine_recenter_speed: 0.15  # rad/s leader target speed while leaving fine mode
@@ -45,8 +44,8 @@ control:                     # overrides i2rt/serving/control_config (robot serv
   # --- leader human-held feel (LEADER only; follower keeps yam.yml) ---
   # scalar = all joints, list = per arm joint (6). Omit = yam.yml defaults.
   # Applied ONLY while a human holds the leader: teleop ENGAGED and DAgger
-  # intervention (dagger_feedback_kp: 0 -> fully free intervention). Every other
-  # phase (homing, idle/before engage, policy mirroring) uses yam.yml originals.
+  # intervention (both use bilateral_kp; 0 -> fully free). Every other phase
+  # (homing, idle/before engage, policy mirroring) uses yam.yml originals.
   # leader_grav_comp_kd: [0.05, 0.05, 0.05, 0.15, 0.025, 0.025]
   leader_grav_comp_kd: [0.000, 0.000, 0.000, 0.0001, 0.0001, 0.0001]
   leader_coulomb_friction: [0.55, 0.4, 0.8, 0.07, 0.07, 0.07]

@@ -84,8 +84,12 @@ class StubFollower:
         z = np.zeros(self.n - 1)
         g = np.zeros(1)
         return {
-            "joint_pos": z, "joint_vel": z, "joint_eff": z,
-            "gripper_pos": g, "gripper_vel": g, "gripper_eff": g,
+            "joint_pos": z,
+            "joint_vel": z,
+            "joint_eff": z,
+            "gripper_pos": g,
+            "gripper_vel": g,
+            "gripper_eff": g,
         }
 
     def command_joint_pos(self, pos):
@@ -101,32 +105,37 @@ def _set_free_feel(monkeypatch):
     monkeypatch.setattr(cc, "LEADER_GRAV_COMP_KD", list(FREE_KD), raising=False)
 
 
-def _make_dagger(monkeypatch, feedback_kp: float, leader_kd: np.ndarray = None):
+def _make_dagger(monkeypatch, bilateral_kp: float, leader_kd: np.ndarray = None):
+    """DAgger intervention reuses teleop's BILATERAL_KP, so that is what is set here —
+    there is no DAgger-only feedback gain to pass through the config any more."""
+    from i2rt.serving import control_config as cc
     from i2rt.serving import controllers as ctl
 
     _set_free_feel(monkeypatch)
+    monkeypatch.setattr(cc, "BILATERAL_KP", bilateral_kp, raising=False)
     leader, follower = StubLeader(grav_comp_kd=leader_kd), StubFollower()
-    pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
-                       base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
+    pair = ctl.ArmPair(
+        side="left", leader=leader, follower=follower, base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0)
+    )
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
-    dc = ctl.DeployController(ctl.DeployConfig(feedback_kp=feedback_kp))
+    dc = ctl.DeployController(ctl.DeployConfig())
     return dc, leader, follower
 
 
 def test_mirror_applies_arm_default_grav_comp_kd(monkeypatch):
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7)})
     dc.step()
     kp, kd = leader.kp_kd_calls[-1]
-    assert np.allclose(kp, np.full(6, 10.0) * dc.mirror_kp)
+    assert np.allclose(kp, np.full(6, 10.0))  # the leader's own nominal kp, unscaled
     assert np.allclose(kd, GRAV_COMP_KD)  # damping ON while mirroring the policy
 
 
 def test_mirror_damping_ignores_leader_free_mode_override(monkeypatch):
     # leader built with leader_grav_comp_kd: 0 (free-mode feel) — the mirror phase
     # must still use the arm's ORIGINAL yam.yml damping, not the override.
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1, leader_kd=np.zeros(6))
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.1, leader_kd=np.zeros(6))
     dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7)})
     dc.step()
@@ -134,8 +143,8 @@ def test_mirror_damping_ignores_leader_free_mode_override(monkeypatch):
     assert np.allclose(kd, GRAV_COMP_KD)  # yam.yml value, damping stays ON
 
 
-def test_intervention_with_zero_feedback_kp_frees_leader(monkeypatch):
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.0)
+def test_intervention_with_zero_bilateral_kp_frees_leader(monkeypatch):
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.0)
     dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7)})
     dc.step()  # mirror phase leaves a PD command on the leader
@@ -143,7 +152,7 @@ def test_intervention_with_zero_feedback_kp_frees_leader(monkeypatch):
 
     dc.set_intervention(True)
     dc.step()
-    assert leader.idle_calls, "feedback_kp=0 intervention must enter grav-comp idle"
+    assert leader.idle_calls, "bilateral_kp=0 intervention must enter grav-comp idle"
     # the leader_grav_comp_kd override kd is passed explicitly (the leader itself
     # is BUILT with the yam.yml original) — intervention feels like teleop engaged
     assert np.allclose(leader.idle_calls[-1], FREE_KD)
@@ -151,7 +160,7 @@ def test_intervention_with_zero_feedback_kp_frees_leader(monkeypatch):
 
 
 def test_mirror_reverts_grav_ff_to_yam_defaults(monkeypatch):
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.0)
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.0)
     dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7)})
     dc.step()
@@ -160,7 +169,7 @@ def test_mirror_reverts_grav_ff_to_yam_defaults(monkeypatch):
 
 
 def test_intervention_restores_leader_override_grav_ff(monkeypatch):
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.0)
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.0)
     dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7)})
     dc.step()  # mirror -> originals
@@ -172,7 +181,7 @@ def test_intervention_restores_leader_override_grav_ff(monkeypatch):
 
 def test_dagger_stopped_uses_original_grav_ff(monkeypatch):
     # nobody driving, nobody holding -> yam.yml feel (human-held only during intervention)
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.0)
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.0)
     dc.step()
     assert np.allclose(leader.factor_calls[-1], ORIG_FACTOR)
     assert np.allclose(leader.coulomb_calls[-1], ORIG_COULOMB)
@@ -186,8 +195,9 @@ def _make_teleop(monkeypatch, **cfg_kw):
 
     _set_free_feel(monkeypatch)
     leader, follower = StubLeader(), StubFollower()
-    pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
-                       base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
+    pair = ctl.ArmPair(
+        side="left", leader=leader, follower=follower, base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0)
+    )
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
     tc = ctl.TeleopController(ctl.TeleopConfig(**cfg_kw))
     return tc, leader, follower
@@ -236,8 +246,8 @@ def test_motor_chain_robot_grav_ff_setters():
     assert np.allclose(r._coulomb_friction, 0.3)
 
 
-def test_intervention_with_feedback_kp_keeps_pd_force_feel(monkeypatch):
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+def test_intervention_with_bilateral_kp_keeps_pd_force_feel(monkeypatch):
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     dc.set_policy_running(True)
     dc.set_intervention(True)
     dc.step()
@@ -267,7 +277,7 @@ def test_mirroring_off_frees_the_leader_instead_of_driving_it(monkeypatch):
 
     Skipping alone would leave whatever PD gains were last commanded, so the handles
     would keep stiffly holding a stale target — worse than mirroring."""
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     dc.set_policy_running(True)
     dc.set_policy_action({"left": np.zeros(7)})
     dc.step()
@@ -282,7 +292,7 @@ def test_mirroring_off_frees_the_leader_instead_of_driving_it(monkeypatch):
 
 
 def test_mirroring_can_be_turned_back_on_mid_rollout(monkeypatch):
-    dc, leader, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, leader, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     dc.set_policy_running(True)
     dc.set_leader_mirror(False)
     dc.set_policy_action({"left": np.zeros(7)})
@@ -294,27 +304,28 @@ def test_mirroring_can_be_turned_back_on_mid_rollout(monkeypatch):
     dc.step()
     assert len(leader.cmd_calls) > n_cmds  # driving the leader again
     kp, _ = leader.kp_kd_calls[-1]
-    assert np.allclose(kp, np.full(6, 10.0) * dc.mirror_kp)
+    assert np.allclose(kp, np.full(6, 10.0))  # the leader's own nominal kp, unscaled
 
 
-def test_mirror_state_defaults_from_mirror_kp_and_is_reported(monkeypatch):
+def test_mirror_state_defaults_on_and_is_reported(monkeypatch):
     from i2rt.serving import controllers as ctl
 
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
-    assert dc._leader_mirror is True  # default mirror_kp > 0
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
+    assert dc._leader_mirror is True  # DeployConfig.leader_mirror default
     dc.step()
     assert dc.snapshot()["leader_mirror"] is True
     dc.set_leader_mirror(False)
     dc.step()
     assert dc.snapshot()["leader_mirror"] is False
 
-    # launching with --mirror-kp 0 means "do not mirror" rather than a silent no-op
+    # launching with --no-leader-mirror means "do not mirror" rather than a silent no-op
     _set_free_feel(monkeypatch)
     leader, follower = StubLeader(), StubFollower()
-    pair = ctl.ArmPair(side="left", leader=leader, follower=follower,
-                       base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0))
+    pair = ctl.ArmPair(
+        side="left", leader=leader, follower=follower, base_kp=np.full(6, 10.0), base_kd=np.full(6, 1.0)
+    )
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
-    assert ctl.DeployController(ctl.DeployConfig(mirror_kp=0.0))._leader_mirror is False
+    assert ctl.DeployController(ctl.DeployConfig(leader_mirror=False))._leader_mirror is False
 
 
 # --------------------------------------------------- gripper closed before a rollout
@@ -342,7 +353,7 @@ def _stateful(dc, gripper=0.6):
 def test_rollout_waits_for_the_gripper_to_close(monkeypatch):
     """Every recorded episode starts with the gripper shut, so a rollout that begins on an
     open one hands the policy a first observation it never saw in training."""
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.6)
 
     dc.set_policy_running(True)
@@ -360,7 +371,7 @@ def test_rollout_waits_for_the_gripper_to_close(monkeypatch):
 
 
 def test_already_closed_gripper_starts_immediately(monkeypatch):
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.0)
     dc.set_policy_running(True)
     assert dc._closing_grip is False
@@ -369,7 +380,7 @@ def test_already_closed_gripper_starts_immediately(monkeypatch):
 
 def test_closing_only_moves_the_gripper(monkeypatch):
     """The arm must not swing while the gripper shuts."""
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.6)
     for pair in dc.pairs.values():  # put the arm somewhere non-zero
         pair.follower._q[:-1] = np.linspace(0.1, 0.6, pair.follower.n - 1)
@@ -385,7 +396,7 @@ def test_closing_only_moves_the_gripper(monkeypatch):
 
 
 def test_reported_state_says_it_is_closing(monkeypatch):
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.6)
     dc.set_policy_running(True)
     dc.step()
@@ -393,7 +404,7 @@ def test_reported_state_says_it_is_closing(monkeypatch):
 
 
 def test_stop_cancels_a_pending_close(monkeypatch):
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.6)
     dc.set_policy_running(True)
     assert dc._closing_grip is True
@@ -407,7 +418,7 @@ def test_blocked_gripper_starts_anyway_after_the_timeout(monkeypatch):
     operator pressing a button that does nothing."""
     from i2rt.serving import controllers as ctl
 
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.6)
     dc.set_policy_running(True)
     assert dc._closing_grip is True
@@ -424,7 +435,7 @@ def test_gripper_is_held_closed_from_startup(monkeypatch):
     """The reported bug: `robot/yam deploy` came up and the gripper drifted open, because
     the stopped state commanded nothing at all. It must close on its own, before any
     rollout is requested."""
-    dc, _, follower = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, follower = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.7)
 
     for _ in range(500):  # just idle -- no set_policy_running anywhere
@@ -437,7 +448,7 @@ def test_gripper_is_held_closed_from_startup(monkeypatch):
 def test_idle_hold_does_not_stiffen_the_arm(monkeypatch):
     """Only the gripper gets a target away from where it is; the arm's command tracks its
     measured position, so it stays as back-drivable as it was when nothing was commanded."""
-    dc, _, _ = _make_dagger(monkeypatch, feedback_kp=0.1)
+    dc, _, _ = _make_dagger(monkeypatch, bilateral_kp=0.1)
     _stateful(dc, gripper=0.7)
     for pair in dc.pairs.values():
         pair.follower._q[:-1] = np.linspace(0.1, 0.6, pair.follower.n - 1)
@@ -455,6 +466,4 @@ def test_idle_hold_does_not_stiffen_the_arm(monkeypatch):
         pair.follower._q[:-1] += 0.3
     dc.step()
     for pair in dc.pairs.values():
-        np.testing.assert_allclose(
-            pair.follower.cmds[-1][:-1], pair.follower.get_joint_pos()[:-1], atol=1e-6
-        )
+        np.testing.assert_allclose(pair.follower.cmds[-1][:-1], pair.follower.get_joint_pos()[:-1], atol=1e-6)

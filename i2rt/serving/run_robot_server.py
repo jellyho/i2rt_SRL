@@ -1,7 +1,7 @@
 """Run the YAM robot server on the robot machine.
 
     python -m i2rt.serving.run_robot_server teleop  [--sim] [--bilateral-kp 0.15]
-    python -m i2rt.serving.run_robot_server deploy  [--sim] [--mirror-kp 0.2]
+    python -m i2rt.serving.run_robot_server deploy  [--sim] [--no-leader-mirror]
     python -m i2rt.serving.run_robot_server wrapper [--sim]            # replay target
 
 The workstation connects with :class:`i2rt.serving.robot_client.RobotClient`.
@@ -117,8 +117,15 @@ def main() -> None:
     pd.add_argument("--port", type=int, default=default_port)
     pd.add_argument("--sim", action="store_true")
     pd.add_argument("--home", default="")
-    pd.add_argument("--mirror-kp", type=float, default=cc.DAGGER_MIRROR_KP)
-    pd.add_argument("--feedback-kp", type=float, default=cc.DAGGER_FEEDBACK_KP)
+    # No gains here: mirroring uses the leader's own PD and intervention uses BILATERAL_KP
+    # (config.yaml `control.bilateral_kp`). This only picks the boot default for mirroring;
+    # the workstation sets it per run mode and re-applies it on reconnect.
+    pd.add_argument(
+        "--no-leader-mirror",
+        dest="leader_mirror",
+        action="store_false",
+        help="start with the leader hanging free while the policy drives",
+    )
     pd.add_argument("--fine-grained-scale", type=float, default=cc.FINE_GRAINED_SCALE)
     pd.add_argument("--fine-grained-button", default=cc.FINE_GRAINED_BUTTON)
     pd.add_argument("--fine-recenter-speed", type=float, default=cc.FINE_RECENTER_SPEED)
@@ -196,8 +203,7 @@ def main() -> None:
             DeployConfig(
                 sim=args.sim,
                 home=args.home,
-                mirror_kp=args.mirror_kp,
-                feedback_kp=args.feedback_kp,
+                leader_mirror=args.leader_mirror,
                 fine_grained_scale=args.fine_grained_scale,
                 fine_grained_button=args.fine_grained_button,
                 fine_recenter_speed=args.fine_recenter_speed,
