@@ -247,8 +247,8 @@ def _rms(values: Sequence[float]) -> float:
 
 @dataclasses.dataclass
 class Capture:
-    """One calibration sample: the arm's FK pose plus both cameras' independent board detections
-    at (as close to) that same instant.
+    """One calibration sample: the arm's FK pose + the WRIST board detection, and OPTIONALLY the
+    agentview board detection at (as close to) that same instant.
 
     ``arm`` records which wrist camera / FK model ``base_t_flange`` came from -- required so
     ``solve_agentview_extrinsic`` can refuse to mix frames it has no business averaging (see the
@@ -257,14 +257,20 @@ class Capture:
     ``base_t_flange`` is the EXTRINSIC-FREE flange pose (``WristCameraGeometry.flange_pose``),
     not ``flange @ extrinsic``: it is both what hand-eye needs as the gripper pose, and what lets
     the agentview solve be re-run against a freshly hand-eye'd extrinsic instead of the CAD one
-    baked in at capture time."""
+    baked in at capture time.
+
+    ``agentview_t_board`` is None when agentview did NOT see the board at this pose -- which is
+    common when agentview sits far from the workspace, so a board near a wrist is out of its view.
+    Such a capture still feeds the wrist hand-eye solve (which needs only the wrist + FK); it just
+    does not feed the agentview solve. That is what lets you calibrate the wrists first and link
+    agentview later, in one tool -- see ``solve_wrist_extrinsic`` vs ``solve_agentview_extrinsic``."""
 
     arm: str  # "left" | "right" -- whichever WristCameraGeometry built base_t_flange
     base_t_flange: np.ndarray  # 4x4, WristCameraGeometry.flange_pose(q) -- FK only, no extrinsic
     wrist_t_board: np.ndarray  # 4x4, wrist camera PnP (camera_T_board)
-    agentview_t_board: np.ndarray  # 4x4, agentview PnP
+    agentview_t_board: Optional[np.ndarray]  # 4x4 agentview PnP, or None if agentview did not see it
     wrist_reproj_error_px: float
-    agentview_reproj_error_px: float
+    agentview_reproj_error_px: Optional[float]  # None when agentview_t_board is None
 
 
 @dataclasses.dataclass
@@ -380,12 +386,14 @@ def solve_agentview_extrinsic(captures: Sequence[Capture], *, wrist_extrinsic: n
     one outlier estimate rather than silently degrading a shared intermediate everything else
     depends on.
 
+    Only captures where AGENTVIEW also saw the board (``agentview_t_board is not None``) are used
+    -- wrist-only captures (agentview out of view) feed hand-eye, not this. At least 2 such
+    captures are required.
+
     Every capture must be the SAME arm: see the module docstring for why mixing left- and
     right-wrist captures here would silently average two unrelated coordinate frames together.
     Use ``solve_agentview_extrinsic_per_arm`` for a mixed batch -- it calls this once per arm.
     """
-    if len(captures) < 2:
-        raise ValueError("need at least 2 captures (1 cannot show whether the estimates agree)")
     arms = {c.arm for c in captures}
     if len(arms) > 1:
         raise ValueError(
@@ -393,10 +401,13 @@ def solve_agentview_extrinsic(captures: Sequence[Capture], *, wrist_extrinsic: n
             "independent, uncalibrated frame (see the module docstring), so they cannot be "
             "solved together. Use solve_agentview_extrinsic_per_arm for a mixed batch."
         )
+    with_agentview = [c for c in captures if c.agentview_t_board is not None]
+    if len(with_agentview) < 2:
+        raise ValueError("need at least 2 captures where agentview ALSO saw the board")
     (arm,) = arms
 
     estimates = []
-    for c in captures:
+    for c in with_agentview:
         base_t_board = c.base_t_flange @ wrist_extrinsic @ c.wrist_t_board
         estimates.append(base_t_board @ np.linalg.inv(c.agentview_t_board))
 
@@ -404,7 +415,7 @@ def solve_agentview_extrinsic(captures: Sequence[Capture], *, wrist_extrinsic: n
     return CalibrationResult(
         arm=arm,
         base_t_agentview=out,
-        n_captures=len(captures),
+        n_captures=len(with_agentview),
         translation_rms_mm=_rms(per_t),
         rotation_rms_deg=_rms(per_r),
         per_capture_translation_mm=per_t,
@@ -425,16 +436,19 @@ def solve_agentview_extrinsic_per_arm(
     that one back, the same way a mixed collection session naturally produces uneven counts.
 
     ``wrist_extrinsics`` maps arm -> ``gripper_T_camera`` (hand-eye solve or CAD fallback); an arm
-    absent from it is skipped too, since there is no camera placement to chain through.
+    absent from it is skipped too, since there is no camera placement to chain through. An arm with
+    fewer than 2 captures where AGENTVIEW also saw the board is skipped as well (its wrist-only
+    captures still calibrated the wrist elsewhere; they just cannot place agentview).
     """
     by_arm: Dict[str, List[Capture]] = {}
     for c in captures:
         by_arm.setdefault(c.arm, []).append(c)
-    return {
-        arm: solve_agentview_extrinsic(group, wrist_extrinsic=wrist_extrinsics[arm])
-        for arm, group in by_arm.items()
-        if len(group) >= 2 and arm in wrist_extrinsics
-    }
+    out: Dict[str, CalibrationResult] = {}
+    for arm, group in by_arm.items():
+        if arm not in wrist_extrinsics or sum(c.agentview_t_board is not None for c in group) < 2:
+            continue
+        out[arm] = solve_agentview_extrinsic(group, wrist_extrinsic=wrist_extrinsics[arm])
+    return out
 
 
 @dataclasses.dataclass
@@ -442,7 +456,7 @@ class ArmPairCapture:
     """Both wrist cameras seeing the SAME (still, unmoved) board at once -- what
     ``solve_arm_offset`` needs.
 
-    Distinct from ``Capture``: that one only ever needs ONE wrist camera + agentview.
+    Distinct from ``Capture``: that one needs only ONE wrist camera (agentview optional).
     ``left_T_right`` needs BOTH wrist cameras in the same instant, since "the board did not move
     between these two detections" is the only thing tying the two independent FK chains
     together -- a left-wrist capture from one moment and a right-wrist capture from another,

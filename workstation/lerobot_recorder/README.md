@@ -577,6 +577,14 @@ button recenters), so only enable `--capture-button <side>.<index>` against a ro
 leaves them free. Capture at several poses, **varying wrist TILT, not just position**, which
 hand-eye needs (a set all at the same tilt can't resolve the mount's rotation).
 
+**agentview is optional per capture, so you can calibrate the wrists first and link agentview
+later.** A capture only needs a *wrist* to see the board (that feeds hand-eye); if agentview also
+sees it, that same capture additionally feeds the agentview solve — the status line says which.
+So with a board near a wrist (agentview out of view), you still bank wrist hand-eye samples;
+bring the board somewhere agentview can also see it and those captures link agentview on top. A
+pure wrist-only session solves and saves just the wrist extrinsics; agentview simply isn't
+written until it has ≥2 captures where it saw the board.
+
 **The solve re-runs after every capture automatically**, no separate step, with a live
 convergence trend (RMS over the last few re-solves) per line so you can watch it settle. Hand-eye
 (step 1) needs **3+ varied captures** per arm; until an arm reaches that, steps 2–3 fall back to

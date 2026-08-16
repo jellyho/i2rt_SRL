@@ -298,6 +298,61 @@ def test_per_arm_skips_an_arm_with_too_few_captures_instead_of_raising():
 
 
 # --------------------------------------------------------------------------------------- #
+# agentview optional: wrist-only captures (agentview out of view) feed hand-eye, not agentview
+# --------------------------------------------------------------------------------------- #
+def test_wrist_only_captures_still_hand_eye_but_do_not_agentview():
+    """A high/far agentview may never see the board -- those captures must still calibrate the
+    wrist (hand-eye), and the agentview solve must simply skip that arm, not crash."""
+    true_g_t_c = _pose((0.02, -0.03, 0.05), axis="y", deg=25.0)
+    board = _pose((0.5, 0.1, 0.0), axis="z", deg=10.0)
+    caps = _wrist_captures(true_g_t_c, board)  # agentview_t_board is np.eye(4) placeholder...
+    # ...make it explicitly None: agentview never saw the board this session
+    caps = [Capture(c.arm, c.base_t_flange, c.wrist_t_board, None, c.wrist_reproj_error_px, None) for c in caps]
+
+    wrist = solve_wrist_extrinsic_per_arm(caps)
+    assert "left" in wrist  # hand-eye solved from wrist-only captures
+    assert np.allclose(wrist["left"].gripper_t_camera, true_g_t_c, atol=1e-8)
+
+    agentview = solve_agentview_extrinsic_per_arm(caps, wrist_extrinsics={"left": wrist["left"].gripper_t_camera})
+    assert agentview == {}  # nothing to place agentview against -> skipped, not raised
+
+
+def test_agentview_uses_only_the_captures_where_agentview_saw_the_board():
+    """A mix: some poses agentview saw, some it didn't. The agentview solve counts only the ones
+    it saw; the rest still counted toward hand-eye."""
+    true_base_t_agent = _pose((1.0, 0.0, 0.5))
+    g_t_c = _pose((0.03, 0.0, 0.0))
+    board = _pose((0.4, 0.0, 0.0))
+
+    def cap(wrist_t, *, agent_sees):
+        base_t_flange = _pose(wrist_t)
+        base_t_cam = base_t_flange @ g_t_c
+        return Capture(
+            "left",
+            base_t_flange,
+            np.linalg.inv(base_t_cam) @ board,
+            (np.linalg.inv(true_base_t_agent) @ board) if agent_sees else None,
+            0.1,
+            0.1 if agent_sees else None,
+        )
+
+    caps = [cap((0, 0, 0), agent_sees=True), cap((0.02, 0, 0), agent_sees=True), cap((0.04, 0, 0), agent_sees=False)]
+    result = solve_agentview_extrinsic(caps, wrist_extrinsic=g_t_c)
+    assert result.n_captures == 2  # only the two agentview-seeing captures
+    assert np.allclose(result.base_t_agentview, true_base_t_agent, atol=1e-8)
+
+
+def test_agentview_refuses_with_fewer_than_two_agentview_captures():
+    g_t_c = _pose((0.03, 0, 0))
+    board = _pose((0.4, 0, 0))
+    fl = _pose((0.0, 0, 0))
+    one = Capture("left", fl, np.linalg.inv(fl @ g_t_c) @ board, np.eye(4), 0.1, 0.1)
+    none = Capture("left", _pose((0.02, 0, 0)), np.eye(4), None, 0.1, None)
+    with pytest.raises(ValueError, match="at least 2"):
+        solve_agentview_extrinsic([one, none], wrist_extrinsic=g_t_c)
+
+
+# --------------------------------------------------------------------------------------- #
 # solve_arm_offset: left_T_right from simultaneous both-wrists-see-the-board captures
 # --------------------------------------------------------------------------------------- #
 def test_recovers_the_true_arm_offset_and_its_distance():

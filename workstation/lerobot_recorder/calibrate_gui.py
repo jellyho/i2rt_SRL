@@ -282,7 +282,12 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             preview = _draw_detection(agent_img, self._last_agent_det.corners_px if self._last_agent_det else None)
             self.agent_view.setPixmap(_np_to_pixmap(preview).scaled(self.agent_view.size(), QtCore.Qt.KeepAspectRatio))
 
+        # ready_arms: a wrist sees the board + we have its joints -> capturable (feeds hand-eye).
+        # agentview is NOT required here -- a capture where agentview also sees the board
+        # additionally feeds the agentview solve, but a wrist-only pose is still worth banking
+        # (this is what makes "calibrate wrists first, agentview later" possible).
         ready_arms = []
+        agent_ready_arms = []
         for arm in self.arms:
             key = f"wrist_{arm}"
             img = frames.get(key)
@@ -295,8 +300,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 self.wrist_views[arm].setPixmap(
                     _np_to_pixmap(preview).scaled(self.wrist_views[arm].size(), QtCore.Qt.KeepAspectRatio)
                 )
-            if self._last_agent_det is not None and det is not None and self._last_q[arm] is not None:
+            if det is not None and self._last_q[arm] is not None:
                 ready_arms.append(arm)
+                if self._last_agent_det is not None:
+                    agent_ready_arms.append(arm)
 
         # Teleop reports its engage state at the top level (controllers.py); None when a robot
         # does not report it (then auto-capture does not gate on engagement -- see below).
@@ -305,16 +312,15 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.capture_btn.setEnabled(bool(ready_arms))
         triggers = "Space" + (f"/leader button ({'/'.join(self.capture_buttons)})" if self.capture_buttons else "")
         auto = " · auto-capture: hold still" if self.auto_capture else ""
-        if self._last_agent_det is None:
-            self.status.setText("not ready -- board not seen in agentview")
-        elif ready_arms:
-            engaged_note = "" if self._engaged is None else (" [engaged]" if self._engaged else " [NOT engaged]")
-            self.status.setText(
-                f"ready ({triggers}){auto}{engaged_note}: {', '.join(ready_arms)} "
-                "(agentview + that wrist both see the board)"
-            )
+        if not ready_arms:
+            self.status.setText("not ready -- move a wrist camera so it sees the board")
         else:
-            self.status.setText("board seen in agentview but neither wrist sees it (or robot link is down)")
+            engaged_note = "" if self._engaged is None else (" [engaged]" if self._engaged else " [NOT engaged]")
+            if agent_ready_arms:
+                av = f" · agentview also sees it ({', '.join(agent_ready_arms)}) -> feeds agentview too"
+            else:
+                av = " · agentview does NOT see it -> wrist hand-eye only"
+            self.status.setText(f"ready ({triggers}){auto}{engaged_note}: {', '.join(ready_arms)}{av}")
 
         self._check_capture_button(robot_obs)
         self._auto_capture_check(ready_arms, self._engaged, time.monotonic())
@@ -394,28 +400,29 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ actions
     def _on_capture(self) -> None:
-        if self._last_agent_det is None:
-            return
+        agent = self._last_agent_det  # may be None -- agentview far / board out of its view
         added = 0
         for arm in self.arms:
             det = self._last_wrist_det.get(arm)
             q = self._last_q.get(arm)
             if det is None or q is None:
-                continue
+                continue  # this arm's wrist must at least see the board (hand-eye needs it)
             cap = Capture(
                 arm=arm,
                 # FK ONLY (no camera extrinsic) -- so the solve can hand-eye the mount itself and
                 # apply the measured value, not the CAD one baked in here. See charuco docstring.
                 base_t_flange=self.geometries[arm].flange_pose(q),
                 wrist_t_board=det.cam_t_board,
-                agentview_t_board=self._last_agent_det.cam_t_board,
+                # agentview optional: None when it did not see the board (feeds hand-eye only).
+                agentview_t_board=agent.cam_t_board if agent is not None else None,
                 wrist_reproj_error_px=det.reproj_error_px,
-                agentview_reproj_error_px=self._last_agent_det.reproj_error_px,
+                agentview_reproj_error_px=agent.reproj_error_px if agent is not None else None,
             )
             self.captures.append(cap)
+            av = f"agentview err {agent.reproj_error_px:.2f}px" if agent is not None else "agentview: not in view"
             self.capture_list.addItem(
                 f"#{len(self.captures)}  [{arm}]  wrist err {cap.wrist_reproj_error_px:.2f}px  "
-                f"agentview err {cap.agentview_reproj_error_px:.2f}px  ({time.strftime('%H:%M:%S')})"
+                f"{av}  ({time.strftime('%H:%M:%S')})"
             )
             added += 1
 
