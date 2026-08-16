@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO / "policy_serving"))
 
 from workstation.lerobot_recorder.config import ACTION_DIM, STATE_DIM, RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
-from workstation.lerobot_recorder.render_deploy_samples import _replan_starts, render
+from workstation.lerobot_recorder.render_deploy_samples import render
 
 CAMERAS = ("wrist_left", "wrist_right", "agentview")
 IMG = (64, 64, 3)
@@ -104,17 +104,6 @@ def _args(dataset: Path, out: Path, **over) -> argparse.Namespace:
 
 
 # --------------------------------------------------------------------------------------- #
-# Grouping ticks back into replans
-# --------------------------------------------------------------------------------------- #
-def test_only_whole_replans_are_rendered():
-    """A trailing partial replan has fewer than `horizon` snapshots, so its chunk cannot be
-    reassembled — rendering it would draw a fan from frames belonging to two different ones."""
-    assert _replan_starts(20, 5) == [0, 5, 10, 15]
-    assert _replan_starts(23, 5) == [0, 5, 10, 15]
-    assert _replan_starts(4, 5) == []
-
-
-# --------------------------------------------------------------------------------------- #
 # The render
 # --------------------------------------------------------------------------------------- #
 def test_it_writes_a_video_for_a_real_recorded_episode(recorded_run, tmp_path):
@@ -122,27 +111,31 @@ def test_it_writes_a_video_for_a_real_recorded_episode(recorded_run, tmp_path):
     assert out.is_file() and out.stat().st_size > 0
 
 
-def test_every_replan_is_held_for_the_requested_frames(recorded_run, tmp_path):
-    """The frame count is the one thing that says the whole episode was walked rather than a
-    file merely being produced."""
+def test_every_tick_is_rendered_not_just_each_chunk_start(recorded_run, tmp_path):
+    """The whole point of per-tick rendering: every frame of the episode is drawn (times --hold),
+    so you watch each chunk consumed -- not one held frame per chunk."""
     import imageio.v3 as iio
 
     out = render(_args(recorded_run, tmp_path / "held.mp4", hold=3))
     written = iio.imread(out, plugin="pyav")
-    assert len(written) == len(_replan_starts(FRAMES, HORIZON)) * 3
+    assert len(written) == FRAMES * 3  # every one of the episode's frames, held 3x
 
 
-def test_the_replan_limit_is_honoured(recorded_run, tmp_path):
+def test_the_chunk_limit_is_honoured(recorded_run, tmp_path):
     import imageio.v3 as iio
 
+    # 2 chunks of HORIZON ticks each, held 2x
     out = render(_args(recorded_run, tmp_path / "two.mp4", replans=2, hold=2))
-    assert len(iio.imread(out, plugin="pyav")) == 4
+    assert len(iio.imread(out, plugin="pyav")) == 2 * HORIZON * 2
 
 
-def test_a_horizon_longer_than_the_episode_is_refused(recorded_run, tmp_path):
-    """Rather than writing an empty video that looks like a rendering bug."""
-    with pytest.raises(SystemExit, match="shorter than"):
-        render(_args(recorded_run, tmp_path / "nope.mp4", horizon=FRAMES + 10))
+def test_a_horizon_longer_than_the_episode_renders_one_chunk(recorded_run, tmp_path):
+    """A horizon past the episode length just makes ONE (shorter) chunk covering all frames --
+    the whole trajectory is still rendered, tick by tick, rather than raising."""
+    import imageio.v3 as iio
+
+    out = render(_args(recorded_run, tmp_path / "one.mp4", horizon=FRAMES + 10, hold=1))
+    assert len(iio.imread(out, plugin="pyav")) == FRAMES  # every frame, as a single chunk
 
 
 def test_an_episode_that_is_not_there_is_refused(recorded_run, tmp_path):

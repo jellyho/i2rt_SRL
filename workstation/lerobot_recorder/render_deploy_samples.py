@@ -26,23 +26,23 @@ Two sources of the overlaid path, ``--source``:
     what the robot did in a dataset without a multi-sample deploy. No ``--candidates`` needed.
 
 What it does:
-  1. Groups an episode's ticks into replans of ``--horizon`` consecutive frames -- the chunk
-     size the server was started with. ActionChunkBroker re-queries the server only every
-     ``action_horizon`` ticks, so that many consecutive recorded frames share one replan's
-     candidates (see the module note on ``_replan_starts`` for what this assumes).
-  2. Reassembles each replan's per-tick ``[N, 14]`` snapshots back into an ``[N, H, 14]``
-     candidate chunk -- frame t's snapshot IS the candidates' predicted action at tick t of the
-     chunk (see ``MultiSamplePolicy.infer``'s docstring, in ACRFT, for why the wire format is
-     per-tick rather than candidate-major).
-  3. Runs one arm's joint-target candidates through real forward kinematics
-     (``WristCameraGeometry``) and projects into that arm's wrist camera (``WristProjector``),
-     using the joint state at the start of the replan -- the camera rides the wrist, so a later
-     pose does not describe where these candidates were projected from.
-  4. Also projects each arm's candidates into the FIXED agentview, through that arm's calibrated
+  1. Tiles an episode into chunks of ``--horizon`` consecutive frames on a fixed grid (the last
+     one may be shorter, so the WHOLE trajectory is covered). This mirrors ActionChunkBroker,
+     which re-queries the server every ``action_horizon`` ticks -- as long as streaming was
+     continuous; an intervention/homing forces an early replan the grid does not know about, so an
+     interrupted episode drifts out of alignment after the interruption (revisit via
+     ``observation.control_mode`` if that matters).
+  2. Reassembles each chunk's per-tick ``[N, 14]`` snapshots back into an ``[N, H, 14]`` candidate
+     chunk -- frame t's snapshot IS the candidates' predicted action at tick t of the chunk (see
+     ``MultiSamplePolicy.infer``'s docstring, in ACRFT, for the per-tick wire format).
+  3. Renders EVERY tick of the chunk (not just its start): the joint-target paths run through real
+     forward kinematics (``WristCameraGeometry``) once per chunk, and each wrist re-projects them
+     at that tick's own pose -- so you watch the arm consume the chunk, then jump to the next.
+  4. Also projects each arm's paths into the FIXED agentview, through that arm's calibrated
      ``base_T_agentview`` (config, board-on-gripper solve): agentview does not ride the arm, so
      this needs no joint pose, no arm_offset, and no shared frame -- each arm's chunk lives in its
-     own base frame and its own extrinsic places it (left fan green, right fan amber).
-  5. Draws the fans on the recorded frames (``_draw_fan``) and writes an mp4.
+     own base frame and its own extrinsic places it (left green, right amber).
+  5. Draws the overlays on the recorded frames (``_draw_fan``) and writes an mp4.
 
     # deploy fan on all three cameras (agentview + both wrists):
     workstation/yam-data render-samples \\
@@ -73,22 +73,9 @@ import numpy as np
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
     from PIL.ImageFont import FreeTypeFont, ImageFont
-    from yam_policy.viz import CameraIntrinsics
+    from yam_policy.viz import CameraIntrinsics, WristCameraGeometry
 
     from workstation.lerobot_recorder.dataset_reader import DatasetReader
-
-
-def _replan_starts(n_frames: int, horizon: int) -> List[int]:
-    """Tick indices where a fresh chunk starts, on a fixed grid from the episode's first frame.
-
-    ActionChunkBroker re-queries the server exactly every ``horizon`` ticks starting from the
-    first tick it drives, so replans land on a fixed grid *as long as streaming was continuous*.
-    An intervention or a homing return forces an early replan (``_reset_policy_chunk``) that this
-    does not know about -- a recorded episode that was interrupted mid-rollout will have its
-    candidate reassembly drift out of alignment after the interruption. Fine for a first pass;
-    revisit by reading ``observation.control_mode`` to re-sync on interruption if that matters.
-    """
-    return list(range(0, n_frames - horizon + 1, horizon))
 
 
 def _load_replan_chunk(
@@ -139,6 +126,20 @@ def _project_fixed(points_base: np.ndarray, cam_t_base: np.ndarray, intr: "Camer
     v = intr.fy * cam[:, 1] / safe_z + intr.cy
     px = np.stack([u, v], axis=1)
     px[~in_front] = np.nan
+    return px
+
+
+def _project_wrist(
+    geometry: "WristCameraGeometry", base_path: np.ndarray, q_now: np.ndarray, intr: "CameraIntrinsics"
+) -> np.ndarray:
+    """[H, 3] base-frame path -> [H, 2] pixels in the wrist camera at pose ``q_now``, NaN behind it.
+
+    The wrist camera rides the arm, so its pose is ``WristCameraGeometry.camera_pose(q_now)`` --
+    recomputed each tick as the arm executes, while the base-frame path itself is fixed. NaN for
+    points behind the lens (same contract as ``_project_fixed`` / the old ``WristProjector``)."""
+    proj = geometry.project(base_path, q_now, intr)  # [H, 3]; column 2 is the in-front mask
+    px = proj[:, :2].copy()
+    px[proj[:, 2] < 0.5] = np.nan
     return px
 
 
@@ -345,7 +346,7 @@ def _compose_frame(panels: list, panel_w: int, panel_h: int, *, header: str) -> 
 
 
 def render(args: argparse.Namespace) -> pathlib.Path:
-    from yam_policy.viz import CameraIntrinsics, WristCameraGeometry, WristProjector
+    from yam_policy.viz import CameraIntrinsics, WristCameraGeometry
 
     from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
     from workstation.lerobot_recorder.dataset_reader import DatasetReader
@@ -379,9 +380,6 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     xml = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
     wrist_extr = _load_wrist_extrinsics(args.config)
     geometries = {arm: WristCameraGeometry(xml, extrinsic=wrist_extr.get(arm)) for arm in ("left", "right")}
-    projectors = {
-        arm: WristProjector(geometries[arm], wrist_intr, arm_slice=action_slices[arm]) for arm in ("left", "right")
-    }
 
     # Agentview: a FIXED third-person camera, so each arm's overlay projects through its calibrated
     # base_T_agentview (config, board-on-gripper solve) -- no wrist ride, no arm_offset, no shared
@@ -391,74 +389,85 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     agent_extrinsics = _load_agentview_extrinsics(args.config, agentview_arms)
     wrists = list(dict.fromkeys(args.wrists))
 
-    starts = _replan_starts(n_frames, args.horizon)
-    if not starts:
-        raise SystemExit(f"episode has {n_frames} frames, shorter than --horizon {args.horizon}")
+    # Chunks tile the episode on a fixed grid of `horizon` ticks (the last one may be shorter, so
+    # the WHOLE trajectory is covered, tail included -- not just the first n//H*H frames).
+    blocks = list(range(0, n_frames, args.horizon))
+    if args.replans:
+        blocks = blocks[: args.replans]
+    if not blocks:
+        raise SystemExit(f"episode {args.episode} has no frames")
 
     # "samples" = the multi-candidate deploy fan (action_samples column); "action" = the single
     # executed trajectory from the plain action column, so it works on ANY LeRobot recording.
     fan_word = "fan" if args.source == "samples" else "path"
 
     frames = []
-    step = 0
-    for replan_idx, start in enumerate(starts[: args.replans] if args.replans else starts):
+    for block_idx, start in enumerate(blocks):
+        block_len = min(args.horizon, n_frames - start)
         if args.source == "samples":
-            chunk = _load_replan_chunk(reader, args.episode, start, args.horizon, args.candidates)
+            chunk = _load_replan_chunk(reader, args.episode, start, block_len, args.candidates)
             missing = "no action_samples recorded here"
         else:
-            chunk = _load_action_chunk(reader, args.episode, start, args.horizon)
+            chunk = _load_action_chunk(reader, args.episode, start, block_len)
             missing = "no action column here"
         if chunk is None:
-            print(f"replan at frame {start}: {missing}, skipping", file=sys.stderr)
+            print(f"chunk at frame {start}: {missing}, skipping", file=sys.stderr)
             continue
-        state = reader.get_state(args.episode, start)
-        if state is None:
-            print(f"replan at frame {start}: no observation.state recorded here, skipping", file=sys.stderr)
-            continue
-        images = reader.get_images(args.episode, start)
 
-        panels = []  # [(square_rgb, label)] left-to-right: agentview, then each requested wrist
+        # The chunk's base-frame paths (FK of the joint targets) are the SAME for every tick in the
+        # block -- only the wrist CAMERA moves as the arm executes -- so compute them once here and
+        # only re-project per tick below. This is what makes rendering every frame cheap.
+        base_paths = {
+            arm: [geometries[arm].chunk_to_path(c[:, action_slices[arm]]) for c in chunk] for arm in ("left", "right")
+        }
+        agent_paths = {
+            arm: [_project_fixed(bp, agent_extrinsics[arm], agent_intr) for bp in base_paths[arm]]
+            for arm in agent_extrinsics
+        }
 
-        # Agentview panel: both (calibrated) arms' overlays layered on, each its own colour.
-        agent = images.get("agentview")
-        if agent is not None and agentview_arms:
-            agent_sq = _to_size(agent, panel_w, panel_h)
-            for arm, cam_t_base in agent_extrinsics.items():
-                av_paths = [
-                    _project_fixed(geometries[arm].chunk_to_path(cand[:, action_slices[arm]]), cam_t_base, agent_intr)
-                    for cand in chunk
-                ]
-                agent_sq = _draw_fan(agent_sq, av_paths, chosen=0, colors=_FAN_COLORS[arm])
-            label = (
-                f"agentview -- {'+'.join(agent_extrinsics)} {fan_word}"
-                if agent_extrinsics
-                else "agentview (no extrinsic)"
-            )
-            panels.append((agent_sq, label))
-
-        # One panel per requested wrist camera, each with only its own arm's overlay.
-        for arm in wrists:
-            wimg = images.get(f"wrist_{arm}")
-            if wimg is None:
+        # Render EVERY tick in the block (not just its start): you watch the arm consume the chunk,
+        # then it jumps to the next chunk. The overlay (the plan) holds across the block; the
+        # footage advances and each wrist re-projects at that tick's pose.
+        for offset in range(block_len):
+            frame_idx = start + offset
+            state = reader.get_state(args.episode, frame_idx)
+            images = reader.get_images(args.episode, frame_idx)
+            if state is None or not images:
+                print(f"frame {frame_idx}: no state/images, skipping", file=sys.stderr)
                 continue
-            projectors[arm].set_pose(state[state_slices[arm]])
-            wrist_sq = _draw_fan(
-                _to_size(wimg, panel_w, panel_h), projectors[arm](chunk), chosen=0, colors=_FAN_COLORS[arm]
+
+            panels = []  # left-to-right: agentview, then each requested wrist
+            agent = images.get("agentview")
+            if agent is not None and agentview_arms:
+                agent_sq = _to_size(agent, panel_w, panel_h)
+                for arm, apaths in agent_paths.items():
+                    agent_sq = _draw_fan(agent_sq, apaths, chosen=0, colors=_FAN_COLORS[arm])
+                label = (
+                    f"agentview -- {'+'.join(agent_paths)} {fan_word}" if agent_paths else "agentview (no extrinsic)"
+                )
+                panels.append((agent_sq, label))
+
+            for arm in wrists:
+                wimg = images.get(f"wrist_{arm}")
+                if wimg is None:
+                    continue
+                q_now = state[state_slices[arm]]
+                wpaths = [_project_wrist(geometries[arm], bp, q_now, wrist_intr) for bp in base_paths[arm]]
+                wrist_sq = _draw_fan(_to_size(wimg, panel_w, panel_h), wpaths, chosen=0, colors=_FAN_COLORS[arm])
+                panels.append((wrist_sq, f"wrist {arm} -- {fan_word}"))
+
+            if not panels:
+                continue
+            header = (
+                f"{args.repo_id} · ep {args.episode} · chunk {block_idx + 1}/{len(blocks)}  "
+                f"tick {offset + 1}/{block_len}"
             )
-            panels.append((wrist_sq, f"wrist {arm} -- {fan_word}"))
-
-        if not panels:
-            print(f"replan at frame {start}: no requested camera image present, skipping", file=sys.stderr)
-            continue
-        header = f"{args.repo_id} · ep {args.episode} · replan {replan_idx}  step {step}"
-        composed = _compose_frame(panels, panel_w, panel_h, header=header)
-
-        for _ in range(max(1, args.hold)):
-            frames.append(composed)
-            step += 1
+            composed = _compose_frame(panels, panel_w, panel_h, header=header)
+            for _ in range(max(1, args.hold)):
+                frames.append(composed)
 
     if not frames:
-        raise SystemExit("nothing to render -- no replan had both action/action_samples and images")
+        raise SystemExit("nothing to render -- no frame had both action/action_samples and images")
 
     import imageio
 
@@ -467,7 +476,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     # Browser-friendly h264: yuv420p is what every browser can decode (hf-utils encodes the same
     # way for its dataset previews); macro_block_size=1 keeps odd panel widths from being padded.
     imageio.mimwrite(out, frames, fps=args.fps, quality=8, macro_block_size=1, codec="libx264", pixelformat="yuv420p")
-    print(f"wrote {out} ({len(frames)} frames, {len(starts)} replans, {len(frames) // max(len(starts), 1)} held each)")
+    print(f"wrote {out} ({len(frames)} frames over {len(blocks)} chunk(s))")
     return out
 
 
@@ -509,7 +518,7 @@ def main() -> None:
         help="the --num-samples the server was started with (required for --source samples; ignored for action)",
     )
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
-    p.add_argument("--hold", type=int, default=5, help="frames to hold each replan on screen")
+    p.add_argument("--hold", type=int, default=1, help="repeat each rendered tick N times (>1 = slow motion)")
     p.add_argument("--height", type=int, default=360, help="per-panel height in px (width follows the 4:3 footage)")
     p.add_argument("--fps", type=int, default=10)
     p.add_argument("--out", default=".scratch/deploy_samples.mp4")
