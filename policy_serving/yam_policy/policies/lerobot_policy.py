@@ -67,7 +67,10 @@ class LeRobotPolicy(BasePolicy):
         camera_map: Optional[Dict[str, str] | str] = None,
         actions_per_chunk: Optional[int] = None,
     ) -> None:
-        from lerobot.policies import get_policy_class, make_pre_post_processors
+        # factory, not the `lerobot.policies` package: 0.6 re-exports these, 0.4 does not,
+        # and importing the submodule runs the package __init__ either way -- which is what
+        # registers the built-in policy configs that get_policy_class then looks up.
+        from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
         self._device = self._resolve_device(device)
         self._pretrained_path = str(pretrained_path)
@@ -175,7 +178,7 @@ class LeRobotPolicy(BasePolicy):
     def _load_legacy_config(pretrained_path: str, device: str) -> "PreTrainedConfig":
         """Load an older LeRobot checkpoint by dropping fields the current config cannot take."""
         import draccus
-        from lerobot.policies import make_policy_config
+        from lerobot.policies.factory import make_policy_config
 
         config_path = Path(pretrained_path) / "config.json"
         if not config_path.is_file():

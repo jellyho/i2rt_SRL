@@ -25,8 +25,8 @@ pytest.importorskip("lerobot")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "policy_serving"))
 
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from yam_policy.policies.lerobot_policy import LeRobotPolicy
 
 from workstation.policy_bridge.deploy_runner import _describe_policy

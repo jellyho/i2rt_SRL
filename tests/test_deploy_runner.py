@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from workstation.lerobot_recorder.config import RecorderConfig
+from workstation.lerobot_recorder.config import CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
 from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
 
@@ -74,12 +74,27 @@ def test_uses_openpi_image_slot_names_by_default():
         assert obs[key].dtype == np.uint8
 
 
-def test_sends_nothing_the_policy_does_not_read():
-    """Leader/eef/control_mode are recorder features, not policy inputs; a YAM or RoboCasa
-    transform ignores them, so they would only be wasted bandwidth every tick."""
+def test_sends_every_recorded_column_and_nothing_else():
+    """Leader/eef/control_mode were once withheld as "recorder features, not policy inputs".
+    That held for openpi, whose transforms ignore them, and broke for LeRobot: its trainer takes
+    every dataset column as an input, so a checkpoint trained on this stack's data can require
+    any of them -- and one that did could not be deployed at all while they were withheld.
+
+    27 floats a tick. The set stays pinned, because the original point was that the client puts
+    nothing arbitrary on the wire.
+    """
     obs = _runner()._build_obs(_robot_obs(), {})
-    assert set(obs) == {"observation/state", "prompt"}
+    assert set(obs) == {
+        "observation/state",
+        "observation.leader",
+        "observation.eef",
+        "observation.control_mode",
+        "prompt",
+    }
     assert obs["prompt"] == "pick up the banana cloth"
+    assert obs["observation.leader"].shape == (LEADER_DIM,)
+    assert obs["observation.eef"].shape == (EEF_DIM,)
+    assert float(obs["observation.control_mode"][0]) == CONTROL_MODE["policy"]
 
 
 def test_missing_arm_state_yields_no_observation():
@@ -104,13 +119,15 @@ def _idle_runner(policy_port=59998):
     """A runner whose robot is up and idle: connected, but not running a rollout."""
     import types
 
-    cfg = BridgeConfig(robot_host="127.0.0.1", robot_port=59999,
-                       policy_host="127.0.0.1", policy_port=policy_port, rate_hz=50)
+    cfg = BridgeConfig(
+        robot_host="127.0.0.1", robot_port=59999, policy_host="127.0.0.1", policy_port=policy_port, rate_hz=50
+    )
     rec = RecorderConfig(mock=False)
     runner = DeploymentPolicyRunner(cfg, rec, lambda: {})
     runner._connect_robot = lambda: runner._set(robot_connected=True)
-    runner._robot = types.SimpleNamespace(get_observation=lambda: {
-        "policy_running": False, "intervention": False, "homing": False, "estop": False})
+    runner._robot = types.SimpleNamespace(
+        get_observation=lambda: {"policy_running": False, "intervention": False, "homing": False, "estop": False}
+    )
     return runner
 
 
@@ -147,8 +164,7 @@ def test_idle_probe_connects_so_the_gui_guard_can_pass():
     import time
 
     runner = _idle_runner()
-    runner._connect_policy = lambda: (setattr(runner, "_policy", object()),
-                                      runner._set(policy_connected=True))
+    runner._connect_policy = lambda: (setattr(runner, "_policy", object()), runner._set(policy_connected=True))
     runner.start()
     try:
         time.sleep(1.0)
@@ -184,7 +200,8 @@ def test_idle_probe_is_throttled():
 
 def _capture(runner, seconds, level="INFO"):
     """Run the loop for a while, returning the deploy_runner log lines it emitted."""
-    import logging, time
+    import logging
+    import time
 
     records = []
 
@@ -220,25 +237,23 @@ def test_client_says_it_cannot_reach_the_policy_at_startup():
 
 def test_client_announces_the_policy_link_coming_up():
     runner = _idle_runner()
-    runner._connect_policy = lambda: (setattr(runner, "_policy", object()),
-                                      runner._set(policy_connected=True))
+    runner._connect_policy = lambda: (setattr(runner, "_policy", object()), runner._set(policy_connected=True))
     lines = _capture(runner, 1.0)
     assert any("policy CONNECTED" in x and "59998" in x for x in lines), lines
 
 
 def test_losing_the_policy_is_reported_once_not_twice():
     """The probe and the transition describe the same event; only one should speak."""
-    import time
 
     runner = _idle_runner()
-    runner._connect_policy = lambda: (setattr(runner, "_policy", object()),
-                                      runner._set(policy_connected=True))
+    runner._connect_policy = lambda: (setattr(runner, "_policy", object()), runner._set(policy_connected=True))
 
     def drop():
         runner._policy = None
         runner._connect_policy = lambda: (_ for _ in ()).throw(ConnectionError("gone"))
 
     import threading
+
     threading.Timer(1.0, drop).start()
     lines = _capture(runner, 4.0)
     assert sum("DISCONNECTED" in x for x in lines) == 1, lines
