@@ -3,9 +3,13 @@
     workstation/yam-data calibrate-agentview
     workstation/yam-data calibrate-agentview --arms left --out ~/lerobot_data/calibration/agentview.json
     workstation/yam-data calibrate-agentview --mock          # GUI shell only, no hardware
+    workstation/yam-data calibrate-agentview --capture-button left.0   # a different handle button
+    workstation/yam-data calibrate-agentview --capture-button          # Space only, no handle trigger
 
 YAM is bimanual, so both wrist cameras are used as bridges by default -- ``--arms`` narrows that
-to one if the other wrist camera is not mounted/working. See
+to one if the other wrist camera is not mounted/working. Capture fires on Space OR either
+configured leader-handle button (default: the "lower" button on each handle) -- both hands are
+usually busy holding the robot in position by the time a pose is worth capturing. See
 :mod:`workstation.lerobot_recorder.calibrate_agentview_gui` for what it does and
 :mod:`workstation.lerobot_recorder.charuco` for the geometry it solves.
 """
@@ -37,6 +41,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="which wrist camera(s) can bridge to the base frame (default: both)",
     )
     p.add_argument("--out", default="~/lerobot_data/calibration/agentview_extrinsic.json")
+    p.add_argument(
+        "--capture-button",
+        dest="capture_buttons",
+        nargs="*",
+        default=["left.1", "right.1"],
+        metavar="SIDE.INDEX",
+        help=(
+            "leader-handle button(s) that trigger a capture (any ONE firing is enough), "
+            "'<side>.<index>' e.g. left.1 -- upper=0, lower=1, same convention as config.py's "
+            "button_map. Pass with no values to disable the handle trigger (Space still works)."
+        ),
+    )
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
@@ -86,8 +102,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     from workstation.lerobot_recorder.calibrate_agentview_gui import run
 
-    logging.info("calibrate-agentview: config=%s arms=%s out=%s", path, arms, args.out)
-    return run(cfg, robot, geometries, board=board, out_path=args.out, mock=args.mock)
+    logging.info(
+        "calibrate-agentview: config=%s arms=%s out=%s capture_buttons=%s", path, arms, args.out, args.capture_buttons
+    )
+    return run(
+        cfg, robot, geometries, board=board, out_path=args.out, mock=args.mock, capture_buttons=args.capture_buttons
+    )
 
 
 if __name__ == "__main__":

@@ -7,10 +7,13 @@ for a ruler between the board and that arm's own frame.
 
 YAM is bimanual, so BOTH wrist cameras can bridge -- whichever one currently has the board in
 view. Live preview of agentview + both wrists with the board outline drawn when found; hit
-**Space** (or click Capture -- the button is enabled exactly when Space would do something) to
-grab one sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not
-have to be posed at once, and when they are, one press banks two independent estimates instead of
-one). Move the arm(s) to a few different poses that keep the board in view and capture at each.
+**Space**, press a **leader-handle button** (default: the "lower" button on either handle,
+``left.1``/``right.1`` -- both hands are usually busy holding the robot in position by the time a
+pose is worth capturing, so a keyboard is not always reachable), or click Capture -- all three are
+gated by the exact same readiness check, so none of them can capture out of a bad state. Grabs one
+sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not have to be
+posed at once, and when they are, one press banks two independent estimates instead of one). Move
+the arm(s) to a few different poses that keep the board in view and capture at each.
 Whenever a press happens to catch BOTH wrist cameras seeing the board AT ONCE, it also banks an
 ``ArmPairCapture`` for free -- no separate button, no extra step -- towards the arm-to-arm offset
 (see below); this needs both arms actually posed together for at least a couple of presses, which
@@ -45,11 +48,12 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from i2rt.serving.teleop_common import handle_button_pressed
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.charuco import (
@@ -123,6 +127,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         board: BoardSpec,
         out_path: str,
         mock: bool = False,
+        capture_buttons: Sequence[str] = ("left.1", "right.1"),
     ) -> None:
         super().__init__()
         self.setWindowTitle("Calibrate agentview -- board via wrist_left / wrist_right")
@@ -133,6 +138,11 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.board = board
         self.out_path = out_path
         self.mock = mock
+        # "<side>.<index>" leader-handle buttons (upper=0, lower=1 -- same convention as
+        # config.py's button_map / DEFAULT_TELEOP_BUTTON_OUTCOMES), any ONE of which capturing:
+        # whichever hand is free. Empty disables the handle trigger (Space still works).
+        self.capture_buttons = list(capture_buttons)
+        self._capture_btn_prev = False  # rising-edge state across the WHOLE set, not per-button
 
         self._last_agent_det = None
         self._last_wrist_det: Dict[str, object] = {}  # arm -> Detection | None
@@ -176,7 +186,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.status)
 
         row = QtWidgets.QHBoxLayout()
-        self.capture_btn = QtWidgets.QPushButton("Capture  [Space]")
+        self.capture_btn = QtWidgets.QPushButton("Capture  [Space / leader button]")
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self._on_capture)
         # Space, not the button, is the intended way to capture: both hands are usually busy
@@ -221,6 +231,8 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             self.status.setText(f"camera read failed: {e}")
             return
 
+        robot_obs = self._get_robot_obs()  # one RPC round trip for both arms' joints + buttons
+
         agent_img = frames.get("agentview")
         agent_intr = self.cams.intrinsics("agentview")
         self._last_agent_det = (
@@ -237,7 +249,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             intr = self.cams.intrinsics(key)
             det = detect_board_pose(img, self.board, intr) if img is not None and intr else None
             self._last_wrist_det[arm] = det
-            self._last_q[arm] = self._read_joints(arm)
+            self._last_q[arm] = self._joints_from_obs(robot_obs, arm)
             if img is not None:
                 preview = _draw_detection(img, det.corners_px if det else None)
                 self.wrist_views[arm].setPixmap(
@@ -247,27 +259,53 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 ready_arms.append(arm)
 
         self.capture_btn.setEnabled(bool(ready_arms))
+        hotkeys = "Space" + (f" or leader button ({'/'.join(self.capture_buttons)})" if self.capture_buttons else "")
         if self._last_agent_det is None:
             self.status.setText("not ready -- board not seen in agentview")
         elif ready_arms:
             self.status.setText(
-                f"ready -- press Space to capture: {', '.join(ready_arms)} (agentview + that wrist both see the board)"
+                f"ready -- press {hotkeys} to capture: {', '.join(ready_arms)} "
+                "(agentview + that wrist both see the board)"
             )
         else:
             self.status.setText("board seen in agentview but neither wrist sees it (or robot link is down)")
 
-    def _read_joints(self, arm: str) -> Optional[np.ndarray]:
+        self._check_capture_button(robot_obs)
+
+    def _get_robot_obs(self) -> dict:
+        if self.mock or self.robot is None:
+            return {}
+        try:
+            return self.robot.get_observation() or {}
+        except Exception as e:
+            logger.warning("could not read robot observation: %s", e)
+            return {}
+
+    def _joints_from_obs(self, obs: dict, arm: str) -> Optional[np.ndarray]:
         if self.mock or self.robot is None:
             return np.zeros(7, np.float64)
-        try:
-            obs = self.robot.get_observation()
-            side = obs.get(arm)
-            if not side or side.get("pos") is None:
-                return None
-            return np.asarray(side["pos"], dtype=np.float64)
-        except Exception as e:
-            logger.warning("could not read robot joints: %s", e)
+        side = obs.get(arm)
+        if not side or side.get("pos") is None:
             return None
+        return np.asarray(side["pos"], dtype=np.float64)
+
+    def _check_capture_button(self, obs: dict) -> None:
+        """Fire a capture on the rising edge of any configured leader-handle button.
+
+        Same ``pressed and not was`` edge test ``Recorder._scan_buttons`` uses (recorder.py),
+        against ITS OWN previous-state flag rather than that class's -- this tool has no
+        recorder instance to share one with, and shouldn't: reading its buttons must not
+        interact with whatever the recorder GUI is doing with the SAME physical handles on a
+        different run. Treated as one aggregate signal across every configured button (not one
+        edge test per button), so pressing two at once still fires exactly once.
+        """
+        if self.mock or self.robot is None or not self.capture_buttons:
+            return
+        side_buttons = {arm: (obs.get(arm, {}) or {}).get("buttons", []) for arm in self.arms}
+        pressed = any(handle_button_pressed(side_buttons, key) for key in self.capture_buttons)
+        if pressed and not self._capture_btn_prev and self.capture_btn.isEnabled():
+            self._on_capture()
+        self._capture_btn_prev = pressed
 
     # ------------------------------------------------------------------ actions
     def _on_capture(self) -> None:
@@ -475,11 +513,14 @@ def run(
     board: BoardSpec,
     out_path: str,
     mock: bool = False,
+    capture_buttons: Sequence[str] = ("left.1", "right.1"),
 ) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     cams = CameraManager(cfg)
     cams.start()
-    win = CalibrateAgentviewWindow(cams, robot, geometries, board=board, out_path=out_path, mock=mock)
+    win = CalibrateAgentviewWindow(
+        cams, robot, geometries, board=board, out_path=out_path, mock=mock, capture_buttons=capture_buttons
+    )
     win.resize(1600, 800)
     win.show()
     return app.exec_()

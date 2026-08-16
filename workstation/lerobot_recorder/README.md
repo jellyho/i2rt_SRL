@@ -558,12 +558,15 @@ Print a ChArUco board (default 8x6 squares, 30mm/22mm — pass `--squares-x/-y`,
 `--square-length-m`, `--marker-length-m` to match a different one; **measure the printed squares,
 don't trust the page-fit scale**) and set it on the desk in view of agentview. Both wrist cameras
 bridge by default (YAM is bimanual — `--arms left` to use only one); move either arm so its wrist
-camera also sees the board, **Capture**, then move to a few more poses and capture again at each
-— the board itself never moves. **Solve** produces one extrinsic *per arm* — never pooled across
-arms, since that would silently average two unrelated coordinate frames together — and each one
-reports how much its own arm's captures disagree with each other in mm/degrees, which is that
-arm's calibration confidence rather than a separate validation step. **Save** writes both
-results (keyed by arm) next to the intrinsics they were solved against.
+camera also sees the board, then **capture** — press **Space**, the **lower button on either
+leader handle** (`left.1`/`right.1` by default; `--capture-button` to change or disable it), or
+click the on-screen button, all gated identically. Move to a few more poses and capture again at
+each — the board itself never moves; the solve re-runs after every capture and shows a live
+convergence trend, so you can watch it settle instead of guessing how many poses are enough.
+**Solve** produces one extrinsic *per arm* — never pooled across arms, since that would silently
+average two unrelated coordinate frames together — and each one reports how much its own arm's
+captures disagree with each other in mm/degrees. **Save** writes both results (keyed by arm)
+next to the intrinsics they were solved against.
 
 Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
 separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
