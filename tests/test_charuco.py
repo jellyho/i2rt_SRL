@@ -22,6 +22,7 @@ from workstation.lerobot_recorder.charuco import (
     detect_board_pose,
     make_board,
     solve_agentview_extrinsic,
+    solve_agentview_extrinsic_per_arm,
 )
 
 
@@ -82,6 +83,7 @@ def test_recovers_the_true_extrinsic_from_noiseless_captures():
         agent_t_board = np.linalg.inv(true_base_t_agent) @ board_pose_in_base
         captures.append(
             Capture(
+                arm="left",
                 base_t_wrist=base_t_wrist,
                 wrist_t_board=wrist_t_board,
                 agentview_t_board=agent_t_board,
@@ -91,6 +93,7 @@ def test_recovers_the_true_extrinsic_from_noiseless_captures():
         )
 
     result = solve_agentview_extrinsic(captures)
+    assert result.arm == "left"
     assert np.allclose(result.base_t_agentview, true_base_t_agent, atol=1e-8)
     assert result.translation_rms_mm < 1e-3
     assert result.rotation_rms_deg < 1e-3
@@ -114,6 +117,7 @@ def test_disagreeing_captures_show_up_as_nonzero_spread_not_silently_averaged_aw
         if detection_error is not None:
             wrist_t_board = wrist_t_board @ detection_error
         return Capture(
+            arm="left",
             base_t_wrist=base_t_wrist,
             wrist_t_board=wrist_t_board,
             agentview_t_board=np.linalg.inv(true_base_t_agent) @ board_pose_in_base,
@@ -137,9 +141,76 @@ def test_disagreeing_captures_show_up_as_nonzero_spread_not_silently_averaged_aw
 def test_refuses_to_solve_from_a_single_capture():
     """One capture cannot show whether the estimate is trustworthy -- there is nothing to
     compare it against, which is the entire point of averaging several."""
-    c = Capture(np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
+    c = Capture("left", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
     with pytest.raises(ValueError, match="at least 2"):
         solve_agentview_extrinsic([c])
+
+
+# --------------------------------------------------------------------------------------- #
+# Arms must never be pooled: each wrist camera is its own, unrelated FK frame (see the
+# module docstring) -- there is no shared "robot base" anywhere in this codebase.
+# --------------------------------------------------------------------------------------- #
+def test_refuses_to_solve_captures_from_two_different_arms_together():
+    """Silently averaging a left-wrist estimate with a right-wrist estimate would blend two
+    numerically valid answers to two different questions -- this must be loud, not silent."""
+    c_left = Capture("left", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
+    c_right = Capture("right", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
+    with pytest.raises(ValueError, match="more than one arm"):
+        solve_agentview_extrinsic([c_left, c_right, c_left])
+
+
+def test_per_arm_solves_each_arm_independently_and_reports_which_is_which():
+    true_left_t_agent = _pose((1.0, 0.0, 0.5))
+    true_right_t_agent = _pose((-1.0, 0.2, 0.5), axis="z", deg=180.0)  # a DIFFERENT frame/answer
+    board_pose = _pose((0.4, 0.0, 0.0))
+
+    def make(arm: str, true_t_agent: np.ndarray, wrist_t: tuple) -> Capture:
+        base_t_wrist = _pose(wrist_t)
+        return Capture(
+            arm=arm,
+            base_t_wrist=base_t_wrist,
+            wrist_t_board=np.linalg.inv(base_t_wrist) @ board_pose,
+            agentview_t_board=np.linalg.inv(true_t_agent) @ board_pose,
+            wrist_reproj_error_px=0.1,
+            agentview_reproj_error_px=0.1,
+        )
+
+    captures = [
+        make("left", true_left_t_agent, (0.0, 0.0, 0.0)),
+        make("left", true_left_t_agent, (0.02, 0.0, 0.0)),
+        make("right", true_right_t_agent, (0.0, 0.0, 0.0)),
+        make("right", true_right_t_agent, (0.0, -0.02, 0.0)),
+    ]
+
+    results = solve_agentview_extrinsic_per_arm(captures)
+
+    assert set(results) == {"left", "right"}
+    assert np.allclose(results["left"].base_t_agentview, true_left_t_agent, atol=1e-8)
+    assert np.allclose(results["right"].base_t_agentview, true_right_t_agent, atol=1e-8)
+    # If arms had been pooled, neither answer would match either true pose.
+    assert not np.allclose(results["left"].base_t_agentview, true_right_t_agent, atol=1e-3)
+
+
+def test_per_arm_skips_an_arm_with_too_few_captures_instead_of_raising():
+    """A session that only managed one right-wrist capture should still get the left arm's
+    result back, not lose everything to the arm that is not ready yet."""
+    left_pose = _pose((1.0, 0.0, 0.5))
+    board_pose = _pose((0.4, 0.0, 0.0))
+
+    def make(arm: str, wrist_t: tuple) -> Capture:
+        base_t_wrist = _pose(wrist_t)
+        return Capture(
+            arm=arm,
+            base_t_wrist=base_t_wrist,
+            wrist_t_board=np.linalg.inv(base_t_wrist) @ board_pose,
+            agentview_t_board=np.linalg.inv(left_pose) @ board_pose,
+            wrist_reproj_error_px=0.1,
+            agentview_reproj_error_px=0.1,
+        )
+
+    captures = [make("left", (0.0, 0.0, 0.0)), make("left", (0.01, 0.0, 0.0)), make("right", (0.0, 0.0, 0.0))]
+    results = solve_agentview_extrinsic_per_arm(captures)
+    assert set(results) == {"left"}
 
 
 # --------------------------------------------------------------------------------------- #

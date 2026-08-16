@@ -3,18 +3,23 @@
 See :mod:`workstation.lerobot_recorder.charuco` for the geometry this drives: the board never
 moves, and a wrist camera's pose is already known at every instant (published extrinsic + that
 arm's own FK, the same ``WristCameraGeometry`` the candidate-fan renderer uses), so it stands in
-for a ruler between the board and the robot base.
+for a ruler between the board and that arm's own frame.
 
 YAM is bimanual, so BOTH wrist cameras can bridge -- whichever one currently has the board in
 view. Live preview of agentview + both wrists with the board outline drawn when found; "Capture"
 grabs one sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not
 have to be posed at once, and when they are, one click banks two independent estimates instead of
-one). Move the arm(s) to a few different poses that keep the board in view and capture at each --
-"Solve" pools every capture regardless of which wrist it came from (each one already carries its
-own arm's FK-derived pose, so the chain does not care) and reports how much the captures disagree
-with each other, which is this calibration's own confidence number rather than a separate
-validation step (see ``charuco.solve_agentview_extrinsic``). "Save" writes the result + the
-intrinsics it was solved against to a JSON file another tool can load.
+one). Move the arm(s) to a few different poses that keep the board in view and capture at each.
+
+"Solve" produces ONE extrinsic PER ARM, not one pooled answer: each arm's ``WristCameraGeometry``
+is its own MJCF loaded in isolation, with no known transform to the other arm's -- there is no
+shared "robot base" frame anywhere in this codebase (see ``charuco``'s module docstring). Mixing
+left- and right-wrist captures into one solve would silently average two different questions'
+answers together, so ``solve_agentview_extrinsic_per_arm`` groups by arm first. Each arm's result
+reports how much ITS OWN captures disagree with each other, which is that arm's calibration
+confidence rather than a separate validation step. "Save" writes both results (whichever arms had
+enough captures) + the intrinsics they were solved against to one JSON file another tool can load
+-- keyed by arm, since a consumer has to know which arm's frame it is asking for.
 """
 
 from __future__ import annotations
@@ -29,7 +34,12 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import CameraManager
-from workstation.lerobot_recorder.charuco import BoardSpec, Capture, detect_board_pose, solve_agentview_extrinsic
+from workstation.lerobot_recorder.charuco import (
+    BoardSpec,
+    Capture,
+    detect_board_pose,
+    solve_agentview_extrinsic_per_arm,
+)
 from workstation.lerobot_recorder.config import RecorderConfig
 
 if TYPE_CHECKING:
@@ -87,7 +97,6 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self._last_wrist_det: Dict[str, object] = {}  # arm -> Detection | None
         self._last_q: Dict[str, Optional[np.ndarray]] = {}  # arm -> joints | None
         self.captures: List[Capture] = []
-        self._capture_arms: List[str] = []  # parallel to self.captures, for the list label only
 
         self._build_ui()
         self.timer = QtCore.QTimer(self)
@@ -210,6 +219,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 continue
             base_t_wrist = self.geometries[arm].camera_pose(q)
             cap = Capture(
+                arm=arm,
                 base_t_wrist=base_t_wrist,
                 wrist_t_board=det.cam_t_board,
                 agentview_t_board=self._last_agent_det.cam_t_board,
@@ -217,7 +227,6 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 agentview_reproj_error_px=self._last_agent_det.reproj_error_px,
             )
             self.captures.append(cap)
-            self._capture_arms.append(arm)
             self.capture_list.addItem(
                 f"#{len(self.captures)}  [{arm}]  wrist err {cap.wrist_reproj_error_px:.2f}px  "
                 f"agentview err {cap.agentview_reproj_error_px:.2f}px  ({time.strftime('%H:%M:%S')})"
@@ -231,31 +240,50 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         if row < 0:
             return
         del self.captures[row]
-        del self._capture_arms[row]
         self.capture_list.takeItem(row)
 
     def _on_solve(self) -> None:
-        if len(self.captures) < 2:
-            QtWidgets.QMessageBox.warning(self, "Not enough captures", "Need at least 2 captures to solve.")
+        # Each arm's wrist camera is an independent, uncalibrated FK frame (see charuco.py's
+        # module docstring) -- solved and reported separately, never pooled.
+        counts = {arm: sum(1 for c in self.captures if c.arm == arm) for arm in self.arms}
+        if all(n < 2 for n in counts.values()):
+            QtWidgets.QMessageBox.warning(
+                self, "Not enough captures", f"Need at least 2 captures for some arm; have {counts}."
+            )
             return
-        try:
-            result = solve_agentview_extrinsic(self.captures)
-        except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "Could not solve", str(e))
+        results = solve_agentview_extrinsic_per_arm(self.captures)
+
+        lines = []
+        per_arm_json = {}
+        for arm, result in results.items():
+            quality = (
+                "good" if result.rotation_rms_deg < 1.0 and result.translation_rms_mm < 10.0 else "CHECK CAPTURES"
+            )
+            lines.append(
+                f"[{arm}] n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
+                f"rotation RMS {result.rotation_rms_deg:.3f} deg  -- {quality}"
+            )
+            per_arm_json[arm] = {
+                # This extrinsic is expressed in `arm`'s own FK frame -- NOT interchangeable
+                # with the other arm's entry, and not a robot-wide "base" frame. See
+                # charuco.py's module docstring.
+                "base_t_agentview": result.base_t_agentview.tolist(),
+                "n_captures": result.n_captures,
+                "translation_rms_mm": result.translation_rms_mm,
+                "rotation_rms_deg": result.rotation_rms_deg,
+                "per_capture_translation_mm": result.per_capture_translation_mm,
+                "per_capture_rotation_deg": result.per_capture_rotation_deg,
+            }
+        for arm, n in counts.items():
+            if arm not in results and n:
+                lines.append(f"[{arm}] {n} capture(s) -- need at least 2 to solve")
+        self.result_label.setText("   ".join(lines) if lines else "not solved yet")
+
+        if not per_arm_json:
+            self.save_btn.setEnabled(False)
             return
-        quality = "good" if result.rotation_rms_deg < 1.0 and result.translation_rms_mm < 10.0 else "CHECK CAPTURES"
-        self.result_label.setText(
-            f"n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
-            f"rotation RMS {result.rotation_rms_deg:.3f} deg  -- {quality}"
-        )
         self._result_json = {
-            "base_t_agentview": result.base_t_agentview.tolist(),
-            "n_captures": result.n_captures,
-            "translation_rms_mm": result.translation_rms_mm,
-            "rotation_rms_deg": result.rotation_rms_deg,
-            "per_capture_translation_mm": result.per_capture_translation_mm,
-            "per_capture_rotation_deg": result.per_capture_rotation_deg,
-            "per_capture_arm": list(self._capture_arms),
+            "by_arm": per_arm_json,
             "board": {
                 "squares_x": self.board.squares_x,
                 "squares_y": self.board.squares_y,

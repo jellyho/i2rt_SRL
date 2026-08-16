@@ -1,27 +1,38 @@
 """ChArUco board detection + pose math for calibrating a fixed (non-wrist) camera.
 
-Built for exactly one job: recover ``base_T_agentview`` -- the agentview camera's pose in the
-robot's base frame -- from a ChArUco board sitting still on the desk, with NO physical
-attachment to the robot and NO separate intrinsic-calibration step.
+Built for exactly one job: recover an agentview extrinsic from a ChArUco board sitting still on
+the desk, with NO physical attachment to the robot and NO separate intrinsic-calibration step.
 
-The trick is a chain, not a direct measurement. Nothing ties the board to the base frame by
-itself, but the WRIST camera does: its pose in the base frame is already known at every instant
-via forward kinematics (``WristCameraGeometry``, published extrinsic + the arm's own MJCF -- see
-that module). So at any arm pose that has the board in the wrist camera's view:
+The trick is a chain, not a direct measurement. Nothing ties the board to a robot-relative frame
+by itself, but a WRIST camera does: its pose is already known at every instant via forward
+kinematics (``WristCameraGeometry``, published extrinsic + the arm's own MJCF -- see that
+module). So at any arm pose that has the board in the wrist camera's view:
 
-    base_T_board = base_T_wrist(q) @ wrist_T_board      (wrist_T_board from a PnP solve)
+    frame_T_board = frame_T_wrist(q) @ wrist_T_board      (wrist_T_board from a PnP solve)
 
 and the same board, seen by agentview from wherever IT sits:
 
-    agentview_T_board                                    (another PnP solve, same board)
+    agentview_T_board                                     (another PnP solve, same board)
 
 give the one thing being solved for:
 
-    base_T_agentview = base_T_board @ inv(agentview_T_board)
+    frame_T_agentview = frame_T_board @ inv(agentview_T_board)
 
 Move the arm to a few different poses (the board stays put) and average -- see
 ``solve_agentview_extrinsic`` -- both to smooth out per-shot PnP noise and to catch a bad
 capture (a wildly different pose than the others) before it goes in the answer.
+
+**"frame_T_wrist" is per-arm, not a shared robot frame -- there is no cross-arm transform
+anywhere in this codebase.** ``WristCameraGeometry`` builds FK from ONE arm's own MJCF
+(``combine_arm_and_gripper_xml`` has no left/right parameter and no rig-level origin), so its
+"base frame" is that model's own (0,0,0) -- unrelated to wherever the arm is actually bolted to
+the table, and unrelated to the OTHER arm's own (0,0,0). Two ``WristCameraGeometry`` instances
+for left and right are two different, uncalibrated coordinate systems that happen to share a
+class. Chaining a left-wrist capture and a right-wrist capture into one solve would therefore
+silently average together the answers to two different questions. ``Capture.arm`` records which
+one each capture came from, ``solve_agentview_extrinsic`` refuses to mix them, and
+``solve_agentview_extrinsic_per_arm`` is the entry point that actually accounts for this --
+solving (and reporting) one extrinsic per arm, each valid only within that arm's own frame.
 
 Intrinsics come from the RealSense devices themselves (``CameraManager.intrinsics``, factory
 calibration off the device) rather than a checkerboard sweep -- accurate enough for this, and it
@@ -35,7 +46,7 @@ pre-4.7 ``aruco.detectMarkers`` + ``interpolateCornersCharuco`` calls, which wer
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -152,9 +163,14 @@ def _rotation_angle_deg(R: np.ndarray) -> float:
 
 @dataclasses.dataclass
 class Capture:
-    """One calibration sample: the arm pose the wrist camera saw the board from, plus both
-    cameras' independent board detections at (as close to) that same instant."""
+    """One calibration sample: the arm pose a wrist camera saw the board from, plus both
+    cameras' independent board detections at (as close to) that same instant.
 
+    ``arm`` records which wrist camera / FK model ``base_t_wrist`` came from -- required so
+    ``solve_agentview_extrinsic`` can refuse to mix frames it has no business averaging (see the
+    module docstring)."""
+
+    arm: str  # "left" | "right" -- whichever WristCameraGeometry built base_t_wrist
     base_t_wrist: np.ndarray  # 4x4, from WristCameraGeometry.camera_pose(q) at capture time
     wrist_t_board: np.ndarray  # 4x4
     agentview_t_board: np.ndarray  # 4x4
@@ -164,7 +180,8 @@ class Capture:
 
 @dataclasses.dataclass
 class CalibrationResult:
-    base_t_agentview: np.ndarray  # 4x4, the answer
+    arm: str  # which arm's frame this extrinsic is expressed in -- see the module docstring
+    base_t_agentview: np.ndarray  # 4x4, the answer, valid only within `arm`'s own FK frame
     n_captures: int
     translation_rms_mm: float  # spread across captures -- a per-capture consistency check
     rotation_rms_deg: float
@@ -173,15 +190,27 @@ class CalibrationResult:
 
 
 def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
-    """Chain each capture into an independent ``base_T_agentview`` estimate, then average.
+    """Chain each capture into an independent extrinsic estimate, then average.
 
-    Averaging AFTER the chain (not averaging ``base_T_board`` first) means a single bad capture
+    Averaging AFTER the chain (not averaging ``frame_T_board`` first) means a single bad capture
     -- an arm pose where the wrist camera grazed the board at a steep, noisy angle -- shows up as
     one outlier estimate rather than silently degrading a shared intermediate everything else
     depends on.
+
+    Every capture must be the SAME arm: see the module docstring for why mixing left- and
+    right-wrist captures here would silently average two unrelated coordinate frames together.
+    Use ``solve_agentview_extrinsic_per_arm`` for a mixed batch -- it calls this once per arm.
     """
     if len(captures) < 2:
         raise ValueError("need at least 2 captures (1 cannot show whether the estimates agree)")
+    arms = {c.arm for c in captures}
+    if len(arms) > 1:
+        raise ValueError(
+            f"captures span more than one arm ({sorted(arms)}) -- each arm's wrist camera is an "
+            "independent, uncalibrated frame (see the module docstring), so they cannot be "
+            "solved together. Use solve_agentview_extrinsic_per_arm for a mixed batch."
+        )
+    (arm,) = arms
 
     estimates = []
     for c in captures:
@@ -198,6 +227,7 @@ def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
     out[:3, :3] = R_mean
     out[:3, 3] = t_mean
     return CalibrationResult(
+        arm=arm,
         base_t_agentview=out,
         n_captures=len(captures),
         # RMS distance-from-mean across captures, not std-of-those-distances: the summary this
@@ -210,3 +240,19 @@ def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
         per_capture_translation_mm=per_t,
         per_capture_rotation_deg=per_r,
     )
+
+
+def solve_agentview_extrinsic_per_arm(captures: Sequence[Capture]) -> Dict[str, CalibrationResult]:
+    """Group captures by ``arm`` and solve each group independently.
+
+    This -- not ``solve_agentview_extrinsic`` directly -- is the entry point for a session that
+    captured from both wrist cameras: each arm gets its OWN extrinsic, valid only within that
+    arm's own (uncalibrated-against-the-other) FK frame (see the module docstring for why they
+    cannot be pooled). An arm with fewer than 2 captures is silently skipped rather than raising
+    -- a caller collecting from both wrists but so far only succeeding on one should still get
+    that one back, the same way a mixed collection session naturally produces uneven counts.
+    """
+    by_arm: Dict[str, List[Capture]] = {}
+    for c in captures:
+        by_arm.setdefault(c.arm, []).append(c)
+    return {arm: solve_agentview_extrinsic(group) for arm, group in by_arm.items() if len(group) >= 2}

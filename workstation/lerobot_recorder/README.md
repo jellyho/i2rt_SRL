@@ -542,9 +542,12 @@ nothing the recorder env does not already have.
 ## F. Calibrate agentview's extrinsic
 
 `render-samples`' fan is drawn on the wrist view because that camera's pose is already known
-(published extrinsic + FK). agentview's is not — nothing ties it to the robot base by default.
-`calibrate-agentview` gets it from a ChArUco board left sitting on the desk (never moved, never
-attached to the robot), using a wrist camera's known pose as the bridge:
+(published extrinsic + FK). agentview's is not — nothing ties it to either arm's frame by
+default, and **there is no shared "robot base" frame between the two arms either** (each
+`WristCameraGeometry` loads its arm's MJCF in isolation; left and right have no known transform
+between them anywhere in this codebase). `calibrate-agentview` gets agentview's extrinsic *per
+arm* from a ChArUco board left sitting on the desk (never moved, never attached to the robot),
+using that arm's wrist camera as the bridge:
 
 ```bash
 workstation/yam-data calibrate-agentview --out ~/lerobot_data/calibration/agentview_extrinsic.json
@@ -556,10 +559,11 @@ Print a ChArUco board (default 8x6 squares, 30mm/22mm — pass `--squares-x/-y`,
 don't trust the page-fit scale**) and set it on the desk in view of agentview. Both wrist cameras
 bridge by default (YAM is bimanual — `--arms left` to use only one); move either arm so its wrist
 camera also sees the board, **Capture**, then move to a few more poses and capture again at each
-— the board itself never moves. **Solve** pools every capture (whichever wrist it came from) and
-reports how much they disagree with each other in mm/degrees, which is the calibration's own
-confidence number rather than a separate validation step; **Save** writes the result next to the
-intrinsics it was solved against.
+— the board itself never moves. **Solve** produces one extrinsic *per arm* — never pooled across
+arms, since that would silently average two unrelated coordinate frames together — and each one
+reports how much its own arm's captures disagree with each other in mm/degrees, which is that
+arm's calibration confidence rather than a separate validation step. **Save** writes both
+results (keyed by arm) next to the intrinsics they were solved against.
 
 Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
 separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
