@@ -15,6 +15,8 @@ import pytest
 pytest.importorskip("cv2")
 
 from workstation.lerobot_recorder.charuco import (
+    ArmOffsetResult,
+    ArmPairCapture,
     BoardSpec,
     Capture,
     _orthonormalize,
@@ -23,6 +25,8 @@ from workstation.lerobot_recorder.charuco import (
     make_board,
     solve_agentview_extrinsic,
     solve_agentview_extrinsic_per_arm,
+    solve_arm_offset,
+    unify_rig_calibration,
 )
 
 
@@ -211,6 +215,128 @@ def test_per_arm_skips_an_arm_with_too_few_captures_instead_of_raising():
     captures = [make("left", (0.0, 0.0, 0.0)), make("left", (0.01, 0.0, 0.0)), make("right", (0.0, 0.0, 0.0))]
     results = solve_agentview_extrinsic_per_arm(captures)
     assert set(results) == {"left"}
+
+
+# --------------------------------------------------------------------------------------- #
+# solve_arm_offset: left_T_right from simultaneous both-wrists-see-the-board captures
+# --------------------------------------------------------------------------------------- #
+def test_recovers_the_true_arm_offset_and_its_distance():
+    true_left_t_right = _pose((0.6, -0.05, 0.0), axis="z", deg=178.0)  # ~60cm apart, facing in
+    board_pose = _pose((0.3, 0.0, 0.0))  # the board, between the two arms
+
+    rng = np.random.default_rng(2)
+    captures = []
+    for _ in range(4):
+        left_t_wrist = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
+        right_t_wrist = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
+        left_t_board_true = np.linalg.inv(left_t_wrist) @ board_pose
+        # right's board pose, EXPRESSED IN right's own frame -- board_pose is in "left's frame"
+        # here only because that is the ground truth we picked; right sees it through the
+        # (also ground-truth) arm offset.
+        right_t_board_true = np.linalg.inv(right_t_wrist) @ np.linalg.inv(true_left_t_right) @ board_pose
+        captures.append(
+            ArmPairCapture(
+                left_t_wrist=left_t_wrist,
+                left_wrist_t_board=left_t_board_true,
+                right_t_wrist=right_t_wrist,
+                right_wrist_t_board=right_t_board_true,
+                left_reproj_error_px=0.1,
+                right_reproj_error_px=0.1,
+            )
+        )
+
+    result = solve_arm_offset(captures)
+    assert np.allclose(result.left_t_right, true_left_t_right, atol=1e-8)
+    assert np.isclose(result.distance_m, float(np.linalg.norm(true_left_t_right[:3, 3])), atol=1e-8)
+    assert result.n_captures == 4
+    assert result.translation_rms_mm < 1e-3
+
+
+def test_arm_offset_refuses_a_single_capture():
+    c = ArmPairCapture(np.eye(4), np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
+    with pytest.raises(ValueError, match="at least 2"):
+        solve_arm_offset([c])
+
+
+# --------------------------------------------------------------------------------------- #
+# unify_rig_calibration: fuse + cross-check the two agentview routes via the arm offset
+# --------------------------------------------------------------------------------------- #
+def test_unify_fuses_agreeing_estimates_with_a_small_cross_check():
+    """When left's direct solve and right's solve bridged through left_T_right agree (as they
+    must, if every calibration was solved correctly against the same physical rig), the fused
+    answer should sit close to both and the cross-check should be small."""
+    true_left_t_agent = _pose((1.0, 0.0, 0.5))
+    true_left_t_right = _pose((0.6, 0.0, 0.0), axis="z", deg=180.0)
+    true_right_t_agent = np.linalg.inv(true_left_t_right) @ true_left_t_agent  # self-consistent
+
+    left_result = solve_agentview_extrinsic(
+        [
+            Capture("left", np.eye(4), np.eye(4), np.linalg.inv(true_left_t_agent), 0.1, 0.1),
+            Capture(
+                "left",
+                _pose((0.01, 0, 0)),
+                np.linalg.inv(_pose((0.01, 0, 0))),
+                np.linalg.inv(true_left_t_agent),
+                0.1,
+                0.1,
+            ),
+        ]
+    )
+    right_result = solve_agentview_extrinsic(
+        [
+            Capture("right", np.eye(4), np.eye(4), np.linalg.inv(true_right_t_agent), 0.1, 0.1),
+            Capture(
+                "right",
+                _pose((0.01, 0, 0)),
+                np.linalg.inv(_pose((0.01, 0, 0))),
+                np.linalg.inv(true_right_t_agent),
+                0.1,
+                0.1,
+            ),
+        ]
+    )
+    arm_offset = ArmOffsetResult(
+        true_left_t_right, float(np.linalg.norm(true_left_t_right[:3, 3])), 4, 0.0, 0.0, [], []
+    )
+
+    unified = unify_rig_calibration({"left": left_result, "right": right_result}, arm_offset)
+
+    assert np.allclose(unified.left_t_agentview, true_left_t_agent, atol=1e-6)
+    assert unified.cross_check_translation_mm is not None
+    assert unified.cross_check_translation_mm < 1e-3
+    assert unified.cross_check_rotation_deg < 1e-3
+    assert np.isclose(unified.distance_m, 0.6, atol=1e-8)
+
+
+def test_unify_falls_back_to_whichever_single_arm_is_available():
+    """A rig calibrated so far from only one arm's captures still produces a usable answer --
+    just without the cross-check, since there is nothing independent to check it against."""
+    true_left_t_agent = _pose((1.0, 0.0, 0.5))
+    left_result = solve_agentview_extrinsic(
+        [
+            Capture("left", np.eye(4), np.eye(4), np.linalg.inv(true_left_t_agent), 0.1, 0.1),
+            Capture(
+                "left",
+                _pose((0.01, 0, 0)),
+                np.linalg.inv(_pose((0.01, 0, 0))),
+                np.linalg.inv(true_left_t_agent),
+                0.1,
+                0.1,
+            ),
+        ]
+    )
+    arm_offset = ArmOffsetResult(np.eye(4), 0.0, 2, 0.0, 0.0, [], [])
+
+    unified = unify_rig_calibration({"left": left_result}, arm_offset)
+
+    assert np.allclose(unified.left_t_agentview, true_left_t_agent, atol=1e-8)
+    assert unified.cross_check_translation_mm is None
+    assert unified.cross_check_rotation_deg is None
+
+
+def test_unify_refuses_when_neither_arm_is_available():
+    with pytest.raises(ValueError, match="neither"):
+        unify_rig_calibration({}, ArmOffsetResult(np.eye(4), 0.0, 0, 0.0, 0.0, [], []))
 
 
 # --------------------------------------------------------------------------------------- #

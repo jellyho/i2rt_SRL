@@ -34,6 +34,24 @@ one each capture came from, ``solve_agentview_extrinsic`` refuses to mix them, a
 ``solve_agentview_extrinsic_per_arm`` is the entry point that actually accounts for this --
 solving (and reporting) one extrinsic per arm, each valid only within that arm's own frame.
 
+**That missing cross-arm transform is itself solvable the same way, and the SAME board gets it
+for free.** Whenever both wrist cameras happen to see the still-unmoved board AT ONCE, each
+independently bridges to it:
+
+    left_T_board  = left_T_wrist(q_left)   @ left_wrist_T_board
+    right_T_board = right_T_wrist(q_right) @ right_wrist_T_board
+
+and since it is the same board, unmoved, between the two:
+
+    left_T_right = left_T_board @ inv(right_T_board)
+
+See ``ArmPairCapture``/``solve_arm_offset``. Its translation magnitude is the physical distance
+between the two arms' own FK origins -- not measured with a ruler, recovered from the same board
+captures. Once known, it also lets ``unify_rig_calibration`` cross-check the two independent
+agentview extrinsics against each other (bridge the right-arm one through ``left_T_right`` and
+compare it to the directly-solved left-arm one) -- an end-to-end confidence number on all three
+calibrations at once, not a separate validation step.
+
 Intrinsics come from the RealSense devices themselves (``CameraManager.intrinsics``, factory
 calibration off the device) rather than a checkerboard sweep -- accurate enough for this, and it
 removes a whole separate calibration stage.
@@ -161,6 +179,36 @@ def _rotation_angle_deg(R: np.ndarray) -> float:
     return float(np.degrees(np.arccos(c)))
 
 
+def _average_poses(estimates: Sequence[np.ndarray]) -> tuple:
+    """Average several independent 4x4 pose estimates (translation: mean; rotation: SVD-projected
+    mean, see ``_orthonormalize``), and each one's distance from that average.
+
+    The shared machinery behind every "chain several captures into one relative pose, then
+    average" solve in this module (``solve_agentview_extrinsic``, ``solve_arm_offset``) --
+    averaging AFTER each capture is independently chained, not averaging an intermediate first,
+    is what keeps one bad capture an outlier in the result instead of a silent corruption of a
+    shared intermediate everything else depends on.
+
+    Returns ``(mean_pose, per_capture_translation_mm, per_capture_rotation_deg)``.
+    """
+    t_mean = np.mean([e[:3, 3] for e in estimates], axis=0)
+    R_mean = _orthonormalize(np.mean([e[:3, :3] for e in estimates], axis=0))
+    per_t = [float(np.linalg.norm(e[:3, 3] - t_mean) * 1000.0) for e in estimates]
+    per_r = [_rotation_angle_deg(R_mean.T @ e[:3, :3]) for e in estimates]
+    out = np.eye(4)
+    out[:3, :3] = R_mean
+    out[:3, 3] = t_mean
+    return out, per_t, per_r
+
+
+def _rms(values: Sequence[float]) -> float:
+    """RMS, not std: the summary wanted here is "how far do these typically sit from the mean",
+    which np.std would instead report as "how much do THEY vary from EACH OTHER" -- a real but
+    much less useful number (e.g. every value 5mm off in a different direction reads as 0 std
+    despite 5mm of real disagreement). See solve_agentview_extrinsic's original note on this."""
+    return float(np.sqrt(np.mean(np.square(values))))
+
+
 @dataclasses.dataclass
 class Capture:
     """One calibration sample: the arm pose a wrist camera saw the board from, plus both
@@ -217,26 +265,13 @@ def solve_agentview_extrinsic(captures: Sequence[Capture]) -> CalibrationResult:
         base_t_board = c.base_t_wrist @ c.wrist_t_board
         estimates.append(base_t_board @ np.linalg.inv(c.agentview_t_board))
 
-    t_mean = np.mean([e[:3, 3] for e in estimates], axis=0)
-    R_mean = _orthonormalize(np.mean([e[:3, :3] for e in estimates], axis=0))
-
-    per_t = [float(np.linalg.norm(e[:3, 3] - t_mean) * 1000.0) for e in estimates]
-    per_r = [_rotation_angle_deg(R_mean.T @ e[:3, :3]) for e in estimates]
-
-    out = np.eye(4)
-    out[:3, :3] = R_mean
-    out[:3, 3] = t_mean
+    out, per_t, per_r = _average_poses(estimates)
     return CalibrationResult(
         arm=arm,
         base_t_agentview=out,
         n_captures=len(captures),
-        # RMS distance-from-mean across captures, not std-of-those-distances: the summary this
-        # is for is "how far do the per-capture estimates typically sit from the answer", which
-        # np.std would instead report as "how much do the distances vary from each other" --
-        # a real but much less useful number (e.g. every capture 5mm off in a different
-        # direction reads as 0 std despite 5mm of real disagreement).
-        translation_rms_mm=float(np.sqrt(np.mean(np.square(per_t)))),
-        rotation_rms_deg=float(np.sqrt(np.mean(np.square(per_r)))),
+        translation_rms_mm=_rms(per_t),
+        rotation_rms_deg=_rms(per_r),
         per_capture_translation_mm=per_t,
         per_capture_rotation_deg=per_r,
     )
@@ -256,3 +291,114 @@ def solve_agentview_extrinsic_per_arm(captures: Sequence[Capture]) -> Dict[str, 
     for c in captures:
         by_arm.setdefault(c.arm, []).append(c)
     return {arm: solve_agentview_extrinsic(group) for arm, group in by_arm.items() if len(group) >= 2}
+
+
+@dataclasses.dataclass
+class ArmPairCapture:
+    """Both wrist cameras seeing the SAME (still, unmoved) board at once -- what
+    ``solve_arm_offset`` needs.
+
+    Distinct from ``Capture``: that one only ever needs ONE wrist camera + agentview.
+    ``left_T_right`` needs BOTH wrist cameras in the same instant, since "the board did not move
+    between these two detections" is the only thing tying the two independent FK chains
+    together -- a left-wrist capture from one moment and a right-wrist capture from another,
+    with the board nudged in between, would silently corrupt the offset with however far it
+    moved.
+    """
+
+    left_t_wrist: np.ndarray  # 4x4, left WristCameraGeometry.camera_pose(q_left)
+    left_wrist_t_board: np.ndarray  # 4x4
+    right_t_wrist: np.ndarray  # 4x4, right WristCameraGeometry.camera_pose(q_right)
+    right_wrist_t_board: np.ndarray  # 4x4
+    left_reproj_error_px: float
+    right_reproj_error_px: float
+
+
+@dataclasses.dataclass
+class ArmOffsetResult:
+    left_t_right: np.ndarray  # 4x4, the answer
+    distance_m: float  # ||translation|| -- how far apart the two arms' own FK origins sit
+    n_captures: int
+    translation_rms_mm: float
+    rotation_rms_deg: float
+    per_capture_translation_mm: List[float]
+    per_capture_rotation_deg: List[float]
+
+
+def solve_arm_offset(captures: Sequence[ArmPairCapture]) -> ArmOffsetResult:
+    """``left_T_right`` from moments both wrist cameras saw the same still board at once.
+
+    Same "chain each capture independently, then average" pattern as
+    ``solve_agentview_extrinsic`` -- here BOTH sides of the chain are FK-bridged rather than one
+    being a fixed camera, but the maths (and the reason to average after chaining, not before)
+    is identical; see that function's docstring.
+    """
+    if len(captures) < 2:
+        raise ValueError("need at least 2 captures (1 cannot show whether the estimates agree)")
+
+    estimates = []
+    for c in captures:
+        left_t_board = c.left_t_wrist @ c.left_wrist_t_board
+        right_t_board = c.right_t_wrist @ c.right_wrist_t_board
+        estimates.append(left_t_board @ np.linalg.inv(right_t_board))
+
+    out, per_t, per_r = _average_poses(estimates)
+    return ArmOffsetResult(
+        left_t_right=out,
+        distance_m=float(np.linalg.norm(out[:3, 3])),
+        n_captures=len(captures),
+        translation_rms_mm=_rms(per_t),
+        rotation_rms_deg=_rms(per_r),
+        per_capture_translation_mm=per_t,
+        per_capture_rotation_deg=per_r,
+    )
+
+
+@dataclasses.dataclass
+class UnifiedRigCalibration:
+    """Everything expressed in ONE shared frame -- canonically the left arm's -- once
+    ``left_T_right`` is known.
+
+    ``left_t_agentview`` is the FUSED estimate: the mean of the direct left-wrist solve and the
+    right-wrist solve bridged through ``left_t_right``, when both exist (otherwise whichever one
+    does -- a rig calibrated from only one arm's captures still produces an answer, just without
+    the cross-check). ``cross_check_*`` is how far apart those two independent routes to
+    agentview landed, when both exist -- an end-to-end confidence number on all three
+    calibrations (left-agentview, right-agentview, left-right) at once, not a separate
+    validation step. None when only one arm's agentview extrinsic was available to fuse.
+    """
+
+    left_t_agentview: np.ndarray
+    left_t_right: np.ndarray
+    distance_m: float
+    cross_check_translation_mm: Optional[float]
+    cross_check_rotation_deg: Optional[float]
+
+
+def unify_rig_calibration(
+    agentview_by_arm: Dict[str, CalibrationResult], arm_offset: ArmOffsetResult
+) -> UnifiedRigCalibration:
+    """Fuse a per-arm agentview solve (``solve_agentview_extrinsic_per_arm``) with the arm
+    offset (``solve_arm_offset``) into one shared-frame answer, cross-checking the two
+    independent routes to agentview against each other when both are available."""
+    left = agentview_by_arm.get("left")
+    right = agentview_by_arm.get("right")
+    if left is None and right is None:
+        raise ValueError("agentview_by_arm has neither 'left' nor 'right' -- nothing to fuse")
+
+    bridged_right = arm_offset.left_t_right @ right.base_t_agentview if right is not None else None
+    candidates = [m for m in (left.base_t_agentview if left is not None else None, bridged_right) if m is not None]
+    fused, _per_t, _per_r = _average_poses(candidates)
+
+    cross_t = cross_r = None
+    if left is not None and bridged_right is not None:
+        cross_t = float(np.linalg.norm(bridged_right[:3, 3] - left.base_t_agentview[:3, 3]) * 1000.0)
+        cross_r = _rotation_angle_deg(left.base_t_agentview[:3, :3].T @ bridged_right[:3, :3])
+
+    return UnifiedRigCalibration(
+        left_t_agentview=fused,
+        left_t_right=arm_offset.left_t_right,
+        distance_m=arm_offset.distance_m,
+        cross_check_translation_mm=cross_t,
+        cross_check_rotation_deg=cross_r,
+    )

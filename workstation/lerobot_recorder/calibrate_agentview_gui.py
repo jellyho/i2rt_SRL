@@ -10,6 +10,10 @@ view. Live preview of agentview + both wrists with the board outline drawn when 
 grabs one sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not
 have to be posed at once, and when they are, one click banks two independent estimates instead of
 one). Move the arm(s) to a few different poses that keep the board in view and capture at each.
+Whenever a click happens to catch BOTH wrist cameras seeing the board AT ONCE, it also banks an
+``ArmPairCapture`` for free -- no separate button, no extra step -- towards the arm-to-arm offset
+(see below); this needs both arms actually posed together for at least a couple of clicks, which
+the single-arm agentview captures do not require.
 
 "Solve" produces ONE extrinsic PER ARM, not one pooled answer: each arm's ``WristCameraGeometry``
 is its own MJCF loaded in isolation, with no known transform to the other arm's -- there is no
@@ -17,9 +21,16 @@ shared "robot base" frame anywhere in this codebase (see ``charuco``'s module do
 left- and right-wrist captures into one solve would silently average two different questions'
 answers together, so ``solve_agentview_extrinsic_per_arm`` groups by arm first. Each arm's result
 reports how much ITS OWN captures disagree with each other, which is that arm's calibration
-confidence rather than a separate validation step. "Save" writes both results (whichever arms had
-enough captures) + the intrinsics they were solved against to one JSON file another tool can load
--- keyed by arm, since a consumer has to know which arm's frame it is asking for.
+confidence rather than a separate validation step.
+
+When at least 2 paired captures exist too, "Solve" ALSO recovers ``left_T_right`` (the physical
+offset between the two arms -- distance included) and, when both single-arm extrinsics solved,
+fuses them into one shared-frame answer with a cross-check: bridge the right-arm extrinsic
+through ``left_T_right`` and compare it to the direct left-arm one, which is an end-to-end
+confidence number on all three calibrations at once (see ``charuco.unify_rig_calibration``).
+
+"Save" writes everything available -- per-arm extrinsics, the arm offset, the fused/cross-checked
+answer -- to one JSON file another tool can load.
 """
 
 from __future__ import annotations
@@ -35,10 +46,13 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.charuco import (
+    ArmPairCapture,
     BoardSpec,
     Capture,
     detect_board_pose,
     solve_agentview_extrinsic_per_arm,
+    solve_arm_offset,
+    unify_rig_calibration,
 )
 from workstation.lerobot_recorder.config import RecorderConfig
 
@@ -97,6 +111,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self._last_wrist_det: Dict[str, object] = {}  # arm -> Detection | None
         self._last_q: Dict[str, Optional[np.ndarray]] = {}  # arm -> joints | None
         self.captures: List[Capture] = []
+        # Only ever appended alongside a regular Capture (see _on_capture), and only when BOTH
+        # wrist cameras saw the board in the SAME tick -- see ArmPairCapture's docstring for why
+        # "same tick" (board unmoved) is what makes the offset valid at all.
+        self.pair_captures: List[ArmPairCapture] = []
 
         self._build_ui()
         self.timer = QtCore.QTimer(self)
@@ -144,6 +162,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.capture_list = QtWidgets.QListWidget()
         self.capture_list.setMaximumHeight(160)
         root.addWidget(self.capture_list)
+
+        self.pair_label = QtWidgets.QLabel("arm-pair samples (for the left/right offset): 0")
+        self.pair_label.setStyleSheet(f"color:{theme.MUTED};")
+        root.addWidget(self.pair_label)
 
         self.result_label = QtWidgets.QLabel("not solved yet")
         self.result_label.setStyleSheet("font-size:20px;")
@@ -232,6 +254,23 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 f"agentview err {cap.agentview_reproj_error_px:.2f}px  ({time.strftime('%H:%M:%S')})"
             )
             added += 1
+
+        if "left" in self.arms and "right" in self.arms:
+            left_det, right_det = self._last_wrist_det.get("left"), self._last_wrist_det.get("right")
+            left_q, right_q = self._last_q.get("left"), self._last_q.get("right")
+            if left_det is not None and right_det is not None and left_q is not None and right_q is not None:
+                self.pair_captures.append(
+                    ArmPairCapture(
+                        left_t_wrist=self.geometries["left"].camera_pose(left_q),
+                        left_wrist_t_board=left_det.cam_t_board,
+                        right_t_wrist=self.geometries["right"].camera_pose(right_q),
+                        right_wrist_t_board=right_det.cam_t_board,
+                        left_reproj_error_px=left_det.reproj_error_px,
+                        right_reproj_error_px=right_det.reproj_error_px,
+                    )
+                )
+                self.pair_label.setText(f"arm-pair samples (for the left/right offset): {len(self.pair_captures)}")
+
         if not added:
             self.status.setText("capture pressed but nothing was ready -- see status above")
 
@@ -277,6 +316,29 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         for arm, n in counts.items():
             if arm not in results and n:
                 lines.append(f"[{arm}] {n} capture(s) -- need at least 2 to solve")
+
+        # The arm-to-arm offset, and (once both single-arm extrinsics AND the offset exist) the
+        # fused/cross-checked shared-frame answer -- see charuco.py's module docstring for why
+        # this needs simultaneous both-wrists-see-the-board captures, not just any two captures.
+        arm_offset = None
+        if len(self.pair_captures) >= 2:
+            arm_offset = solve_arm_offset(self.pair_captures)
+            lines.append(
+                f"[left<->right] n={arm_offset.n_captures}  distance {arm_offset.distance_m * 100:.1f} cm  "
+                f"translation RMS {arm_offset.translation_rms_mm:.2f} mm  "
+                f"rotation RMS {arm_offset.rotation_rms_deg:.3f} deg"
+            )
+        elif self.pair_captures:
+            lines.append(f"[left<->right] {len(self.pair_captures)} paired capture(s) -- need at least 2")
+
+        unified = None
+        if arm_offset is not None and "left" in results and "right" in results:
+            unified = unify_rig_calibration(results, arm_offset)
+            lines.append(
+                f"[unified, left frame] cross-check {unified.cross_check_translation_mm:.2f} mm / "
+                f"{unified.cross_check_rotation_deg:.3f} deg"
+            )
+
         self.result_label.setText("   ".join(lines) if lines else "not solved yet")
 
         if not per_arm_json:
@@ -294,6 +356,28 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             "agentview_intrinsics": self.cams.intrinsics("agentview"),
             "solved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if arm_offset is not None:
+            self._result_json["arm_offset"] = {
+                # left_T_right: composes with either arm's own base_t_agentview above to bring
+                # everything into one shared (left) frame by hand, if a consumer wants that
+                # rather than the already-fused "unified_left_frame" below.
+                "left_t_right": arm_offset.left_t_right.tolist(),
+                "distance_m": arm_offset.distance_m,
+                "n_captures": arm_offset.n_captures,
+                "translation_rms_mm": arm_offset.translation_rms_mm,
+                "rotation_rms_deg": arm_offset.rotation_rms_deg,
+            }
+        if unified is not None:
+            self._result_json["unified_left_frame"] = {
+                "left_t_agentview": unified.left_t_agentview.tolist(),
+                "left_t_right": unified.left_t_right.tolist(),
+                "distance_m": unified.distance_m,
+                # How far apart the direct left-arm solve and the right-arm solve (bridged
+                # through left_t_right) landed -- an end-to-end check on all three calibrations
+                # at once, not a separate validation step.
+                "cross_check_translation_mm": unified.cross_check_translation_mm,
+                "cross_check_rotation_deg": unified.cross_check_rotation_deg,
+            }
         self.save_btn.setEnabled(True)
 
     def _on_save(self) -> None:

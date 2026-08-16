@@ -569,6 +569,18 @@ Camera intrinsics come from the RealSense devices themselves (factory calibratio
 separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
 `CharucoDetector`/`matchImagePoints` API) — see requirements.txt.
 
+**Also recovers the arm-to-arm offset, for free, off the same board.** Whenever a Capture click
+happens to catch BOTH wrist cameras seeing the (unmoved) board at once — pose both arms toward
+it together for a couple of clicks — it also banks a sample toward `left_T_right`: the physical
+transform, and straight-line distance, between the two arms' own FK origins (recovered from the
+board, not measured with a ruler). Once at least 2 such paired samples exist, **Solve** reports
+that offset alongside the per-arm results, and — when both single-arm extrinsics also solved —
+fuses them into one shared (left-arm) frame with a cross-check: bridge the right-arm extrinsic
+through the offset and compare it to the direct left-arm one. A small cross-check number is an
+end-to-end confidence check on all three calibrations (left-agentview, right-agentview,
+left-right) at once, not a separate validation step. **Save** writes whatever combination of
+these actually solved — per-arm only, or with the offset and fused answer too.
+
 ---
 
 ## Notes
