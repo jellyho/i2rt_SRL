@@ -127,14 +127,14 @@ cameras: {agentview: "&lt;D455&gt;", wrist_left: "&lt;D405&gt;", wrist_right: "&
       <h3 id="sc-teleop">A · Bimanual teleop only (no recording)</h3>
       <span class="code-label">bash · robot</span>
 <pre><code>robot/yam canup                          # bring up the 4 CAN interfaces (after boot)
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 # lift both gellos to engage; bring both home to stop &amp; auto-return.</code></pre>
 
       <h3 id="sc-collect">B · Data collection (teleop + LeRobot recorder) — main flow</h3>
       <p><strong>1.</strong> <span class="pill real">robot</span> — start the teleop server (serves state / action / gate over portal):</p>
       <span class="code-label">bash · robot</span>
 <pre><code>robot/yam canup
-robot/yam teleop --bilateral-kp 0.15</code></pre>
+robot/yam teleop</code></pre>
       <p><strong>2.</strong> <span class="pill sim">workstation</span> — start the recorder GUI (host + serials come from <code>config.yaml</code>):</p>
       <span class="code-label">bash · workstation</span>
 <pre><code>workstation/yam-data record --repo-id user/yam_pick</code></pre>
@@ -158,9 +158,9 @@ robot/yam teleop --bilateral-kp 0.15</code></pre>
       <h3 id="sc-dagger">C · Deployment / DAgger (policy + human takeover)</h3>
       <p><strong>1.</strong> <span class="pill real">robot</span> dagger server · <strong>2.</strong> <span class="pill sim">policy</span> a websocket policy server · <strong>3.</strong> <span class="pill sim">workstation</span> the bridge that joins them:</p>
       <span class="code-label">bash</span>
-<pre><code>robot/yam dagger --mirror-kp 0.2 --feedback-kp 0.1     # robot
+<pre><code>robot/yam deploy                                         # robot
 python -m yam_policy.serve                               # policy host (:8000)
-workstation/yam-data bridge --prompt "pick up the cube"  # workstation (reads config.yaml)
+workstation/yam-data deploy --prompt "pick up the cube"  # workstation (reads config.yaml)
 # press a handle button (or RobotClient.set_intervention) to take over; release to hand back.</code></pre>
 
       <h3 id="sc-replay">D · Replay a dataset onto the robot</h3>
@@ -953,23 +953,23 @@ client.reset_odometry()</code></pre>
       </table>
       </div>
       <span class="code-label">bash · robot</span>
-<pre><code>robot/yam teleop --bilateral-kp 0.15      # auto-reads config.yaml
-robot/yam dagger --mirror-kp 0.2
+<pre><code>robot/yam teleop                           # auto-reads config.yaml
+robot/yam deploy                           # a policy drives; button = takeover
 robot/yam wrapper                          # replay target</code></pre>
       <p><strong>Teleop auto-gate (both arms together, no button):</strong> <code>HOMING</code> → robot &amp; gellos ramp home; <code>IDLE</code> → at home, gellos free; <strong>lift both</strong> past <code>--engage-thr</code> → <code>ENGAGED</code> (followers track directly via their own PD gains, no lag); bring both home for <code>--dwell</code>s → back to <code>HOMING</code>. The exact rate-limited command sent is the recorded <code>action</code>, so episodes reproduce precisely. Only the one-time engage approach + the (gentler) homing return are ramped (<code>--ramp-speed</code> / <code>--home-speed</code>).</p>
       <div class="callout tip">
         <div class="callout-title">Bilateral engage — no leader yank</div>
-        <p>With <code>--bilateral-kp&gt;0</code>, the leader is back-driven only <strong>after the follower has caught up</strong> to it — so engaging from home with the gellos lifted does not snap the leader toward home. Leader buttons can also end an episode: the per-button outcome is set in <code>config.yaml</code> (<code>recorder.buttons</code>), defaulting to left lower → success, right lower → fail, either upper → discard (each also starts the gentle homing return).</p>
+        <p>Force feedback is <strong>off by default</strong> (<code>bilateral_kp: 0.0</code>). With <code>--bilateral-kp&gt;0</code> the leader is back-driven only <strong>after the follower has caught up</strong> to it — so engaging from home with the gellos lifted does not snap the leader toward home. Leader buttons can also end an episode: the per-button outcome is set in <code>config.yaml</code> (<code>recorder.buttons</code>), defaulting to left lower → success, right lower → fail, either upper → discard (each also starts the gentle homing return).</p>
       </div>
       <p>The snapshot (<code>get_observation()</code>) carries, per side, follower <code>pos/vel/eff</code>, <code>leader_pos</code>, <code>applied</code> (the action), <code>human</code> (while intervening), <code>buttons</code>, plus the gate state and <code>estop</code>. Follower gains live in one place — <code>i2rt/serving/control_config.py</code> — and apply to teleop, dagger, and the replay wrapper, so collection and replay match.</p>
 
-      <h3 id="serving-policy">Policy serving &amp; the bridge</h3>
-      <p>Policies run in their <strong>own unconstrained env</strong> (any Python / CUDA, even a remote GPU box) behind an <strong>openpi-compatible websocket server</strong>; the workstation <strong>bridge</strong> joins the two links — it reads the robot snapshot + cameras, builds an openpi obs dict, queries the policy (prefetching the next action chunk to hide latency), and sends the result to the robot.</p>
+      <h3 id="serving-policy">Policy serving &amp; the deploy client</h3>
+      <p>Policies run in their <strong>own unconstrained env</strong> (any Python / CUDA, even a remote GPU box) behind an <strong>openpi-compatible websocket server</strong>; the workstation <strong>deploy client</strong> joins the two links — it reads the robot snapshot + cameras, builds an openpi obs dict, queries the policy, and sends the result to the robot. One chunk is executed per inference (there is no prefetching variant: one existed, and measured, its freshness came out a wash).</p>
       <span class="code-label">bash</span>
 <pre><code>python -m yam_policy.serve --policy &lt;module&gt;:&lt;Class&gt; --config k=v   # policy host (:8000)
-robot/yam dagger                                                # robot
-workstation/yam-data bridge --prompt "pick up the cube"          # workstation</code></pre>
-      <p>The bridge auto-configures the action horizon and image keys from the server's metadata, so a real openpi checkpoint drops in unchanged. Add your own policy by subclassing <code>BasePolicy.infer(obs)→{"actions": (H, D)}</code> (see <code>policy_serving/</code> with dummy / openpi / lerobot templates).</p>
+robot/yam deploy                                                # robot
+workstation/yam-data deploy --prompt "pick up the cube"          # workstation</code></pre>
+      <p>The client auto-configures the chunk length and image keys from the server's metadata, so a real openpi checkpoint drops in unchanged — and so does a <strong>LeRobot</strong> checkpoint, through <code>yam_policy.policies.lerobot_policy:LeRobotPolicy</code>, with no conversion step. Deploy names which stack answered, since all of them speak this wire but read different observations. Add your own policy by subclassing <code>BasePolicy.infer(obs)→{"actions": (H, D)}</code> (see <code>policy_serving/</code> with dummy / openpi / lerobot templates).</p>
 
       <h3 id="serving-safety">Safety model</h3>
       <ul>
@@ -995,7 +995,7 @@ workstation/yam-data bridge --prompt "pick up the cube"          # workstation</
           <tr><td><code>observation.eef</code></td><td>(14,) — both arms × EE pose (FK; zeros if unavailable)</td></tr>
           <tr><td><code>observation.control_mode</code></td><td>(1,) — teleop / policy / intervention</td></tr>
           <tr><td><code>action</code></td><td>(14,) — both arms × executed command</td></tr>
-          <tr><td>images</td><td><code>wrist_left</code>, <code>wrist_right</code>, <code>agentview</code> @ 60 fps</td></tr>
+          <tr><td>images</td><td><code>wrist_left</code>, <code>wrist_right</code>, <code>agentview</code> @ 30 fps</td></tr>
         </tbody>
       </table>
       </div>
