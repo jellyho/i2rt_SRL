@@ -44,12 +44,13 @@ What it does:
      own base frame and its own extrinsic places it (left fan green, right fan amber).
   5. Draws the fans on the recorded frames (``_draw_fan``) and writes an mp4.
 
+    # deploy fan on all three cameras (agentview + both wrists):
     workstation/yam-data render-samples \\
-        --repo-id my_deploy_run --episode 0 --arm left --horizon 30 --candidates 8 \\
+        --repo-id my_deploy_run --episode 0 --horizon 30 --candidates 8 \\
         --out .scratch/deploy_samples.mp4
     # any dataset, executed trajectory only (no action_samples needed):
     workstation/yam-data render-samples \\
-        --repo-id my_demo --episode 0 --arm left --source action --horizon 16 \\
+        --repo-id my_demo --episode 0 --source action --horizon 16 \\
         --out .scratch/executed_path.mp4
 
 The WRIST intrinsics default to the same placeholder ``tests/test_wrist_view.py`` uses ("roughly
@@ -148,7 +149,11 @@ def _load_agentview_extrinsics(config_path: Optional[str], arms: List[str]) -> d
     the overlay just skips them rather than drawing a fan at a wrong pose."""
     from i2rt.serving.rig_config import find_rig, load_rig
 
-    rig = load_rig(config_path)
+    try:
+        rig = load_rig(config_path)
+    except Exception as e:  # no config found / unreadable -> no calibrated agentview, render raw
+        print(f"agentview: no usable config ({e}) -- agentview shown without an overlay", file=sys.stderr)
+        return {}
     extr = ((rig.get("cameras") or {}).get("agentview") or {}).get("extrinsic") or {}
     out = {}
     for arm in arms:
@@ -164,17 +169,37 @@ def _load_agentview_extrinsics(config_path: Optional[str], arms: List[str]) -> d
     return out
 
 
-def _to_square(img: np.ndarray, size: int) -> np.ndarray:
-    """Squash a frame to ``size x size`` (non-uniform if the source is not already square).
+def _load_wrist_extrinsics(config_path: Optional[str]) -> dict:
+    """{arm: gripper_T_camera (4x4)} from config's ``cameras.wrist_<arm>.extrinsic.matrix`` (the
+    hand-eye solve), or an empty/partial dict when absent -- the caller then lets
+    ``WristCameraGeometry`` fall back to its CAD ``T_GRIPPER_CAMERA``. Using the calibrated mount
+    here (not CAD) is what makes the wrist overlay land on the pixel rather than only near it."""
+    from i2rt.serving.rig_config import load_rig
 
-    Doing this ourselves, once, and scaling the intrinsics to match with the same factor (see
-    ``CameraIntrinsics.scaled_to``) makes the two non-uniform transforms cancel out, so a
-    projected point still lands where the visible pixel it names actually is -- the recorded
-    wrist frame (D405, 640x480) is not square, and projecting at one aspect ratio while drawing
-    at another silently shifts every point."""
+    try:
+        cams = (load_rig(config_path).get("cameras")) or {}
+    except Exception:  # no config -> WristCameraGeometry uses its CAD T_GRIPPER_CAMERA default
+        return {}
+    out = {}
+    for arm in ("left", "right"):
+        m = ((cams.get(f"wrist_{arm}") or {}).get("extrinsic") or {}).get("matrix")
+        if m is not None:
+            out[arm] = np.asarray(m, dtype=float)
+    return out
+
+
+def _to_size(img: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize a frame to ``width x height`` (its native aspect kept when width/height match it).
+
+    hf-utils' dataset render scales every camera to a COMMON HEIGHT and hstacks, so the footage
+    keeps its 4:3 shape instead of being squashed square -- we do the same. Scaling the intrinsics
+    to the SAME ``(width, height)`` (see ``CameraIntrinsics.scaled_to``, which takes the x and y
+    factors separately) makes the two transforms cancel, so a projected point still lands on the
+    visible pixel it names even when width/height differ -- projecting at one aspect and drawing at
+    another otherwise silently shifts every point."""
     from PIL import Image
 
-    return np.asarray(Image.fromarray(img).resize((size, size), Image.LANCZOS))
+    return np.asarray(Image.fromarray(img).resize((width, height), Image.LANCZOS))
 
 
 def _finite_prefix(path: np.ndarray) -> Optional[list]:
@@ -299,23 +324,23 @@ def _label(
     ImageDraw.Draw(canvas).text((x, y), text, font=font, fill=fill, anchor="la")
 
 
-def _compose_frame(
-    agent_sq: np.ndarray, wrist_sq: np.ndarray, replan: int, step: int, cam: int, *, agent_label: str, wrist_label: str
-) -> np.ndarray:
-    """Agent view + fan-overlaid wrist view, hstacked flush (hf-utils' dataset-render layout),
-    each panel bottom-left labelled on a translucent box instead of a separate header strip.
+def _compose_frame(panels: list, panel_w: int, panel_h: int, *, header: str) -> np.ndarray:
+    """``[(image, label), ...]`` -> one hstacked-flush frame, hf-utils' dataset-render look: each
+    camera scaled to a common height and butted together, a translucent-box header top-left and a
+    per-panel camera label bottom-left (``drawtext ... box=1:boxcolor=black@0.5`` in hf-utils).
 
-    No analytics column: there is no critic here to explain a decision with, only the sampled
-    spread the fan already shows. ``hud.Dashboard``'s Q-grid/value-trace panels are exactly the
-    part that does not apply -- see the module docstring for why they are not vendored too.
+    Variable panel count so a run can show agentview + one wrist, or agentview + BOTH wrists, or
+    any subset -- see ``--agentview-arms``/``--wrists``. No analytics column: there is no critic
+    here to explain a decision with, only the spread the overlay already shows (``hud.Dashboard``'s
+    Q-grid/value-trace panels are exactly the part that does not apply -- see the module docstring).
     """
     from PIL import Image
 
-    canvas = Image.fromarray(np.concatenate([agent_sq, wrist_sq], axis=1))
-    f_sm, f_md = _font(13), _font(15)
-    _label(canvas, (8, 8), f"replan {replan}   step {step}", f_md)
-    _label(canvas, (8, cam - 24), agent_label, f_sm)
-    _label(canvas, (cam + 8, cam - 24), wrist_label, f_sm, fill=(178, 214, 197))
+    canvas = Image.fromarray(np.concatenate([img for img, _ in panels], axis=1))
+    f_sm, f_md = _font(14), _font(16)
+    _label(canvas, (8, 8), header, f_md)
+    for i, (_, label) in enumerate(panels):
+        _label(canvas, (i * panel_w + 8, panel_h - 26), label, f_sm)
     return np.asarray(canvas)
 
 
@@ -331,32 +356,40 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     if not n_frames:
         raise SystemExit(f"episode {args.episode} not found (or empty) in {args.repo_id}")
 
-    geometry = WristCameraGeometry(combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310))
-    # Native-resolution intrinsics, rescaled to the square canvas we draw on (see _to_square) --
-    # not the recorded frame's own (non-square) resolution.
-    camera_size = 256
-    intrinsics = CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy, width=640, height=480).scaled_to(
-        camera_size, camera_size
+    # Each panel keeps the footage's 4:3 (hf-utils scales cameras to a common height, not square --
+    # see _to_size). Native-resolution intrinsics are rescaled to that panel size so a projected
+    # point still lands on the visible pixel it names.
+    panel_h = args.height
+    panel_w = round(panel_h * 640 / 480)
+    wrist_intr = CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy, width=640, height=480).scaled_to(
+        panel_w, panel_h
     )
+    agent_intr = CameraIntrinsics(
+        fx=args.agent_fx, fy=args.agent_fy, cx=args.agent_cx, cy=args.agent_cy, width=640, height=480
+    ).scaled_to(panel_w, panel_h)
     # Which 7 of the 14 recorded action dims are each arm's (see workstation.lerobot_recorder
     # .config: joints 0..6 left, 7..13 right), and where in `observation.state`'s 42-d layout
     # each arm's joint POSITIONS sit (pos block only -- vel/eff do not describe the pose).
     action_slices = {"left": slice(0, 7), "right": slice(7, 14)}
-    arm_slice = action_slices[args.arm]
-    state_slice = slice(0, 7) if args.arm == "left" else slice(21, 28)
-    wrist_key = "wrist_left" if args.arm == "left" else "wrist_right"
+    state_slices = {"left": slice(0, 7), "right": slice(21, 28)}
 
-    projector = WristProjector(geometry, intrinsics, arm_slice=arm_slice)
+    # One FK model per arm, built with THAT arm's calibrated wrist extrinsic when config has it
+    # (gripper_T_camera; falls back to the CAD default). FK itself is arm-independent, so any of
+    # these also serves the agentview projection (chunk_to_path is extrinsic-free).
+    xml = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
+    wrist_extr = _load_wrist_extrinsics(args.config)
+    geometries = {arm: WristCameraGeometry(xml, extrinsic=wrist_extr.get(arm)) for arm in ("left", "right")}
+    projectors = {
+        arm: WristProjector(geometries[arm], wrist_intr, arm_slice=action_slices[arm]) for arm in ("left", "right")
+    }
 
-    # Agentview overlay: a FIXED third-person camera, so each arm's fan projects through its
-    # calibrated base_T_agentview (config, board-on-gripper solve) -- no wrist ride, no arm_offset,
-    # no shared frame needed: each arm's chunk lives in its own base frame and its own extrinsic
-    # places it. Arms without a calibrated extrinsic are skipped (see _load_agentview_extrinsics).
+    # Agentview: a FIXED third-person camera, so each arm's overlay projects through its calibrated
+    # base_T_agentview (config, board-on-gripper solve) -- no wrist ride, no arm_offset, no shared
+    # frame needed. Each wrist camera rides its own arm and shows ONLY that arm's overlay (the other
+    # arm's path would need arm_offset to place, which this deliberately avoids).
     agentview_arms = list(dict.fromkeys(args.agentview_arms))
     agent_extrinsics = _load_agentview_extrinsics(args.config, agentview_arms)
-    agent_intr = CameraIntrinsics(
-        fx=args.agent_fx, fy=args.agent_fy, cx=args.agent_cx, cy=args.agent_cy, width=640, height=480
-    ).scaled_to(camera_size, camera_size)
+    wrists = list(dict.fromkeys(args.wrists))
 
     starts = _replan_starts(n_frames, args.horizon)
     if not starts:
@@ -382,39 +415,43 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         if state is None:
             print(f"replan at frame {start}: no observation.state recorded here, skipping", file=sys.stderr)
             continue
-        projector.set_pose(state[state_slice])
-        paths = projector(chunk)  # [N] of [H, 2] pixel paths, this arm's candidates only
-
         images = reader.get_images(args.episode, start)
+
+        panels = []  # [(square_rgb, label)] left-to-right: agentview, then each requested wrist
+
+        # Agentview panel: both (calibrated) arms' overlays layered on, each its own colour.
         agent = images.get("agentview")
-        wrist = images.get(wrist_key)
-        if agent is None or wrist is None:
-            print(f"replan at frame {start}: missing agentview/wrist image, skipping", file=sys.stderr)
+        if agent is not None and agentview_arms:
+            agent_sq = _to_size(agent, panel_w, panel_h)
+            for arm, cam_t_base in agent_extrinsics.items():
+                av_paths = [
+                    _project_fixed(geometries[arm].chunk_to_path(cand[:, action_slices[arm]]), cam_t_base, agent_intr)
+                    for cand in chunk
+                ]
+                agent_sq = _draw_fan(agent_sq, av_paths, chosen=0, colors=_FAN_COLORS[arm])
+            label = (
+                f"agentview -- {'+'.join(agent_extrinsics)} {fan_word}"
+                if agent_extrinsics
+                else "agentview (no extrinsic)"
+            )
+            panels.append((agent_sq, label))
+
+        # One panel per requested wrist camera, each with only its own arm's overlay.
+        for arm in wrists:
+            wimg = images.get(f"wrist_{arm}")
+            if wimg is None:
+                continue
+            projectors[arm].set_pose(state[state_slices[arm]])
+            wrist_sq = _draw_fan(
+                _to_size(wimg, panel_w, panel_h), projectors[arm](chunk), chosen=0, colors=_FAN_COLORS[arm]
+            )
+            panels.append((wrist_sq, f"wrist {arm} -- {fan_word}"))
+
+        if not panels:
+            print(f"replan at frame {start}: no requested camera image present, skipping", file=sys.stderr)
             continue
-        # Pre-squash both frames ourselves (see _to_square) so the wrist one lines up with the
-        # already-square-scaled intrinsics above.
-        agent_sq = _to_square(agent, camera_size)
-        # Each calibrated arm's candidate fan, projected into the fixed agentview and layered on
-        # (drawn per arm so left/right stay their own colour -- see _draw_fan / _FAN_COLORS).
-        for arm, cam_t_base in agent_extrinsics.items():
-            av_paths = [
-                _project_fixed(geometry.chunk_to_path(cand[:, action_slices[arm]]), cam_t_base, agent_intr)
-                for cand in chunk
-            ]
-            agent_sq = _draw_fan(agent_sq, av_paths, chosen=0, colors=_FAN_COLORS.get(arm, _FAN_COLORS["left"]))
-        wrist_fan = _draw_fan(_to_square(wrist, camera_size), paths, chosen=0, colors=_FAN_COLORS[args.arm])
-        agent_label = (
-            f"agentview -- {'+'.join(agent_extrinsics)} {fan_word}" if agent_extrinsics else "agentview (no extrinsic)"
-        )
-        composed = _compose_frame(
-            agent_sq,
-            wrist_fan,
-            replan_idx,
-            step,
-            camera_size,
-            agent_label=agent_label,
-            wrist_label=f"wrist {args.arm} -- candidate {fan_word}",
-        )
+        header = f"{args.repo_id} · ep {args.episode} · replan {replan_idx}  step {step}"
+        composed = _compose_frame(panels, panel_w, panel_h, header=header)
 
         for _ in range(max(1, args.hold)):
             frames.append(composed)
@@ -427,7 +464,9 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
     out = pathlib.Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    imageio.mimwrite(out, frames, fps=args.fps, quality=8, macro_block_size=1)
+    # Browser-friendly h264: yuv420p is what every browser can decode (hf-utils encodes the same
+    # way for its dataset previews); macro_block_size=1 keeps odd panel widths from being padded.
+    imageio.mimwrite(out, frames, fps=args.fps, quality=8, macro_block_size=1, codec="libx264", pixelformat="yuv420p")
     print(f"wrote {out} ({len(frames)} frames, {len(starts)} replans, {len(frames) // max(len(starts), 1)} held each)")
     return out
 
@@ -438,15 +477,21 @@ def main() -> None:
     p.add_argument("--root", default="~/lerobot_data")
     p.add_argument("--config", default=None, help="config.yaml for agentview extrinsics; auto-discovered by default")
     p.add_argument("--episode", type=int, default=0)
-    p.add_argument("--arm", choices=["left", "right"], default="left", help="which wrist camera panel to show")
+    p.add_argument(
+        "--wrists",
+        nargs="*",
+        choices=["left", "right"],
+        default=["left", "right"],
+        help="which wrist camera panels to show (default both); each overlays only its own arm's path",
+    )
     p.add_argument(
         "--agentview-arms",
         dest="agentview_arms",
         nargs="*",
         choices=["left", "right"],
         default=["left", "right"],
-        help="which arms' candidate fans to overlay on agentview (default both; each uses its own "
-        "calibrated base_T_agentview -- arms without one are skipped)",
+        help="which arms' paths to overlay on the agentview panel (default both; each uses its own "
+        "calibrated base_T_agentview -- arms without one are skipped). Pass nothing to drop agentview.",
     )
     p.add_argument(
         "--source",
@@ -465,6 +510,7 @@ def main() -> None:
     )
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
     p.add_argument("--hold", type=int, default=5, help="frames to hold each replan on screen")
+    p.add_argument("--height", type=int, default=360, help="per-panel height in px (width follows the 4:3 footage)")
     p.add_argument("--fps", type=int, default=10)
     p.add_argument("--out", default=".scratch/deploy_samples.mp4")
     # Uncalibrated placeholder -- same numbers tests/test_wrist_view.py uses. The fan's shape is

@@ -76,18 +76,28 @@ def _args(dataset: Path, out: Path, **over) -> argparse.Namespace:
     base = dict(
         repo_id="t/samples",
         root=str(dataset.parent),
+        # A path that does not exist, so the loaders fail-soft to no calibrated extrinsics (CAD
+        # wrist, raw agentview) -- keeps the test hermetic instead of discovering the repo config.
+        config=str(dataset.parent / "no_such_config.yaml"),
+        source="samples",
         episode=0,
-        arm="left",
+        wrists=["left", "right"],
+        agentview_arms=["left", "right"],
         horizon=HORIZON,
         candidates=CANDIDATES,
         replans=0,
         hold=2,
+        height=180,
         fps=10,
         out=str(out),
         fx=430.0,
         fy=430.0,
         cx=320.0,
         cy=240.0,
+        agent_fx=390.0,
+        agent_fy=390.0,
+        agent_cx=320.0,
+        agent_cy=240.0,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -140,8 +150,23 @@ def test_an_episode_that_is_not_there_is_refused(recorded_run, tmp_path):
         render(_args(recorded_run, tmp_path / "nope.mp4", episode=7))
 
 
-def test_both_arms_render(recorded_run, tmp_path):
+def test_each_wrist_renders(recorded_run, tmp_path):
     """The right arm reads a different action slice and a different state slice; getting either
-    wrong still draws a fan, just of the wrong joints."""
+    wrong still draws a path, just of the wrong joints."""
     for arm in ("left", "right"):
-        assert render(_args(recorded_run, tmp_path / f"{arm}.mp4", arm=arm)).is_file()
+        assert render(_args(recorded_run, tmp_path / f"{arm}.mp4", wrists=[arm])).is_file()
+
+
+def test_render_all_three_cameras_hstacks_three_panels(recorded_run, tmp_path):
+    """Default is agentview + both wrists -> a 3-panel-wide frame, each panel 4:3 (not squashed)."""
+    import imageio.v3 as iio
+
+    out = render(_args(recorded_run, tmp_path / "all.mp4"))
+    frame = iio.imread(out, index=0)
+    assert frame.shape[1] == 3 * (frame.shape[0] * 640 // 480)  # 3 panels, each 4:3 of the height
+
+
+def test_source_action_needs_no_action_samples(recorded_run, tmp_path):
+    """--source action reads the plain action column, so it renders even with candidates unset."""
+    out = render(_args(recorded_run, tmp_path / "act.mp4", source="action", candidates=None))
+    assert out.is_file()
