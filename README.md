@@ -90,7 +90,7 @@ is selected automatically; set live-camera opacity to `100%` to hide the referen
 
 Then teleoperate — **lift both gellos** to start recording, **bring both home** to end the episode:
 
-- With `review_before_save: true` the episode is held for **Keep** / **Delete**. With `false` it **auto-saves** on each engage→idle.
+- `review_before_save` decides what happens next: `true` holds the episode for **Keep** / **Delete**, `false` (what `config.yaml` ships) **auto-saves** on each engage→idle.
 - **Leader handle buttons:** left upper toggles **fine-grained control** (2.5:1 with the checked-in `fine_grained_scale: 0.4`). When toggled off, recording and teleoperation pause while the follower holds and the leader safely realigns; left lower → **success**, right lower → **fail**, right upper → **discard** (force-home, no save).
 - Close the window when done (calls `finalize()` so the dataset is complete). Cameras run on their own capture thread, so the live view and saving never stall on a slow frame.
 
@@ -106,6 +106,24 @@ workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube" 
 # Other handle buttons toggle intervention and keep/discard + home.
 # Past demonstration overlay is inherited from the recorder UI and remains preview-only.
 ```
+
+**openpi and LeRobot checkpoints both deploy through the same client.** openpi's is the wire
+protocol; a LeRobot checkpoint runs through an adapter on our side, with no conversion step:
+
+```bash
+# 🧠 a LeRobot checkpoint (local dir or a Hub repo id)
+python -m yam_policy.serve \
+    --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
+    --config pretrained_path=outputs/train/my_act/checkpoints/last/pretrained_model \
+    --config device=cuda
+```
+
+The client configures itself from the handshake — camera names, image size, chunk length —
+and the deploy UI names what answered (`LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`), because
+all of these speak the same wire while reading different observations. See
+[`policy_serving/README.md`](policy_serving/README.md), which also covers the one thing to get
+right before training on this recorder's data: **drop `observation.leader`**, or the policy is
+handed the answer as an input.
 
 ### D · Replay a dataset onto the robot
 

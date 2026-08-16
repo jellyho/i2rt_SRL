@@ -1,6 +1,8 @@
 # Dataset Episode Visualizer — Design
 
 Date: 2026-07-09
+Status: **historical.** This shipped as `workstation/lerobot_dataset_visualizer/`, not as the
+`visualize_dataset.py` sketched below. Kept for the reasoning, not as instructions.
 
 ## Goal
 

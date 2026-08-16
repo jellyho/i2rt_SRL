@@ -114,8 +114,8 @@ mirroring the follower. `observation.control_mode` is worth dropping too: it is 
 teleop dataset, so it teaches nothing.
 
 Name the inputs you want in the training config. The dataset is not touched — LeRobot only infers
-features when `input_features` is empty (`policies/factory.py`: `if not cfg.input_features`), so
-setting it wins:
+features when `input_features` is empty (LeRobot's own `policies/factory.py`:
+`if not cfg.input_features`), so setting it wins:
 
 ```bash
 lerobot-train ... --tolerance_s=1e-3 \
