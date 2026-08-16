@@ -330,3 +330,139 @@ def test_save_writes_the_wrist_extrinsic_when_hand_eye_solved(window, config_fil
     assert "wrist_left:" in written
     # the extrinsic child landed under wrist_left, and its serial survived the scalar->mapping expand
     assert "extrinsic:" in written and "352122271652" in written
+
+
+# --------------------------------------------------------------------------------------- #
+# Board-on-gripper (eye-to-hand) mode: agentview solved from a grasped board, no wrist bridge
+# --------------------------------------------------------------------------------------- #
+def _rot(axis, deg):
+    a = np.radians(deg)
+    c, s = np.cos(a), np.sin(a)
+    return {
+        "x": np.array([[1, 0, 0], [0, c, -s], [0, s, c]]),
+        "y": np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]]),
+        "z": np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]),
+    }[axis]
+
+
+def _T(R, t):
+    M = np.eye(4)
+    M[:3, :3] = R
+    M[:3, 3] = t
+    return M
+
+
+class _MovableGeometry:
+    """flange_pose returns whatever the test last set -- so a board-on-gripper capture records a
+    varied FK pose (the identity _FakeGeometry can't drive an eye-to-hand solve)."""
+
+    def __init__(self):
+        self.cur = np.eye(4)
+
+    def flange_pose(self, q):
+        return self.cur
+
+
+_LTR = _T(_rot("z", 5.0), [0.03, -0.53, 0.05])  # a known left_T_right, as config.yaml would hold
+
+
+@pytest.fixture
+def eth_window(qapp):
+    cfg = RecorderConfig(cameras=[CameraSpec("agentview", "", 64, 64, 5)], mock=True)
+    cams = CameraManager(cfg)
+    cams.start()
+    geos = {"left": _MovableGeometry(), "right": _MovableGeometry()}
+    win = CalibrateAgentviewWindow(
+        cams,
+        None,
+        geos,
+        board=BoardSpec(),
+        config_path=None,
+        mock=True,
+        board_on_gripper=True,
+        arm_offset_left_t_right=_LTR,
+    )
+    win._geos = geos  # stash for the test to move the flange between captures
+    yield win
+    cams.stop()
+
+
+def _feed_eth(win, arm, x_true, y_true, *, n, seed):
+    """Bank n board-on-gripper captures for `arm` from a known base_T_agentview + flange_T_board."""
+    win.arm_selector.setCurrentText(arm)
+    rng = np.random.default_rng(seed)
+    for _ in range(n):
+        base_t_flange = _T(
+            _rot("x", rng.uniform(-40, 40)) @ _rot("y", rng.uniform(-40, 40)), rng.uniform(-0.2, 0.2, 3)
+        )
+        win._geos[arm].cur = base_t_flange
+        win._last_agent_det = Detection(
+            cam_t_board=np.linalg.inv(x_true) @ base_t_flange @ y_true,
+            n_corners=10,
+            reproj_error_px=0.2,
+            corners_px=np.zeros((10, 2)),
+        )
+        win._last_q = {"left": np.zeros(7), "right": np.zeros(7)}
+        win._on_capture_eth()
+
+
+def test_eth_mode_hides_the_wrist_previews_and_shows_an_arm_selector(eth_window):
+    assert all(not v.isVisible() for v in eth_window.wrist_views.values())
+    assert eth_window.arm_selector is not None
+
+
+def test_eth_capture_attributes_to_the_selected_arm(eth_window):
+    eth_window.arm_selector.setCurrentText("right")
+    eth_window._last_agent_det = Detection(np.eye(4), 10, 0.2, np.zeros((10, 2)))
+    eth_window._last_q = {"left": np.zeros(7), "right": np.zeros(7)}
+    eth_window._on_capture_eth()
+    assert eth_window.eth_captures[-1].arm == "right"
+
+
+def test_eth_solve_recovers_agentview_and_cross_checks_both_arms(eth_window):
+    x_left = _T(_rot("x", 150.0), [0.4, -0.1, 0.9])
+    y_true = _T(_rot("y", 30.0), [0.03, 0.0, 0.12])
+    x_right = np.linalg.inv(_LTR) @ x_left
+    _feed_eth(eth_window, "left", x_left, y_true, n=6, seed=1)
+    _feed_eth(eth_window, "right", x_right, y_true, n=5, seed=2)
+
+    res = eth_window._last_eth_results
+    assert set(res) == {"left", "right"}
+    assert np.allclose(res["left"].base_t_agentview, x_left, atol=1e-6)
+    assert eth_window._last_eth_unified is not None
+    assert eth_window._last_eth_unified.cross_check_translation_mm < 1e-3
+
+
+def test_eth_without_arm_offset_reports_no_cross_check(eth_window):
+    eth_window.arm_offset_left_t_right = None
+    x_left = _T(_rot("x", 150.0), [0.4, -0.1, 0.9])
+    y_true = _T(_rot("y", 30.0), [0.03, 0.0, 0.12])
+    _feed_eth(eth_window, "left", x_left, y_true, n=6, seed=1)
+    _feed_eth(eth_window, "right", np.linalg.inv(_LTR) @ x_left, y_true, n=5, seed=2)
+    assert eth_window._last_eth_unified is None  # nothing to bridge through
+    assert "no robot.arm_offset" in eth_window.result_label.toPlainText()
+
+
+def test_eth_save_writes_agentview_extrinsic_marked_eye_to_hand(eth_window, config_file, monkeypatch):
+    _confirm_yes(monkeypatch)
+    eth_window.config_path = str(config_file)
+    x_left = _T(_rot("x", 150.0), [0.4, -0.1, 0.9])
+    y_true = _T(_rot("y", 30.0), [0.03, 0.0, 0.12])
+    _feed_eth(eth_window, "left", x_left, y_true, n=6, seed=1)
+    _feed_eth(eth_window, "right", np.linalg.inv(_LTR) @ x_left, y_true, n=5, seed=2)
+
+    eth_window._on_save()
+
+    written = config_file.read_text()
+    assert 'method: "eye_to_hand"' in written
+    assert "unified:" in written
+    # eye-to-hand must NOT fabricate wrist extrinsics or an arm offset (those are the desk board's job)
+    assert "arm_offset:" not in written
+    assert "gripper_T_camera" not in written
+
+
+def test_eth_save_button_stays_disabled_below_three_captures(eth_window):
+    x_left = _T(_rot("x", 150.0), [0.4, -0.1, 0.9])
+    y_true = _T(_rot("y", 30.0), [0.03, 0.0, 0.12])
+    _feed_eth(eth_window, "left", x_left, y_true, n=2, seed=1)  # 2 < the eye-to-hand minimum of 3
+    assert eth_window.save_btn.isEnabled() is False

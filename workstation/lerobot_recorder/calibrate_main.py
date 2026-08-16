@@ -80,6 +80,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "gripper_T_camera (default: fuse, since both mounts are the same part)",
     )
     p.add_argument(
+        "--board-on-gripper",
+        action="store_true",
+        help="EYE-TO-HAND agentview mode: instead of the desk board, GRASP the board with the "
+        "gripper and lift it into agentview's view. Solves agentview's extrinsic from agentview + "
+        "FK alone (no wrist bridge) -- use this when agentview is mounted too high to co-see a desk "
+        "board with a wrist camera. Run once per arm; both arms are cross-checked through the "
+        "existing robot.arm_offset (calibrate the wrists on the desk board first to get it).",
+    )
+    p.add_argument(
         "--no-auto-capture",
         dest="auto_capture",
         action="store_false",
@@ -105,7 +114,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     path = find_rig(args.config)
     rig = load_rig(args.config)
     cams = apply_camera_serials(default_cameras(), rig)
-    wanted = {"agentview", *(f"wrist_{arm}" for arm in arms)}
+    # Board-on-gripper (eye-to-hand) uses agentview only -- no wrist bridge. The desk-board mode
+    # needs the wrist cameras too.
+    wanted = {"agentview"} if args.board_on_gripper else {"agentview", *(f"wrist_{arm}" for arm in arms)}
     cams = [c for c in cams if c.key in wanted]
     for cam in cams:
         cam.width, cam.height, cam.fps = args.width, args.height, args.fps
@@ -148,6 +159,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     board = dataclasses.replace(board, **overrides) if overrides else board
 
+    # For the board-on-gripper cross-check: the left<->right offset from a prior desk-board wrist
+    # calibration (robot.arm_offset in config.yaml). None if never calibrated -- then a two-arm
+    # board-on-gripper run reports "no arm_offset" rather than a bogus cross-check.
+    import numpy as np
+
+    offset_cfg = ((rig.get("robot") or {}).get("arm_offset") or {}).get("matrix")
+    arm_offset_left_t_right = np.asarray(offset_cfg, dtype=float) if offset_cfg is not None else None
+
     from workstation.lerobot_recorder.calibrate_gui import run
 
     logging.info(
@@ -168,6 +187,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         auto_capture=args.auto_capture,
         auto_dwell_s=args.auto_dwell,
         shared_wrist_mount=args.shared_wrist_mount,
+        board_on_gripper=args.board_on_gripper,
+        arm_offset_left_t_right=arm_offset_left_t_right,
     )
 
 
