@@ -20,7 +20,12 @@ The YAM setup spans **two machines** on the same LAN:
 - 🤖 **robot** — the YAM arms on CAN; runs the **portal robot server**. uv-managed, so `robot/yam` uses `uv run` and there is **nothing to activate**.
 - 💻 **workstation** — RealSense cameras + LeRobot; connects to the robot over **portal / plain TCP**. Lives in a conda env (`yam_ws`).
 
-Two launchers run the right env for you — **`robot/yam`** on the robot, **`workstation/yam-data`** on the workstation. One **`config.yaml`** at the repo root holds the shared settings (robot host, camera serials, control gains, recorder defaults) and is auto-discovered by every tool — no `--config`, no env var, regardless of directory.
+Two launchers pick the right env for you: **`robot/yam`** on the robot,
+**`workstation/yam-data`** on the workstation.
+
+One **`config.yaml`** at the repo root holds everything shared — robot host, camera serials,
+control gains, recorder defaults. Every tool finds it on its own: no `--config`, no env var, from
+any directory.
 
 ### 0 · One-time setup
 
@@ -69,30 +74,48 @@ workstation/yam-data record
 
 The recorder opens on a **Setup page**:
 
-1. Confirm `repo_id` / `root` / `task` and the **source** (teleop / dagger / eval). The dataset is written to `<root>/<name>`, where *name* is the last segment of `repo_id` (e.g. `~/lerobot_data` + `hello/pick_and_place` → `~/lerobot_data/pick_and_place`). The status line shows the cameras detected and whether that dataset already exists.
+1. Confirm `repo_id` / `root` / `task` and the **source** (teleop / dagger / eval).
+   The dataset lands in `<root>/<name>`, where *name* is the last segment of `repo_id` —
+   `~/lerobot_data` + `hello/pick_and_place` → `~/lerobot_data/pick_and_place`.
+   The status line shows which cameras were detected and whether that dataset already exists.
 2. To add to an existing dataset, tick **Continue collecting** (resume/append). Otherwise **START** creates it fresh — and if the folder exists it asks twice before overwriting.
 3. **START** connects the robot, opens cameras + dataset, and (with `auto_arm: true`) arms collection immediately.
 
-After START, **Past demonstration overlay** can use any dataset folder under the selected
-`root`, including a different dataset from the one currently being recorded. Choose the
-source with **Overlay dataset**; changing it immediately refreshes the completed demonstrations
-(using LeRobot's `episode_index` metadata, not MP4 container filenames).
-Select one to display its synchronized wrist-left, agentview, and
-wrist-right videos over the matching live cameras, then use **Live camera opacity**
-to compare the current scene with the reference. A selected episode starts paused
-on its first frame and advances only after **Resume reference**. Tick **Continue collecting** before
-START when using an existing dataset; starting fresh intentionally deletes that dataset's past
-episodes after the two overwrite confirmations. Other overlay-source datasets are read-only.
-The blend is preview-only: saved
-frames and policy inputs always remain the unmodified camera images. This same panel
-is available in both `yam-data record` and `yam-data deploy`. The first saved demonstration
-is selected automatically; set live-camera opacity to `100%` to hide the reference.
+**Past demonstration overlay** (after START) plays a recorded episode's three camera views
+under the live ones, so you can match the scene before starting a take. Available in both
+`yam-data record` and `yam-data deploy`.
+
+| Control | What it does |
+|---|---|
+| **Overlay dataset** | any dataset folder under `root`, including one you are not recording into |
+| **Live camera opacity** | blend live against the reference; `100%` hides the reference |
+| **Resume reference** | a selected episode starts paused on frame 1 and advances only after this |
+
+- The first saved demonstration is selected automatically.
+- **Preview only** — saved frames and policy inputs are always the unmodified camera images.
+- Overlay-source datasets other than the one being recorded are **read-only**.
+- Recording into an existing dataset still needs **Continue collecting** ticked *before* START;
+  starting fresh deletes that dataset's episodes after the two overwrite confirmations.
 
 Then teleoperate — **lift both gellos** to start recording, **bring both home** to end the episode:
 
-- `review_before_save` decides what happens next: `true` holds the episode for **Keep** / **Delete**, `false` (what `config.yaml` ships) **auto-saves** on each engage→idle.
-- **Leader handle buttons:** left upper toggles **fine-grained control** (2.5:1 with the checked-in `fine_grained_scale: 0.4`). When toggled off, recording and teleoperation pause while the follower holds and the leader safely realigns; left lower → **success**, right lower → **fail**, right upper → **discard** (force-home, no save).
-- Close the window when done (calls `finalize()` so the dataset is complete). Cameras run on their own capture thread, so the live view and saving never stall on a slow frame.
+`review_before_save` decides what happens at the end of each episode: `true` holds it for
+**Keep** / **Delete**, `false` (what `config.yaml` ships) **auto-saves**.
+
+**Leader handle buttons**
+
+| Button | Action |
+|---|---|
+| left upper | toggle **fine-grained control** (2.5:1 with the checked-in `fine_grained_scale: 0.4`) |
+| left lower | **success** |
+| right lower | **fail** |
+| right upper | **discard** — force-home, no save |
+
+Leaving fine-grained mode pauses recording and teleoperation while the follower holds and the
+leader realigns.
+
+Close the window when done: that calls `finalize()`, which completes the dataset. Cameras run on
+their own capture thread, so the live view and saving never stall on a slow frame.
 
 > **Dry run (no hardware):** `workstation/yam-data record --mock` exercises the whole pipeline with synthetic teleop + fake frames — no robot, cameras, or lerobot needed.
 
@@ -118,12 +141,11 @@ python -m yam_policy.serve \
     --config device=cuda
 ```
 
-The client configures itself from the handshake — camera names, image size, chunk length —
-and the deploy UI names what answered (`LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`), because
-all of these speak the same wire while reading different observations. See
-[`policy_serving/README.md`](policy_serving/README.md), which also covers the one thing to get
-right before training on this recorder's data: **drop `observation.leader`**, or the policy is
-handed the answer as an input.
+- The client configures itself from the handshake: camera names, image size, chunk length.
+- The deploy UI **names what answered** (`LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`) — they
+  share a wire but not an observation format.
+- **Before training on this recorder's data, drop `observation.leader`**, or the policy is handed
+  the answer as an input. Details: [`policy_serving/README.md`](policy_serving/README.md).
 
 ### D · Replay a dataset onto the robot
 
@@ -189,7 +211,11 @@ re-encode). At train time, drop the tail by filtering `control_mode == homing`.
 
 Everything below documents using **i2rt as a Python library** — driving motors over CAN, grippers, kinematics, the Flow Base, and the serving stack.
 
-> **Running the YAM teleop / recording rig?** The [Quick Start](#-quick-start--what-to-run) above is all you need — its setup scripts (`robot/setup_robot_env.sh`, `workstation/setup_workstation_env.sh`) already create the envs and install everything. The manual install below is only for using i2rt standalone as a library.
+> **Running the YAM teleop / recording rig?** The [Quick Start](#-quick-start--what-to-run) is
+> all you need — its setup scripts already create the envs and install everything
+> (`robot/setup_robot_env.sh`, `workstation/setup_workstation_env.sh`).
+>
+> The manual install below is only for using i2rt standalone as a library.
 
 ## Installation (manual / standalone library)
 

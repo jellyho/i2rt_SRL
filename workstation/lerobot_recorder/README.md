@@ -87,11 +87,13 @@ opened and no frames are buffered. See *C. Deployment*.
 | `action`            | (14,) float32 | both arms × `applied`(7) |
 | task                | string | the language instruction |
 
-Recorded at the rate `config.yaml` sets — **30 fps** as checked in, matched to the camera
-streams (`RecorderConfig`'s own default is 60, but the config pins both to 30 because three
-640x480 streams at 60 overrun a single USB 2.0 bus). Uses the official v3.0 API
-(`create` / `add_frame` with a `task` key / `save_episode` / `clear_episode_buffer`
-/ **`finalize`**); the version-sensitive calls live in `dataset_writer.py`.
+**Rate: 30 fps**, set by `config.yaml` and matched to the camera streams. (`RecorderConfig`
+defaults to 60; the config pins both down because three 640x480 streams at 60 overrun one
+USB 2.0 bus.)
+
+Written through the official v3.0 API — `create`, `add_frame` with a `task` key,
+`save_episode`, `clear_episode_buffer`, **`finalize`**. The version-sensitive calls are all in
+`dataset_writer.py`.
 
 ### Training on one of these: pass `--tolerance_s=1e-3`
 
@@ -102,11 +104,14 @@ lerobot-train --dataset.root=~/lerobot_data/<name> ... --tolerance_s=1e-3
 Without it, training dies partway through with `FrameTimestampError: One or several query
 timestamps unexpectedly violate the tolerance (tensor([0.0001]) > tolerance_s=0.0001)`.
 
-Nothing is wrong with the dataset, and re-recording will not help — it is arithmetic. v3.0
-timestamps are `float32` and v3.0 packs many episodes into one mp4, so the file-relative query
-time climbs into the hundreds of seconds. Past **t = 1024 s** the gap between adjacent `float32`
-values is 1.22e-4 s, which is already larger than the 1e-4 default tolerance: no frame can satisfy
-it, however well the data was collected. Any sufficiently long v3.0 dataset hits this.
+Nothing is wrong with the dataset, and re-recording will not help. It is arithmetic:
+
+- v3.0 timestamps are `float32`, and v3.0 packs many episodes into one mp4 — so the
+  file-relative query time climbs into the hundreds of seconds.
+- Past **t = 1024 s**, adjacent `float32` values are 1.22e-4 s apart, already wider than the
+  1e-4 default tolerance. No frame can satisfy it, however well the data was collected.
+
+Any sufficiently long v3.0 dataset hits this.
 
 `1e-3` is still 3% of a frame at 30 fps, so it rejects a genuinely wrong frame just as well.
 
@@ -284,34 +289,34 @@ The recorder opens on a **Setup page**:
 3. **START** connects the robot, opens cameras + dataset, and — with `auto_arm` —
    arms collection immediately.
 
-The **Past demonstration overlay** panel at the bottom can read any dataset folder
-under the session `root`, not just the dataset currently being recorded. The
-**Overlay dataset** dropdown contains the same sibling folders as the setup-page
-dataset picker; changing it immediately refreshes that folder's LeRobot
-`meta/episodes` table. Each row is one demonstration (`episode_index`), even
-when many demonstrations share one MP4 container. Selecting a demonstration displays
-all three synchronized slices (left wrist,
-agentview, right wrist) over their matching live cameras. **Live camera opacity** is
-`100%` for live-only, `0%` for the past episode only, and any middle value is a
-blend. Selection always starts paused on the first frame; **Resume reference** starts
-playback, and **Pause reference** freezes the current comparison frame. Use **Continue
-collecting** when the recording folder itself must retain past episodes—starting
-fresh removes it after the overwrite confirmations. Other overlay-source folders are
-read-only. The player reads completed MP4s
-directly, so it can safely coexist with an append session, and **Refresh demonstrations**
-finds newly encoded saves. The first saved demonstration is selected automatically; there
-is no separate Off entry because `100%` live-camera opacity fully hides the reference.
+The **Past demonstration overlay** panel plays a recorded episode's three camera views under
+the live ones, so the scene can be matched before a take.
 
-The overlay exists only in the operator display composition. Dataset frames and
-deployment policy observations both use the untouched RealSense arrays. The shared
-panel therefore behaves the same in `yam-data record` and `yam-data deploy` without
-adding video decoding to either robot-side server.
+| Control | Behaviour |
+|---|---|
+| **Overlay dataset** | any sibling folder under the session `root` — the same list as the setup-page picker. Changing it re-reads that folder's `meta/episodes`. |
+| **Live camera opacity** | `100%` live only · `0%` past episode only · anything between blends |
+| **Resume reference** / **Pause reference** | selection always starts paused on frame 1; resume plays, pause freezes the comparison frame |
+| **Refresh demonstrations** | picks up saves encoded since the panel last read the folder |
+
+- One row per demonstration (`episode_index`), even when many share an MP4 container.
+- The first saved demonstration is selected automatically. There is no Off entry —
+  `100%` live opacity already hides the reference.
+- The player reads **completed** MP4s, so it coexists safely with an append session.
+- Overlay-source folders other than the one being recorded are **read-only**. For the
+  recording folder itself, tick **Continue collecting**; starting fresh removes its episodes
+  after the overwrite confirmations.
+
+**It is display only.** Dataset frames and policy observations are the untouched RealSense
+arrays, which is why the same panel serves `yam-data record` and `yam-data deploy` without
+either robot-side server having to decode video.
 
 Then teleoperate: **lift both gellos** → records; **bring both home** → episode ends.
-With `review_before_save: true` it's held in the **review panel** for **Keep** (S/F) /
-**Delete** (D); with `review_before_save: false` it **auto-saves** each engage→idle.
-A **leader handle button** ends + labels in one press (see *Labeling* below). Close
-the window when done — this calls `finalize()` so the dataset is complete.
+
+- `review_before_save: true` — held in the **review panel** for **Keep** (S/F) / **Delete** (D).
+- `review_before_save: false` — **auto-saves** each engage→idle.
+- A **leader handle button** ends + labels in one press (see *Labeling* below).
+- Close the window when done: that calls `finalize()`, which is what completes the dataset.
 
 Quick dry run with no robot/cameras/lerobot:
 
@@ -368,11 +373,12 @@ python -m yam_policy.serve \
     --config device=cuda                                      # a LeRobot checkpoint
 ```
 
-Nothing on the workstation changes: the client reads the camera names, image size and chunk
-length out of the handshake. It also **names what answered** — `LeRobot · act`,
-`ACRFT · pi05_yam_lego_taxi` — next to the connection dot and in `--headless` logs, because
-all of these serve the same wire while reading different observations, and the wrong one
-still returns a well-formed chunk.
+Nothing on the workstation changes — the client reads the camera names, image size and chunk
+length out of the handshake.
+
+It also **names what answered** (`LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`) next to the
+connection dot and in `--headless` logs. That matters because the wrong server still returns a
+well-formed chunk: they share a wire but not an observation format.
 
 The cameras line up on their own: this recorder writes `observation.images.<role>`, so a
 policy trained on its data already names its image features after `wrist_left` /

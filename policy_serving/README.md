@@ -135,12 +135,15 @@ policy trains beautifully and simply behaves badly on the robot. The deploy clie
 of these columns, so an already-trained checkpoint still runs — it just runs with a leader signal
 that no longer means what it meant during collection.
 
-The inference path deliberately mirrors LeRobot's own `async_inference.policy_server`, whose two
-easy mistakes are silent: the pre/post processors need an explicit device override or the batch
-stays on the CPU while the model sits on the GPU, and the postprocessor unnormalises one
-`(B, action_dim)` step at a time — handing it a whole chunk does not raise, it just unnormalises
-against the wrong axis. `tests/test_lerobot_policy.py` builds a real ACT checkpoint and checks the
-actions against the known stats for exactly that reason.
+The inference path mirrors LeRobot's own `async_inference.policy_server` rather than being
+invented, because two of its steps fail **silently**:
+
+- the pre/post processors need an explicit **device override**, or the batch stays on the CPU
+  while the model sits on the GPU;
+- the postprocessor unnormalises one `(B, action_dim)` step at a time. Handing it a whole chunk
+  does not raise — it broadcasts against the wrong axis and returns plausible wrong numbers.
+
+`tests/test_lerobot_policy.py` therefore checks the actions against known stats, not just shapes.
 
 Nothing in LeRobot is modified or vendored; the adapter is one file on this side.
 
@@ -181,11 +184,13 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
 Deploy shows what is behind the policy port — `LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`,
 `openpi · pi0_fast_droid` — next to the connection dot.
 
-This is worth a field of its own because the failure it catches is invisible otherwise. All three
-stacks speak this wire, none of them reads the others' observations, and every one of them answers
-a mismatched observation with a well-formed chunk of the right shape. Nothing raises; the robot
-just moves wrongly. Naming the server at the handshake moves that from a rollout symptom to
-something readable before starting.
+It earns a field of its own because the failure is otherwise invisible:
+
+- all three stacks speak this wire, and none reads the others' observations;
+- every one of them answers a mismatched observation with a well-formed chunk of the right shape.
+
+Nothing raises. The robot just moves wrongly. Naming the server at the handshake turns that from
+a rollout symptom into something readable before starting.
 
 A policy declares it by exposing `policy_info`, which `serve.py` merges into the metadata:
 
