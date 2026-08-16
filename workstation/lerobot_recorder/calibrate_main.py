@@ -2,9 +2,8 @@
 
     workstation/yam-data calibrate
     workstation/yam-data calibrate --arms left
-    workstation/yam-data calibrate --mock          # GUI shell only, no hardware
-    workstation/yam-data calibrate --capture-button left.0   # a different handle button
-    workstation/yam-data calibrate --capture-button          # Space only, no handle trigger
+    workstation/yam-data calibrate --mock                     # GUI shell only, no hardware
+    workstation/yam-data calibrate --capture-button left.0    # enable a handle button (see below)
 
 One ChArUco board on the desk recovers each wrist camera's own extrinsic (hand-eye), each
 agentview extrinsic, and the left<->right arm offset -- see
@@ -12,9 +11,11 @@ agentview extrinsic, and the left<->right arm offset -- see
 :mod:`workstation.lerobot_recorder.charuco` for the geometry.
 
 YAM is bimanual, so both wrist cameras are used as bridges by default -- ``--arms`` narrows that
-to one if the other wrist camera is not mounted/working. Capture fires on Space OR either
-configured leader-handle button (default: the "lower" button on each handle) -- both hands are
-usually busy holding the robot in position by the time a pose is worth capturing.
+to one if the other wrist camera is not mounted/working. **Capture is Space by default**, NOT a
+handle button: in teleop the robot server consumes the handles while engaged (outcome buttons
+force homing, the fine button starts recentering), so a press there would move the arm rather than
+capture. ``--capture-button <side>.<index>`` opts into a handle trigger only if you are running a
+robot mode that leaves the handles free.
 
 The result is written into ``config.yaml`` itself (the same file ``--config`` points at, or the
 auto-discovered one -- see :func:`i2rt.serving.rig_config.find_rig`), not a separate file: THE
@@ -55,17 +56,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--capture-button",
         dest="capture_buttons",
         nargs="*",
-        default=["left.1", "right.1"],
+        default=[],
         metavar="SIDE.INDEX",
         help=(
-            "leader-handle button(s) that trigger a capture (any ONE firing is enough), "
-            "'<side>.<index>' e.g. left.1 -- upper=0, lower=1, same convention as config.py's "
-            "button_map. Pass with no values to disable the handle trigger (Space still works)."
+            "OPT-IN leader-handle button(s) that also trigger a capture (any ONE firing), "
+            "'<side>.<index>' e.g. left.1 -- upper=0, lower=1. Default OFF: in teleop the robot "
+            "consumes the handles (homing/recentering), so enable this only against a robot mode "
+            "that leaves them free. Space is always the capture key regardless."
         ),
     )
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
+    p.add_argument(
+        "--no-auto-capture",
+        dest="auto_capture",
+        action="store_false",
+        help="disable hands-free auto-capture (hold the arm still while engaged -> captures); "
+        "on by default since both hands are on the leaders",
+    )
+    p.add_argument("--auto-dwell", type=float, default=1.0, help="seconds to hold still before an auto-capture")
     # Board geometry -- MUST match the printed board (see charuco.BoardSpec). Default None so an
     # unpassed flag falls through to config.yaml's calibration.board, then to the BoardSpec
     # default; a passed flag overrides both. **Measure the printed squares -- don't trust the
@@ -125,9 +135,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     from workstation.lerobot_recorder.calibrate_gui import run
 
-    logging.info("calibrate: config=%s arms=%s capture_buttons=%s", path, arms, args.capture_buttons)
+    logging.info(
+        "calibrate: config=%s arms=%s auto_capture=%s capture_buttons=%s",
+        path,
+        arms,
+        args.auto_capture,
+        args.capture_buttons,
+    )
     return run(
-        cfg, robot, geometries, board=board, config_path=path, mock=args.mock, capture_buttons=args.capture_buttons
+        cfg,
+        robot,
+        geometries,
+        board=board,
+        config_path=path,
+        mock=args.mock,
+        capture_buttons=args.capture_buttons,
+        auto_capture=args.auto_capture,
+        auto_dwell_s=args.auto_dwell,
     )
 
 

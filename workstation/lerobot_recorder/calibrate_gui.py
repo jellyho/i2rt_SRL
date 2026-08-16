@@ -10,16 +10,18 @@ order -- see :mod:`workstation.lerobot_recorder.charuco` for the geometry:
 
 YAM is bimanual, so BOTH wrist cameras can bridge -- whichever one currently has the board in
 view. Live preview of agentview + both wrists with the board outline drawn when found; hit
-**Space**, press a **leader-handle button** (default: the "lower" button on either handle,
-``left.1``/``right.1`` -- both hands are usually busy holding the robot in position by the time a
-pose is worth capturing, so a keyboard is not always reachable), or click Capture -- all three are
-gated by the exact same readiness check, so none of them can capture out of a bad state. Grabs one
-sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not have to be
-posed at once, and when they are, one press banks two independent estimates instead of one). Move
-the arm(s) to a few different poses -- **varying wrist TILT, not just position**, which hand-eye
-needs -- and capture at each. Whenever a press happens to catch BOTH wrist cameras seeing the
-board AT ONCE, it also banks an ``ArmPairCapture`` for free towards the arm-to-arm offset; this
-needs both arms actually posed together for at least a couple of presses.
+**Space** (or click Capture) to grab one sample per wrist camera that currently sees the board
+(0, 1, or 2 -- both arms do not have to be posed at once, and when they are, one press banks two
+independent estimates instead of one). A **leader-handle button** can trigger capture too, but is
+OFF by default (``--capture-button`` to enable): in teleop the robot server already consumes the
+handles while engaged -- the outcome buttons force homing, the fine button starts recentering --
+so a press there would move the arm rather than capture. Only enable it against a robot mode that
+leaves the handles free. Every enabled trigger is gated by the same readiness check, so none can
+capture out of a bad state. Move the arm(s) to a few different poses -- **varying wrist TILT, not
+just position**, which hand-eye needs -- and capture at each. Whenever a press happens to catch
+BOTH wrist cameras seeing the board AT ONCE, it also banks an ``ArmPairCapture`` for free towards
+the arm-to-arm offset; this needs both arms actually posed together for at least a couple of
+presses.
 
 The solve re-runs automatically after every capture -- no need to click "Solve" and wait; watch
 the numbers on screen while you work instead of guessing how many more poses to collect. Hand-eye
@@ -136,7 +138,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         board: BoardSpec,
         config_path: Optional[str],
         mock: bool = False,
-        capture_buttons: Sequence[str] = ("left.1", "right.1"),
+        capture_buttons: Sequence[str] = (),
+        auto_capture: bool = True,
+        auto_dwell_s: float = 1.0,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Calibrate rig -- wrist extrinsics, agentview, arm offset (one desk board)")
@@ -147,11 +151,29 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.board = board
         self.config_path = config_path  # None = no config.yaml found; Save will say so
         self.mock = mock
-        # "<side>.<index>" leader-handle buttons (upper=0, lower=1 -- same convention as
-        # config.py's button_map / DEFAULT_TELEOP_BUTTON_OUTCOMES), any ONE of which capturing:
-        # whichever hand is free. Empty disables the handle trigger (Space still works).
+        # "<side>.<index>" leader-handle buttons (upper=0, lower=1) that trigger a capture, any
+        # ONE firing. EMPTY BY DEFAULT: in teleop the robot server already consumes these while
+        # engaged (outcome buttons -> homing, fine button -> recentering; see i2rt controllers),
+        # so a handle press would move the arm rather than capture. Opt in with --capture-button
+        # only against a robot mode that leaves the handles free. Space always works.
         self.capture_buttons = list(capture_buttons)
         self._capture_btn_prev = False  # rising-edge state across the WHOLE set, not per-button
+
+        # Hands-free capture: while teleop is ENGAGED and the board is in view, holding the arm
+        # still for `auto_dwell_s` fires one capture; you must move away before it re-arms. This
+        # is the primary trigger -- both hands are on the leaders, so Space and handle buttons are
+        # both awkward -- so it defaults on. Holding still (vs. snapping on a timer while moving)
+        # also keeps each capture's image and joint pose from the same instant. See
+        # _auto_capture_check for the state machine and the (tuned) motion thresholds.
+        self.auto_capture = bool(auto_capture)
+        self.auto_dwell_s = float(auto_dwell_s)
+        self._auto_still_rad = 0.01  # ~0.6 deg: drift under this over the dwell counts as "still"
+        self._auto_move_rad = 0.05  # ~3 deg: motion over this after a capture re-arms the trigger
+        self._auto_key: Optional[tuple] = None  # which ready arms the window/rearm state is for
+        self._auto_ref_q: Optional[np.ndarray] = None  # joints at the start of the current still window
+        self._auto_still_since: Optional[float] = None
+        self._auto_rearm_q: Optional[np.ndarray] = None  # joints at last auto-capture; None = armed
+        self._engaged: Optional[bool] = None  # teleop engage state from the last obs (None = unknown)
 
         self._last_agent_det = None
         self._last_wrist_det: Dict[str, object] = {}  # arm -> Detection | None
@@ -196,7 +218,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.status)
 
         row = QtWidgets.QHBoxLayout()
-        self.capture_btn = QtWidgets.QPushButton("Capture  [Space / leader button]")
+        self.capture_btn = QtWidgets.QPushButton("Capture  [Space]")
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self._on_capture)
         # Space, not the button, is the intended way to capture: both hands are usually busy
@@ -216,6 +238,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.save_btn.clicked.connect(self._on_save)
         for b in (self.capture_btn, self.remove_btn, self.solve_btn, self.save_btn):
             row.addWidget(b)
+        self.auto_chk = QtWidgets.QCheckBox("Auto-capture (hold still)")
+        self.auto_chk.setChecked(self.auto_capture)
+        self.auto_chk.toggled.connect(self._on_auto_toggled)
+        row.addWidget(self.auto_chk)
         root.addLayout(row)
 
         self.capture_list = QtWidgets.QListWidget()
@@ -272,19 +298,64 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             if self._last_agent_det is not None and det is not None and self._last_q[arm] is not None:
                 ready_arms.append(arm)
 
+        # Teleop reports its engage state at the top level (controllers.py); None when a robot
+        # does not report it (then auto-capture does not gate on engagement -- see below).
+        self._engaged = robot_obs.get("active") if "active" in robot_obs else None
+
         self.capture_btn.setEnabled(bool(ready_arms))
-        hotkeys = "Space" + (f" or leader button ({'/'.join(self.capture_buttons)})" if self.capture_buttons else "")
+        triggers = "Space" + (f"/leader button ({'/'.join(self.capture_buttons)})" if self.capture_buttons else "")
+        auto = " · auto-capture: hold still" if self.auto_capture else ""
         if self._last_agent_det is None:
             self.status.setText("not ready -- board not seen in agentview")
         elif ready_arms:
+            engaged_note = "" if self._engaged is None else (" [engaged]" if self._engaged else " [NOT engaged]")
             self.status.setText(
-                f"ready -- press {hotkeys} to capture: {', '.join(ready_arms)} "
+                f"ready ({triggers}){auto}{engaged_note}: {', '.join(ready_arms)} "
                 "(agentview + that wrist both see the board)"
             )
         else:
             self.status.setText("board seen in agentview but neither wrist sees it (or robot link is down)")
 
         self._check_capture_button(robot_obs)
+        self._auto_capture_check(ready_arms, self._engaged, time.monotonic())
+
+    def _on_auto_toggled(self, on: bool) -> None:
+        self.auto_capture = bool(on)
+        self._auto_still_since = self._auto_ref_q = self._auto_rearm_q = self._auto_key = None
+
+    def _auto_capture_check(self, ready_arms: List[str], engaged: Optional[bool], now: float) -> None:
+        """Fire one capture when the arm(s) have been held still, board in view, while engaged.
+
+        The primary trigger, since both hands are on the leaders (Space/handle buttons are
+        awkward or unsafe -- see the module docstring). "Held still" is what keeps each capture's
+        image and joint pose from the same instant, and is also what naturally excludes the
+        homing/ramp motion. Re-arms only after the arm moves ``_auto_move_rad`` away, so holding a
+        pose does not machine-gun captures. ``now`` is injected (``time.monotonic()`` from the
+        tick) so the dwell logic is testable without real time.
+
+        ``engaged`` gates it to active teleoperation when the robot reports engage state; None
+        (robot does not report it, or --mock) means "do not gate on it".
+        """
+        capturable = self.auto_capture and bool(ready_arms) and self.capture_btn.isEnabled() and engaged is not False
+        if not capturable:
+            self._auto_still_since = self._auto_ref_q = None
+            return
+        key = tuple(ready_arms)
+        q = np.concatenate([np.asarray(self._last_q[a], dtype=float) for a in ready_arms])
+        if key != self._auto_key:  # the set of ready arms changed -> start fresh (avoids shape mismatch)
+            self._auto_key, self._auto_ref_q, self._auto_still_since, self._auto_rearm_q = key, q, now, None
+            return
+        if self._auto_rearm_q is not None:  # captured here already; wait until the arm moves away
+            if np.max(np.abs(q - self._auto_rearm_q)) > self._auto_move_rad:
+                self._auto_rearm_q = None  # moved -> armed again; fall through to open a new window
+            else:
+                return
+        if self._auto_ref_q is None or np.max(np.abs(q - self._auto_ref_q)) > self._auto_still_rad:
+            self._auto_ref_q, self._auto_still_since = q, now  # drifted -> restart the dwell window
+            return
+        if now - self._auto_still_since >= self.auto_dwell_s:
+            self._on_capture()
+            self._auto_rearm_q, self._auto_ref_q, self._auto_still_since = q, None, None
 
     def _get_robot_obs(self) -> dict:
         if self.mock or self.robot is None:
@@ -559,13 +630,23 @@ def run(
     board: BoardSpec,
     config_path: Optional[str],
     mock: bool = False,
-    capture_buttons: Sequence[str] = ("left.1", "right.1"),
+    capture_buttons: Sequence[str] = (),
+    auto_capture: bool = True,
+    auto_dwell_s: float = 1.0,
 ) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     cams = CameraManager(cfg)
     cams.start()
     win = CalibrateAgentviewWindow(
-        cams, robot, geometries, board=board, config_path=config_path, mock=mock, capture_buttons=capture_buttons
+        cams,
+        robot,
+        geometries,
+        board=board,
+        config_path=config_path,
+        mock=mock,
+        capture_buttons=capture_buttons,
+        auto_capture=auto_capture,
+        auto_dwell_s=auto_dwell_s,
     )
     win.resize(1600, 800)
     win.show()

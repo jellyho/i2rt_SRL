@@ -316,6 +316,11 @@ def solve_wrist_extrinsic(captures: Sequence[Capture]) -> WristExtrinsicResult:
     x = np.eye(4)
     x[:3, :3] = r_x
     x[:3, 3] = np.asarray(t_x).reshape(3)
+    # On too-similar poses cv2 logs "Not enough informative motions" and can hand back a
+    # non-finite X rather than raising. Turn that into the same "not solved" path a <3-capture
+    # arm takes (per_arm skips it -> CAD fallback), so a NaN mount never reaches the config.
+    if not np.all(np.isfinite(x)):
+        raise ValueError("hand-eye did not converge (too-similar poses -- vary the wrist tilt more)")
 
     # base_T_board per capture, which should be identical if X (and the FK) are right.
     boards = [c.base_t_flange @ x @ c.wrist_t_board for c in captures]
@@ -332,12 +337,22 @@ def solve_wrist_extrinsic(captures: Sequence[Capture]) -> WristExtrinsicResult:
 
 
 def solve_wrist_extrinsic_per_arm(captures: Sequence[Capture]) -> Dict[str, WristExtrinsicResult]:
-    """Group captures by ``arm`` and hand-eye-solve each; an arm with fewer than 3 is skipped
-    (returned dict just omits it), the same lenient behaviour as ``solve_agentview_extrinsic_per_arm``."""
+    """Group captures by ``arm`` and hand-eye-solve each; an arm with fewer than 3 captures, or
+    one whose solve does not converge (too-similar poses -- see ``solve_wrist_extrinsic``), is
+    skipped (omitted from the returned dict), the same lenient behaviour as
+    ``solve_agentview_extrinsic_per_arm``. The caller then uses the CAD fallback for that arm."""
     by_arm: Dict[str, List[Capture]] = {}
     for c in captures:
         by_arm.setdefault(c.arm, []).append(c)
-    return {arm: solve_wrist_extrinsic(group) for arm, group in by_arm.items() if len(group) >= 3}
+    out: Dict[str, WristExtrinsicResult] = {}
+    for arm, group in by_arm.items():
+        if len(group) < 3:
+            continue
+        try:
+            out[arm] = solve_wrist_extrinsic(group)
+        except ValueError:
+            pass  # not converged yet -> leave it out, caller falls back to CAD
+    return out
 
 
 @dataclasses.dataclass

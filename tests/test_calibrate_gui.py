@@ -50,6 +50,10 @@ def window(qapp):
         config_path=None,  # per-test fixtures set this explicitly where the save path matters
         mock=False,  # False so the button path is actually exercised (True short-circuits it)
     )
+    # The handle trigger is OFF by default now (teleop consumes the handles); enable it here so
+    # the button-edge tests can exercise the mechanism. Tests that check the disabled/other-button
+    # behaviour override this themselves.
+    win.capture_buttons = ["left.1", "right.1"]
     det = Detection(cam_t_board=np.eye(4), n_corners=10, reproj_error_px=0.2, corners_px=np.zeros((10, 2)))
     win._last_agent_det = det
     win._last_wrist_det = {"left": det, "right": det}
@@ -122,6 +126,62 @@ def test_capture_button_respects_the_readiness_gate(window):
     window.capture_btn.setEnabled(False)
     window._check_capture_button(_obs(left=True))
     assert len(window.captures) == 0
+
+
+# --------------------------------------------------------------------------------------- #
+# _auto_capture_check: hands-free hold-still capture (the primary trigger)
+# --------------------------------------------------------------------------------------- #
+def _hold(window, n_captures_before, *, engaged=True, t0=100.0):
+    """Hold still across the dwell and return how many auto-captures fired (each fire adds 2
+    captures: one per ready arm). Joints stay at the fixture's zeros the whole time."""
+    window._auto_capture_check(["left", "right"], engaged, t0)  # opens the window
+    window._auto_capture_check(["left", "right"], engaged, t0 + window.auto_dwell_s - 0.1)  # not yet
+    before_mid = len(window.captures)
+    window._auto_capture_check(["left", "right"], engaged, t0 + window.auto_dwell_s + 0.01)  # fires
+    return before_mid == n_captures_before, len(window.captures)
+
+
+def test_auto_capture_fires_after_holding_still_through_the_dwell(window):
+    fired_only_after_dwell, n = _hold(window, 0)
+    assert fired_only_after_dwell  # nothing fired before the dwell elapsed
+    assert n == 2  # one capture per ready arm
+
+
+def test_auto_capture_does_not_refire_while_still_held(window):
+    _hold(window, 0)
+    n_after = len(window.captures)
+    # keep holding well past another dwell -- must not machine-gun
+    window._auto_capture_check(["left", "right"], True, 200.0)
+    window._auto_capture_check(["left", "right"], True, 205.0)
+    assert len(window.captures) == n_after
+
+
+def test_auto_capture_rearms_after_moving_away(window):
+    _hold(window, 0)
+    n_after = len(window.captures)
+    # move the arm well past the re-arm threshold, then hold still again
+    window._last_q = {"left": np.full(7, 0.2), "right": np.full(7, 0.2)}
+    _, n = _hold(window, n_after, t0=300.0)
+    assert n == n_after + 2  # a second capture set
+
+
+def test_auto_capture_does_not_fire_when_not_engaged(window):
+    window._auto_capture_check(["left", "right"], False, 100.0)
+    window._auto_capture_check(["left", "right"], False, 102.0)
+    assert len(window.captures) == 0
+
+
+def test_auto_capture_off_never_fires(window):
+    window.auto_capture = False
+    window._auto_capture_check(["left", "right"], True, 100.0)
+    window._auto_capture_check(["left", "right"], True, 102.0)
+    assert len(window.captures) == 0
+
+
+def test_auto_capture_engage_gate_ignored_when_robot_does_not_report_it(window):
+    """engaged=None (robot doesn't report engage state, or --mock) must NOT block auto-capture."""
+    _, n = _hold(window, 0, engaged=None)
+    assert n == 2
 
 
 # --------------------------------------------------------------------------------------- #

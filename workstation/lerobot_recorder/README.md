@@ -564,12 +564,18 @@ Set the ChArUco board on the desk in view of agentview. Board geometry comes fro
 `config.yaml`'s `calibration.board` (auto-loaded, and written back after each calibration);
 override per-run with `--squares-x/-y`, `--square-length-m`, `--marker-length-m`, `--dictionary`.
 **Measure the printed squares — don't trust the page-fit scale.** Both wrist cameras bridge by
-default (YAM is bimanual — `--arms left` to use only one); move an arm so its wrist camera also
-sees the board, then **capture** — press **Space**, the **lower button on either leader handle**
-(`left.1`/`right.1` by default; `--capture-button left.0` for a different one, or
-`--capture-button` with no value to keep Space only), or click the on-screen button — all gated
-by the same readiness check. Capture at several poses, **varying wrist TILT, not just position**,
-which hand-eye needs (a set all at the same tilt returns a confident-looking but wrong mount).
+default (YAM is bimanual — `--arms left` to use only one).
+
+**Capture is hands-free by default**, because both hands are on the leaders: run the robot in
+**teleop**, engage, move an arm so its wrist camera and agentview both see the board, and **hold
+it still for ~1 s — it auto-captures**, then move to the next pose (it re-arms once you move
+away). It only auto-captures while engaged, so the homing/ramp motion is never captured. Tune
+with `--auto-dwell <sec>`, or `--no-auto-capture` to turn it off. **Space** (or the on-screen
+button) always works as a manual fallback. A leader-handle trigger is available too but **off by
+default** — in teleop the robot consumes the handles (outcome buttons home the arm, the fine
+button recenters), so only enable `--capture-button <side>.<index>` against a robot mode that
+leaves them free. Capture at several poses, **varying wrist TILT, not just position**, which
+hand-eye needs (a set all at the same tilt can't resolve the mount's rotation).
 
 **The solve re-runs after every capture automatically**, no separate step, with a live
 convergence trend (RMS over the last few re-solves) per line so you can watch it settle. Hand-eye
