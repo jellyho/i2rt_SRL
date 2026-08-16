@@ -524,7 +524,16 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             )
         for arm, n in counts.items():
             if arm not in results and n:
-                lines.append(f"[agentview {arm}] {n} capture(s) -- need at least 2 to solve")
+                # Distinguish "not enough captures at all" from "captures exist but agentview never
+                # saw the board" (the far/high-agentview case -- wrist hand-eye still progresses).
+                n_av = sum(1 for c in self.captures if c.arm == arm and c.agentview_t_board is not None)
+                if n_av < 2:
+                    lines.append(
+                        f"[agentview {arm}] {n_av}/{n} capture(s) with the board in agentview "
+                        "-- need 2 there to solve (wrist-only so far)"
+                    )
+                else:
+                    lines.append(f"[agentview {arm}] {n_av} capture(s) -- solving pending")
 
         # Step 3: the arm-to-arm offset, and (once both single-arm extrinsics AND the offset
         # exist) the fused/cross-checked shared-frame answer -- see charuco.py's module docstring
