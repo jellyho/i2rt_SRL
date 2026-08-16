@@ -444,6 +444,24 @@ def format_arm_offset_yaml(result: ArmOffsetResult, *, calibrated_at: str, inden
     ]
 
 
+def format_unified_yaml(result: UnifiedRigCalibration, *, calibrated_at: str, indent: int = 8) -> List[str]:
+    """The body of ``cameras.agentview.extrinsic.unified`` (see ``splice_agentview_unified``).
+
+    Only the fused matrix + the cross-check diagnostics -- ``left_t_right``/``distance_m`` are
+    NOT repeated here even though ``UnifiedRigCalibration`` carries them too, since
+    ``robot.arm_offset`` already holds that exact number; copying it a second place would be
+    the same fact twice for no reason, in a file where the whole point is one source of truth.
+    """
+    pad = " " * indent
+    lines = [f"{pad}matrix:", *_format_matrix_yaml(result.left_t_agentview, indent + 2)]
+    if result.cross_check_translation_mm is not None:
+        lines.append(f"{pad}cross_check_translation_mm: {result.cross_check_translation_mm:.3f}")
+    if result.cross_check_rotation_deg is not None:
+        lines.append(f"{pad}cross_check_rotation_deg: {result.cross_check_rotation_deg:.4f}")
+    lines.append(f'{pad}calibrated_at: "{calibrated_at}"')
+    return lines
+
+
 def _locate_block(lines: List[str], search: range, key: str) -> Optional[tuple]:
     """``(key_line, key_indent, block_end)`` for a ``"<key>:"`` line found within ``search``, or
     None. ``block_end`` is the line the key's (more-indented) body runs up to -- the same
@@ -540,6 +558,34 @@ def splice_agentview_extrinsic(text: str, arm: str, result: CalibrationResult, *
     )
     block = format_extrinsic_yaml(result, calibrated_at=calibrated_at, indent=8)
     return _splice_leaf(text, ("cameras", "agentview", "extrinsic"), arm, block)
+
+
+def splice_agentview_unified(text: str, result: UnifiedRigCalibration, *, calibrated_at: str) -> str:
+    """Insert/replace ``cameras.agentview.extrinsic.unified`` -- the fused left+right answer,
+    the recommended one for a consumer that does not want to redo the fusion itself.
+
+    Safe to keep alongside ``left``/``right`` despite being derived from them: a save always
+    recomputes and writes all three from the SAME live solve in one call (see
+    ``CalibrateAgentviewWindow._on_save``), so there is no window where they could disagree from
+    this tool's own writes -- only a config.yaml hand-edited afterward could make them drift, the
+    same risk any other derived field in a hand-editable file carries.
+    """
+    text = _ensure_section(
+        text,
+        ("cameras", "agentview"),
+        "extrinsic",
+        comment="base_T_agentview per arm's own FK frame (no shared robot-base frame -- see "
+        "workstation/yam-data calibrate-agentview)",
+    )  # no-op if already there (see splice_agentview_extrinsic, which usually creates it first)
+    block = format_unified_yaml(result, calibrated_at=calibrated_at, indent=8)
+    return _splice_leaf(
+        text,
+        ("cameras", "agentview", "extrinsic"),
+        "unified",
+        block,
+        comment="fused left+right through robot.arm_offset -- use this one unless you "
+        "specifically need a single arm's own frame",
+    )
 
 
 def splice_arm_offset(text: str, result: ArmOffsetResult, *, calibrated_at: str) -> str:

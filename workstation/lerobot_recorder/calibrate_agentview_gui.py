@@ -42,10 +42,15 @@ nothing has been captured yet, is the one that actually complains about it.
 "Save" writes into ``config.yaml`` -- THE single source of truth for the rig (camera serials,
 robot host, button map, ... all already live there; see its own header comment). A confirmation
 dialog names the file first, a ``.bak`` copy is kept before writing, and only the touched blocks
-change -- ``cameras.agentview.extrinsic.<arm>`` per arm, ``robot.arm_offset`` if solved -- via a
-line-range splice (see ``charuco.splice_agentview_extrinsic``/``splice_arm_offset``), not a
-YAML load/dump round trip: config.yaml is heavily commented and a round trip would strip every
-comment and reflow the whole document.
+change -- ``cameras.agentview.extrinsic.<arm>`` per arm, ``robot.arm_offset`` if solved, and
+``cameras.agentview.extrinsic.unified`` (the fused answer, recommended for a consumer that does
+not want to redo the fusion itself) whenever both arms solved together -- via a line-range splice
+(see ``charuco.splice_agentview_extrinsic``/``splice_arm_offset``/``splice_agentview_unified``),
+not a YAML load/dump round trip: config.yaml is heavily commented and a round trip would strip
+every comment and reflow the whole document. ``unified`` is derived from the other two, but safe
+to store anyway: every save recomputes and writes all three from the SAME live solve in one call,
+so there is no window where this tool's own writes could disagree -- only a config.yaml
+hand-edited afterward could make them drift.
 """
 
 from __future__ import annotations
@@ -66,10 +71,12 @@ from workstation.lerobot_recorder.charuco import (
     BoardSpec,
     CalibrationResult,
     Capture,
+    UnifiedRigCalibration,
     detect_board_pose,
     solve_agentview_extrinsic_per_arm,
     solve_arm_offset,
     splice_agentview_extrinsic,
+    splice_agentview_unified,
     splice_arm_offset,
     unify_rig_calibration,
 )
@@ -232,6 +239,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         # What the last successful _solve_and_report found -- what _on_save actually writes.
         self._last_results: Dict[str, CalibrationResult] = {}
         self._last_arm_offset: Optional[ArmOffsetResult] = None
+        self._last_unified: Optional[UnifiedRigCalibration] = None
 
     # ------------------------------------------------------------------ loop
     def _tick(self) -> None:
@@ -422,9 +430,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         # The arm-to-arm offset, and (once both single-arm extrinsics AND the offset exist) the
         # fused/cross-checked shared-frame answer -- see charuco.py's module docstring for why
         # this needs simultaneous both-wrists-see-the-board captures, not just any two captures.
-        # Not itself written to config.yaml (see _on_save): it is fully recoverable from
-        # extrinsic.left/right + arm_offset, so storing it too would just be the same fact
-        # twice, one of which could drift from the other after a future re-calibration.
+        # Both get written to config.yaml too (see _on_save) -- the fused one is recomputable
+        # from the other two, but every save writes all three together from this same live
+        # solve, so there is no window for them to disagree (see splice_agentview_unified).
         arm_offset = None
         if len(self.pair_captures) >= 2:
             arm_offset = solve_arm_offset(self.pair_captures)
@@ -439,6 +447,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         elif self.pair_captures:
             lines.append(f"[left<->right] {len(self.pair_captures)} paired capture(s) -- need at least 2")
 
+        unified = None
         if arm_offset is not None and "left" in results and "right" in results:
             unified = unify_rig_calibration(results, arm_offset)
             lines.append(
@@ -450,6 +459,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
 
         self._last_results = results
         self._last_arm_offset = arm_offset
+        self._last_unified = unified
         self.save_btn.setEnabled(bool(results))
 
     def _on_save(self) -> None:
@@ -486,6 +496,12 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             if self._last_arm_offset is not None:
                 updated = splice_arm_offset(updated, self._last_arm_offset, calibrated_at=calibrated_at)
                 written.append("arm_offset")
+            if self._last_unified is not None:
+                # Derived from the two writes above, but always from THIS SAME live solve, in
+                # this same save -- see splice_agentview_unified's docstring for why that keeps
+                # it safe to store despite being recomputable.
+                updated = splice_agentview_unified(updated, self._last_unified, calibrated_at=calibrated_at)
+                written.append("extrinsic.unified")
             # keep a .bak so a bad write is always recoverable -- same safety net tuner_gui's
             # own config.yaml writer uses.
             with open(self.config_path + ".bak", "w", encoding="utf-8") as fh:

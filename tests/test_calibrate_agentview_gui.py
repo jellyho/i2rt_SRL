@@ -224,6 +224,22 @@ def test_save_with_no_config_path_shows_an_error_not_a_crash(window, monkeypatch
     assert shown  # the "no config.yaml" dialog fired
 
 
+def test_save_writes_the_fused_unified_answer_when_both_arms_and_offset_solved(window, config_file, monkeypatch):
+    """_solved_window's captures come from both arms at once every time, so besides the two
+    per-arm extrinsics this also crosses solve_arm_offset's >=2 threshold -- both arms +
+    the offset should leave enough to fuse, and _on_save should write that too."""
+    _confirm_yes(monkeypatch)
+    _solved_window(window, config_file)
+    assert window._last_unified is not None  # sanity: the fixture really did produce one
+
+    window._on_save()
+
+    written = config_file.read_text()
+    assert "unified:" in written
+    assert "arm_offset:" in written
+    assert "cross_check_translation_mm:" in written
+
+
 def test_save_button_disabled_until_something_has_solved(window):
     assert window.save_btn.isEnabled() is False
     window._on_capture()

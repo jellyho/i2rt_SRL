@@ -586,14 +586,20 @@ auto-discovered one — not a separate output file: that is already THE single s
 the rig (camera serials, robot host, button map, ...), so it is the one place any tool that
 already calls `load_rig()` would look for this too. A confirmation dialog names the file first, a
 `.bak` copy of the untouched original is kept before writing, and only the touched blocks change
-— `cameras.agentview.extrinsic.<arm>` per arm that solved, `robot.arm_offset` if solved — via a
+— `cameras.agentview.extrinsic.<arm>` per arm that solved, `robot.arm_offset` if solved, and
+`cameras.agentview.extrinsic.unified` (the fused answer — the one to actually use unless a
+consumer specifically needs a single arm's own frame) whenever both arms solved together — via a
 line-range splice, the same technique `workstation/yam-data tune`'s "write config.yaml" button
 already uses: **not** a `yaml.safe_load`/dump round trip, which would strip every comment and
 reflow the whole heavily-commented file. Re-running the calibration later replaces just that
-arm's entry, without disturbing the other arm's previously-saved one. The fused/cross-checked
-answer is shown on screen but deliberately not written a second time — it is fully recoverable
-from `extrinsic.left`/`.right` + `arm_offset`, so storing it too would just be the same fact
-twice, one copy of which could silently drift from the other after a future re-calibration.
+arm's entry, without disturbing the other arm's previously-saved one.
+
+`unified` IS recomputable from `extrinsic.left`/`.right` + `arm_offset` — but it is written
+anyway, not left "deliberately redundant": every save recomputes and writes all three from the
+same live solve in one call, so there is no window for this tool's own writes to disagree with
+each other. The only way they could drift is a `config.yaml` hand-edited afterward — the same
+risk any derived value in a hand-editable file carries, and a smaller one than making every
+consumer redo the fusion math itself and risk getting it wrong.
 
 Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
 separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s

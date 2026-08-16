@@ -14,9 +14,12 @@ import pytest
 from workstation.lerobot_recorder.charuco import (
     ArmOffsetResult,
     CalibrationResult,
+    UnifiedRigCalibration,
     format_arm_offset_yaml,
     format_extrinsic_yaml,
+    format_unified_yaml,
     splice_agentview_extrinsic,
+    splice_agentview_unified,
     splice_arm_offset,
 )
 
@@ -66,6 +69,18 @@ def _offset(t=(0.6, 0.0, 0.0)) -> ArmOffsetResult:
         rotation_rms_deg=0.2,
         per_capture_translation_mm=[0.5, 0.9],
         per_capture_rotation_deg=[0.1, 0.2],
+    )
+
+
+def _unified(t=(1.2, 0.1, 0.4), cross_t=0.9, cross_r=0.15) -> UnifiedRigCalibration:
+    m = np.eye(4)
+    m[:3, 3] = t
+    return UnifiedRigCalibration(
+        left_t_agentview=m,
+        left_t_right=np.eye(4),
+        distance_m=0.6,
+        cross_check_translation_mm=cross_t,
+        cross_check_rotation_deg=cross_r,
     )
 
 
@@ -165,6 +180,61 @@ def test_arm_offset_round_trips_through_yaml():
 def test_refuses_when_robot_section_is_missing():
     with pytest.raises(ValueError, match="robot"):
         splice_arm_offset("cameras:\n  agentview: {}\n", _offset(), calibrated_at="t")
+
+
+# --------------------------------------------------------------------------------------- #
+# splice_agentview_unified -- the fused answer, safe to store alongside left/right (see its
+# own docstring for why: every save recomputes and writes all three together)
+# --------------------------------------------------------------------------------------- #
+def test_unified_sits_alongside_left_and_right_not_in_place_of_them():
+    out = splice_agentview_extrinsic(CONFIG, "left", _result((1.0, 0.0, 0.0)), calibrated_at="t1")
+    out = splice_agentview_extrinsic(out, "right", _result((-1.0, 0.0, 0.0)), calibrated_at="t2")
+    out = splice_agentview_unified(out, _unified(), calibrated_at="t3")
+    assert "left:" in out and "right:" in out and "unified:" in out
+    assert '"t1"' in out and '"t2"' in out and '"t3"' in out
+
+
+def test_unified_works_even_when_extrinsic_did_not_exist_yet():
+    """A rig calibrated in one go (both arms + offset, never saved individually first) must
+    still be able to write `unified` -- it should not require left/right to already be there."""
+    out = splice_agentview_unified(CONFIG, _unified(), calibrated_at="t")
+    assert "unified:" in out
+
+
+def test_re_solving_replaces_unified_not_duplicates():
+    step1 = splice_agentview_unified(CONFIG, _unified(), calibrated_at="t1")
+    step2 = splice_agentview_unified(step1, _unified(), calibrated_at="t2")
+    assert sum(1 for ln in step2.splitlines() if ln.strip().startswith("unified:")) == 1
+    assert '"t1"' not in step2 and '"t2"' in step2
+
+
+def test_unified_does_not_duplicate_left_t_right_or_distance_m():
+    """robot.arm_offset already carries these -- the unified block should carry only what is
+    NOT available anywhere else (the fused matrix + the cross-check numbers)."""
+    out = splice_arm_offset(CONFIG, _offset(), calibrated_at="t")
+    out = splice_agentview_unified(out, _unified(), calibrated_at="t")
+    unified_lines = format_unified_yaml(_unified(), calibrated_at="t")
+    assert not any("distance_m" in ln for ln in unified_lines)
+
+
+def test_unified_round_trips_through_yaml_with_cross_check_numbers():
+    yaml = pytest.importorskip("yaml")
+    out = splice_agentview_unified(CONFIG, _unified((2.0, -0.5, 0.3), cross_t=1.234, cross_r=0.056), calibrated_at="t")
+    parsed = yaml.safe_load(out)
+    node = parsed["cameras"]["agentview"]["extrinsic"]["unified"]
+    got = np.asarray(node["matrix"], dtype=np.float64)
+    assert np.allclose(got[:3, 3], [2.0, -0.5, 0.3], atol=1e-6)
+    assert node["cross_check_translation_mm"] == pytest.approx(1.234, abs=1e-3)
+    assert node["cross_check_rotation_deg"] == pytest.approx(0.056, abs=1e-4)
+
+
+def test_unified_omits_cross_check_fields_when_none():
+    """A rig calibrated from only one arm's captures has no independent second route to cross-
+    check against -- the field should be absent, not written as null/0, which would read as a
+    real (and reassuringly small) measurement that was never actually taken."""
+    lines = format_unified_yaml(UnifiedRigCalibration(np.eye(4), np.eye(4), 0.0, None, None), calibrated_at="t")
+    text = "\n".join(lines)
+    assert "cross_check" not in text
 
 
 # --------------------------------------------------------------------------------------- #
