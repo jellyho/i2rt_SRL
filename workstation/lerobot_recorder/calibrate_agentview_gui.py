@@ -6,28 +6,35 @@ arm's own FK, the same ``WristCameraGeometry`` the candidate-fan renderer uses),
 for a ruler between the board and that arm's own frame.
 
 YAM is bimanual, so BOTH wrist cameras can bridge -- whichever one currently has the board in
-view. Live preview of agentview + both wrists with the board outline drawn when found; "Capture"
-grabs one sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not
-have to be posed at once, and when they are, one click banks two independent estimates instead of
+view. Live preview of agentview + both wrists with the board outline drawn when found; hit
+**Space** (or click Capture -- the button is enabled exactly when Space would do something) to
+grab one sample per wrist camera that currently sees the board (0, 1, or 2 -- both arms do not
+have to be posed at once, and when they are, one press banks two independent estimates instead of
 one). Move the arm(s) to a few different poses that keep the board in view and capture at each.
-Whenever a click happens to catch BOTH wrist cameras seeing the board AT ONCE, it also banks an
+Whenever a press happens to catch BOTH wrist cameras seeing the board AT ONCE, it also banks an
 ``ArmPairCapture`` for free -- no separate button, no extra step -- towards the arm-to-arm offset
-(see below); this needs both arms actually posed together for at least a couple of clicks, which
+(see below); this needs both arms actually posed together for at least a couple of presses, which
 the single-arm agentview captures do not require.
 
-"Solve" produces ONE extrinsic PER ARM, not one pooled answer: each arm's ``WristCameraGeometry``
-is its own MJCF loaded in isolation, with no known transform to the other arm's -- there is no
-shared "robot base" frame anywhere in this codebase (see ``charuco``'s module docstring). Mixing
-left- and right-wrist captures into one solve would silently average two different questions'
-answers together, so ``solve_agentview_extrinsic_per_arm`` groups by arm first. Each arm's result
-reports how much ITS OWN captures disagree with each other, which is that arm's calibration
-confidence rather than a separate validation step.
+The solve re-runs automatically after every capture -- no need to click "Solve" and wait; watch
+the numbers on screen while you work instead of guessing how many more poses to collect. It
+produces ONE extrinsic PER ARM, not one pooled answer: each arm's ``WristCameraGeometry`` is its
+own MJCF loaded in isolation, with no known transform to the other arm's -- there is no shared
+"robot base" frame anywhere in this codebase (see ``charuco``'s module docstring). Mixing left-
+and right-wrist captures into one solve would silently average two different questions' answers
+together, so ``solve_agentview_extrinsic_per_arm`` groups by arm first. Each arm's result reports
+how much ITS OWN captures disagree with each other (this calibration's confidence number, not a
+separate validation step) alongside a **convergence trend**: the RMS from the last several
+re-solves, so "still dropping" (keep capturing) reads differently on screen from "flat for the
+last 3" (this arm is done) -- see ``_convergence_note``.
 
-When at least 2 paired captures exist too, "Solve" ALSO recovers ``left_T_right`` (the physical
-offset between the two arms -- distance included) and, when both single-arm extrinsics solved,
-fuses them into one shared-frame answer with a cross-check: bridge the right-arm extrinsic
-through ``left_T_right`` and compare it to the direct left-arm one, which is an end-to-end
-confidence number on all three calibrations at once (see ``charuco.unify_rig_calibration``).
+When at least 2 paired captures exist too, the live solve ALSO recovers ``left_T_right`` (the
+physical offset between the two arms -- distance included) and, when both single-arm extrinsics
+solved, fuses them into one shared-frame answer with a cross-check: bridge the right-arm
+extrinsic through ``left_T_right`` and compare it to the direct left-arm one, which is an
+end-to-end confidence number on all three calibrations at once (see
+``charuco.unify_rig_calibration``). "Solve" (the button) forces an immediate re-run and, if
+nothing has been captured yet, is the one that actually complains about it.
 
 "Save" writes everything available -- per-arm extrinsics, the arm offset, the fused/cross-checked
 answer -- to one JSON file another tool can load.
@@ -86,6 +93,26 @@ def _draw_detection(img: np.ndarray, corners_px: Optional[np.ndarray]) -> np.nda
     return out
 
 
+def _convergence_note(history: List[tuple], *, stable_mm: float = 1.0, window: int = 3) -> str:
+    """A trend string from a ``[(n_captures, translation_rms_mm, rotation_rms_deg), ...]``
+    history, one entry per re-solve (see ``CalibrateAgentviewWindow._record``).
+
+    "Converged" is read straight off the numbers, not a separate model: if the last ``window``
+    re-solves' translation RMS swung by less than ``stable_mm``, more captures are not visibly
+    changing the answer. That is a statement about what has been seen so far, not a proof the
+    true value is close -- a rig with too few DIVERSE poses can sit falsely flat (e.g. every
+    capture from nearly the same angle). It is still the honest, cheap signal to put on screen
+    live; the per-capture disagreement numbers next to it are the deeper check.
+    """
+    if len(history) < 2:
+        return "(need more captures to judge convergence)"
+    trend = " -> ".join(f"{t:.1f}" for _, t, _ in history[-5:])
+    recent = [t for _, t, _ in history[-window:]]
+    stable = len(recent) >= window and (max(recent) - min(recent)) < stable_mm
+    verdict = "converged" if stable else "still moving -- keep capturing"
+    return f"trend {trend} mm ({verdict})"
+
+
 class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
@@ -115,6 +142,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         # wrist cameras saw the board in the SAME tick -- see ArmPairCapture's docstring for why
         # "same tick" (board unmoved) is what makes the offset valid at all.
         self.pair_captures: List[ArmPairCapture] = []
+        # One (n_captures, translation_rms_mm, rotation_rms_deg) appended per re-solve that
+        # actually added a new capture -- see _convergence_note and _record.
+        self._history: Dict[str, List[tuple]] = {arm: [] for arm in self.arms}
+        self._offset_history: List[tuple] = []
 
         self._build_ui()
         self.timer = QtCore.QTimer(self)
@@ -145,9 +176,17 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.status)
 
         row = QtWidgets.QHBoxLayout()
-        self.capture_btn = QtWidgets.QPushButton("Capture")
+        self.capture_btn = QtWidgets.QPushButton("Capture  [Space]")
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self._on_capture)
+        # Space, not the button, is the intended way to capture: both hands are usually busy
+        # holding the robot in position by the time a pose is worth capturing. Bound on the
+        # window (WidgetWithChildrenShortcut default would miss it once focus is on a button/
+        # list), and only fires the click when the button itself is enabled -- same readiness
+        # gate as clicking it, so this cannot capture out of a bad state either.
+        self._capture_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Space), self)
+        self._capture_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self._capture_shortcut.activated.connect(lambda: self.capture_btn.isEnabled() and self._on_capture())
         self.remove_btn = QtWidgets.QPushButton("Remove selected")
         self.remove_btn.clicked.connect(self._on_remove)
         self.solve_btn = QtWidgets.QPushButton("Solve")
@@ -168,7 +207,8 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.pair_label)
 
         self.result_label = QtWidgets.QLabel("not solved yet")
-        self.result_label.setStyleSheet("font-size:20px;")
+        self.result_label.setStyleSheet("font-size:16px;")
+        self.result_label.setWordWrap(True)
         root.addWidget(self.result_label)
 
         self._result_json: Optional[dict] = None
@@ -211,7 +251,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             self.status.setText("not ready -- board not seen in agentview")
         elif ready_arms:
             self.status.setText(
-                f"ready to capture: {', '.join(ready_arms)} (agentview + that wrist both see the board)"
+                f"ready -- press Space to capture: {', '.join(ready_arms)} (agentview + that wrist both see the board)"
             )
         else:
             self.status.setText("board seen in agentview but neither wrist sees it (or robot link is down)")
@@ -273,6 +313,8 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
 
         if not added:
             self.status.setText("capture pressed but nothing was ready -- see status above")
+        else:
+            self._solve_and_report(warn_if_empty=False)
 
     def _on_remove(self) -> None:
         row = self.capture_list.currentRow()
@@ -280,27 +322,51 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             return
         del self.captures[row]
         self.capture_list.takeItem(row)
+        self._solve_and_report(warn_if_empty=False)
 
     def _on_solve(self) -> None:
+        self._solve_and_report(warn_if_empty=True)
+
+    def _record(self, history: List[tuple], n: int, t_rms: float, r_rms: float) -> None:
+        """Append to a convergence history, skipping a duplicate entry when re-solving found no
+        new capture for that arm/offset (e.g. removing a capture from a DIFFERENT arm still
+        triggers a re-solve of this one, at the same n as last time)."""
+        if not history or history[-1][0] != n:
+            history.append((n, t_rms, r_rms))
+
+    def _solve_and_report(self, *, warn_if_empty: bool) -> None:
+        """Re-run every solve that currently has enough data and refresh the on-screen report.
+
+        Called after every capture/removal (silently -- ``warn_if_empty=False``, since "not
+        enough yet" is the normal state early on, not an error) and by the Solve button itself
+        (``warn_if_empty=True``, the one case a popup is warranted: the user asked explicitly and
+        got nothing). Idempotent and cheap (closed-form least-squares over however many captures
+        exist), so calling it this often is not a performance concern.
+        """
         # Each arm's wrist camera is an independent, uncalibrated FK frame (see charuco.py's
         # module docstring) -- solved and reported separately, never pooled.
         counts = {arm: sum(1 for c in self.captures if c.arm == arm) for arm in self.arms}
         if all(n < 2 for n in counts.values()):
-            QtWidgets.QMessageBox.warning(
-                self, "Not enough captures", f"Need at least 2 captures for some arm; have {counts}."
-            )
+            if warn_if_empty:
+                QtWidgets.QMessageBox.warning(
+                    self, "Not enough captures", f"Need at least 2 captures for some arm; have {counts}."
+                )
+            self.result_label.setText("not solved yet -- capture at least 2 per arm")
+            self.save_btn.setEnabled(False)
             return
         results = solve_agentview_extrinsic_per_arm(self.captures)
 
         lines = []
         per_arm_json = {}
         for arm, result in results.items():
+            self._record(self._history[arm], result.n_captures, result.translation_rms_mm, result.rotation_rms_deg)
             quality = (
                 "good" if result.rotation_rms_deg < 1.0 and result.translation_rms_mm < 10.0 else "CHECK CAPTURES"
             )
             lines.append(
                 f"[{arm}] n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
-                f"rotation RMS {result.rotation_rms_deg:.3f} deg  -- {quality}"
+                f"rotation RMS {result.rotation_rms_deg:.3f} deg  -- {quality}  "
+                f"{_convergence_note(self._history[arm])}"
             )
             per_arm_json[arm] = {
                 # This extrinsic is expressed in `arm`'s own FK frame -- NOT interchangeable
@@ -323,10 +389,13 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         arm_offset = None
         if len(self.pair_captures) >= 2:
             arm_offset = solve_arm_offset(self.pair_captures)
+            self._record(
+                self._offset_history, arm_offset.n_captures, arm_offset.translation_rms_mm, arm_offset.rotation_rms_deg
+            )
             lines.append(
                 f"[left<->right] n={arm_offset.n_captures}  distance {arm_offset.distance_m * 100:.1f} cm  "
                 f"translation RMS {arm_offset.translation_rms_mm:.2f} mm  "
-                f"rotation RMS {arm_offset.rotation_rms_deg:.3f} deg"
+                f"rotation RMS {arm_offset.rotation_rms_deg:.3f} deg  {_convergence_note(self._offset_history)}"
             )
         elif self.pair_captures:
             lines.append(f"[left<->right] {len(self.pair_captures)} paired capture(s) -- need at least 2")
@@ -339,7 +408,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 f"{unified.cross_check_rotation_deg:.3f} deg"
             )
 
-        self.result_label.setText("   ".join(lines) if lines else "not solved yet")
+        self.result_label.setText("\n".join(lines) if lines else "not solved yet")
 
         if not per_arm_json:
             self.save_btn.setEnabled(False)
