@@ -36,6 +36,7 @@ _FRAMEWORK_LABELS = {
     "acrft": "ACRFT",
     "lerobot": "LeRobot",
     "yam-policy": "yam-policy",
+    "dataset-replay": "replay",
 }
 
 
@@ -141,6 +142,11 @@ class DeploymentPolicyRunner:
             "last_error": "connecting…",
             # Which stack is answering (openpi / ACRFT / LeRobot), read off the handshake.
             "policy_name": "",
+            "policy_framework": "",
+            # Set only by a dataset-replay server; see _connect_policy.
+            "replay_dataset": "",
+            "replay_episode": -1,
+            "replay_fps": 0.0,
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
@@ -258,6 +264,15 @@ class DeploymentPolicyRunner:
         self._set(
             policy_connected=True,
             policy_name=_describe_policy(meta),
+            # Kept separate from the label so a UI can act on it -- replay drives the overlay
+            # from this rather than parsing the display string.
+            policy_framework=str(meta.get("framework") or "").strip().lower(),
+            # Only a replay server sets these; a UI uses them to line its past-demonstration
+            # overlay up with the episode being replayed instead of asking the operator to
+            # find it again in a list.
+            replay_dataset=str(meta.get("replay_dataset") or ""),
+            replay_episode=int(meta["replay_episode"]) if meta.get("replay_episode") is not None else -1,
+            replay_fps=float(meta.get("replay_fps") or 0.0),
             image_size=self._image_shape[0],
             image_shape=self._image_shape,
         )
@@ -361,7 +376,7 @@ class DeploymentPolicyRunner:
                     self._policy = None
                     self._policy_client = None
                     # Drop the name too: a stale one next to a red dot reads as still-identified.
-                    self._set(policy_connected=False, policy_name="")
+                    self._set(policy_connected=False, policy_name="", policy_framework="")
                 else:
                     self._robot = None
                     self._set(robot_connected=False)
@@ -411,7 +426,7 @@ class DeploymentPolicyRunner:
                     reason,
                     self._PROBE_PERIOD_S,
                 )
-            self._set(policy_connected=False, policy_name="", last_error=reason)
+            self._set(policy_connected=False, policy_name="", policy_framework="", last_error=reason)
 
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:

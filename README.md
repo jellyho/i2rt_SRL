@@ -149,17 +149,30 @@ python -m yam_policy.serve \
 
 ### D · Replay a dataset onto the robot
 
+Replay is deployment with the actions read from a dataset, so it runs on the same three
+processes — **no `wrapper` server, no separate GUI**:
+
 ```bash
-# 🤖 robot — wrapper server tracks the streamed targets
-robot/yam canup
-robot/yam wrapper
+# 🧠 serve the episode as a policy
+python -m yam_policy.serve \
+    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
+    --config root=~/lerobot_data/yam_pick --config episode=3
 ```
 
 ```bash
-# 💻 workstation — open the replay GUI, then:
-#   Load -> pick episode -> (tick "Overlay live") -> tick "Send to robot" -> Play
-workstation/yam-data replay --repo-id user/yam_pick
+robot/yam canup && robot/yam deploy   # 🤖 robot — the deploy server, as usual
+workstation/yam-data deploy           # 💻 workstation — the deploy UI, as usual
 ```
+
+- The **past-demonstration overlay** follows the replay: same episode, played at the rate it
+  was recorded at, paused whenever the rollout is not streaming.
+- Takeover, e-stop, the follower smoother and the link-loss watchdog all apply — replay is not
+  a path around them.
+- `--config speed=2` / `speed=0.5` / `loop=true` change playback; see
+  [`policy_serving/README.md`](policy_serving/README.md).
+
+The standalone `workstation/yam-data replay` GUI still exists for scrubbing a dataset without a
+robot.
 
 > Full hardware bring-up checklist: [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
 

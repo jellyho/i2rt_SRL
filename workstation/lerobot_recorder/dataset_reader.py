@@ -136,6 +136,22 @@ class DatasetReader:
         arr = np.asarray(val, dtype=np.float32).reshape(-1)
         return float(arr[0]) if arr.size else None
 
+    def get_extra(self, episode: int, frame: int, key: str, shape: tuple) -> Optional[np.ndarray]:
+        """Return a declared extra-feature column (e.g. ``action_samples``) at its declared
+        shape (no video decode), or None if the frame/column is absent.
+
+        Mirrors ``get_state``: the dataset writer stores declared extras flattened (see
+        ``dataset_writer._to_lerobot_frame``), so the caller's own shape is what un-flattens it.
+        """
+        if self.mock:
+            return None
+        gi = self._ep_index[episode][frame]
+        try:
+            val = self._ds.hf_dataset[gi].get(key)
+        except Exception:
+            return None
+        return None if val is None else np.asarray(val, dtype=np.float32).reshape(shape)
+
     def has_feature(self, key: str) -> bool:
         if self.mock:
             return False

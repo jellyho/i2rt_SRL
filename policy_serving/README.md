@@ -147,6 +147,44 @@ invented, because two of its steps fail **silently**:
 
 Nothing in LeRobot is modified or vendored; the adapter is one file on this side.
 
+## Replaying a recorded episode
+
+Replay is deployment with the actions read from a dataset instead of a model, so it runs on the
+deploy stack rather than a parallel one:
+
+```bash
+python -m yam_policy.serve \
+    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
+    --config root=~/lerobot_data/yam_cable_tie_v4 --config episode=3
+
+robot/yam deploy                 # the SAME robot server deployment uses -- not `wrapper`
+workstation/yam-data deploy      # the same UI: live cameras, e-stop, takeover
+```
+
+| `--config` | |
+|---|---|
+| `root` | the dataset directory (the one holding `meta/` and `data/`) |
+| `episode` | which `episode_index` to replay |
+| `speed` | `>1` drops frames, `<1` repeats them — the client ticks at a fixed rate, so changing the stream is what changes the speed |
+| `loop` | start again at frame 0 instead of holding at the end |
+| `chunk` | actions per reply (default 30) |
+
+What that inherits, none of which the old replay had: the follower smoother and joint-speed
+clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle button,
+the network e-stop, the link-loss watchdog, leader mirroring, and the option to record the
+replayed run as a dataset of its own.
+
+**The past-demonstration overlay follows along.** The handshake carries `replay_dataset`,
+`replay_episode` and `replay_fps`, so the deploy GUI selects that episode, plays it at the rate
+it was recorded at, and pauses it whenever the rollout is not streaming — including during a
+human takeover.
+
+**Only the action column is read**, straight from the parquet: no video decoding, no `lerobot`
+dependency, and a 100-episode dataset opens in about a tenth of a second.
+
+At the end the final pose is held rather than the stream stopping — the client is driving a
+robot and needs something to hold — and `replay_done` marks which frames those are.
+
 ## Add your own policy
 
 Subclass `BasePolicy` and implement `infer(obs) -> {"actions": (H, D)}`. See
