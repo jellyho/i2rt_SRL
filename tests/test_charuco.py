@@ -19,10 +19,13 @@ from workstation.lerobot_recorder.charuco import (
     ArmPairCapture,
     BoardSpec,
     Capture,
+    WristExtrinsicResult,
     _orthonormalize,
     _rotation_angle_deg,
     detect_board_pose,
+    fuse_wrist_extrinsics,
     make_board,
+    pose_delta,
     solve_agentview_extrinsic,
     solve_agentview_extrinsic_per_arm,
     solve_arm_offset,
@@ -120,6 +123,73 @@ def test_hand_eye_per_arm_skips_an_arm_below_three():
     right = [Capture("right", c.base_t_flange, c.wrist_t_board, c.agentview_t_board, 0.1, 0.1) for c in right]
     out = solve_wrist_extrinsic_per_arm([*left, *right])
     assert set(out) == {"left"}  # right had only 2, below the hand-eye minimum
+
+
+# --------------------------------------------------------------------------------------- #
+# fuse_wrist_extrinsics: identical-mount prior -- one shared gripper_T_camera for both arms
+# --------------------------------------------------------------------------------------- #
+def _wristresult(arm, t, deg=0.0, axis="y") -> WristExtrinsicResult:
+    return WristExtrinsicResult(
+        arm,
+        _pose(t, axis, deg),
+        n_captures=5,
+        translation_rms_mm=0.1,
+        rotation_rms_deg=0.01,
+        per_capture_translation_mm=[],
+        per_capture_rotation_deg=[],
+    )
+
+
+def test_fuse_of_two_agreeing_arms_is_their_pose_with_tiny_spread():
+    x = (0.02, -0.03, 0.05)
+    fused = fuse_wrist_extrinsics({"left": _wristresult("left", x, 25), "right": _wristresult("right", x, 25)})
+    assert set(fused.contributing_arms) == {"left", "right"}
+    assert np.allclose(fused.gripper_t_camera, _pose(x, "y", 25), atol=1e-9)
+    assert fused.translation_spread_mm < 1e-6 and fused.rotation_spread_deg < 1e-6
+    assert fused.n_captures_total == 10
+
+
+def test_fuse_reports_real_spread_when_the_arms_disagree():
+    """A big cross-arm gap is the signal that the mounts are NOT identical (or a bad solve) --
+    it must show up as spread, not be averaged away silently."""
+    close = fuse_wrist_extrinsics(
+        {"left": _wristresult("left", (0.02, 0, 0)), "right": _wristresult("right", (0.021, 0, 0))}
+    )
+    far = fuse_wrist_extrinsics(
+        {"left": _wristresult("left", (0.02, 0, 0)), "right": _wristresult("right", (0.07, 0, 0))}
+    )  # 5cm apart
+    assert far.translation_spread_mm > close.translation_spread_mm
+    assert far.translation_spread_mm > 10.0
+
+
+def test_fuse_of_one_arm_is_that_arm_and_still_usable_for_both():
+    """One arm calibrated to 3+ varied poses should hand a mount to BOTH arms (spread 0)."""
+    fused = fuse_wrist_extrinsics({"left": _wristresult("left", (0.02, -0.03, 0.05), 25)})
+    assert fused.contributing_arms == ["left"]
+    assert np.allclose(fused.gripper_t_camera, _pose((0.02, -0.03, 0.05), "y", 25), atol=1e-9)
+    assert fused.translation_spread_mm == 0.0
+
+
+def test_fuse_refuses_empty():
+    with pytest.raises(ValueError, match="no per-arm"):
+        fuse_wrist_extrinsics({})
+
+
+# --------------------------------------------------------------------------------------- #
+# pose_delta: the "vs CAD" sanity check
+# --------------------------------------------------------------------------------------- #
+def test_pose_delta_zero_for_identical_poses():
+    a = _pose((1.0, 2.0, 3.0), "z", 30)
+    t_mm, r_deg = pose_delta(a, a)
+    assert t_mm < 1e-9 and r_deg < 1e-6
+
+
+def test_pose_delta_reports_translation_in_mm_and_rotation_in_deg():
+    a = _pose((0.10, 0.0, 0.0))
+    b = _pose((0.09, 0.0, 0.0), "y", 5.0)  # 10mm + 5deg from a
+    t_mm, r_deg = pose_delta(a, b)
+    assert t_mm == pytest.approx(10.0, abs=1e-6)
+    assert r_deg == pytest.approx(5.0, abs=1e-4)
 
 
 def test_agentview_uses_the_wrist_extrinsic_it_is_given():

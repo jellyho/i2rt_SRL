@@ -215,6 +215,17 @@ def _rotation_angle_deg(R: np.ndarray) -> float:
     return float(np.degrees(np.arccos(c)))
 
 
+def pose_delta(a: np.ndarray, b: np.ndarray) -> tuple:
+    """``(translation_mm, rotation_deg)`` between two 4x4 poses -- how far ``a`` sits from ``b``.
+
+    Used to sanity-check a solved extrinsic against the CAD reference: a hand-eye result a few mm
+    and a degree or two off ``T_GRIPPER_CAMERA`` is plausibly right; tens of cm or tens of degrees
+    means something upstream is wrong (board size, degenerate poses, a bad FK model)."""
+    t_mm = float(np.linalg.norm(a[:3, 3] - b[:3, 3]) * 1000.0)
+    r_deg = _rotation_angle_deg(a[:3, :3].T @ b[:3, :3])
+    return t_mm, r_deg
+
+
 def _average_poses(estimates: Sequence[np.ndarray]) -> tuple:
     """Average several independent 4x4 pose estimates (translation: mean; rotation: SVD-projected
     mean, see ``_orthonormalize``), and each one's distance from that average.
@@ -339,6 +350,50 @@ def solve_wrist_extrinsic(captures: Sequence[Capture]) -> WristExtrinsicResult:
         rotation_rms_deg=_rms(per_r),
         per_capture_translation_mm=per_t,
         per_capture_rotation_deg=per_r,
+    )
+
+
+@dataclasses.dataclass
+class SharedWristExtrinsic:
+    """One ``gripper_T_camera`` shared across arms whose wrist mounts are physically identical.
+
+    ``gripper_T_camera`` is measured in the FLANGE frame, so it does not depend on which arm's
+    base it was solved in -- if the two D405 mounts are the same part in the same place, the
+    transform is literally the same, and fusing both arms' independent hand-eye solves is valid.
+    (Pooling raw captures into one ``cv2.calibrateHandEye`` is NOT -- it would form relative
+    motions across two base frames; see ``fuse_wrist_extrinsics``.)
+
+    Fusing buys three things: less noise (two solves averaged), a shared value so one
+    well-calibrated arm gives the other its mount too, and ``*_spread_*`` -- how far the arms'
+    independent solves sat from the fused answer, which is a direct check on both "the mounts
+    really are identical" and "the captures were good". A large spread means one of those failed.
+    """
+
+    gripper_t_camera: np.ndarray  # 4x4, the shared answer
+    contributing_arms: List[str]  # arms whose independent hand-eye fed the fuse
+    n_captures_total: int
+    translation_spread_mm: float  # farthest a contributing arm's mount sat from the fused one
+    rotation_spread_deg: float
+
+
+def fuse_wrist_extrinsics(per_arm: Dict[str, WristExtrinsicResult]) -> SharedWristExtrinsic:
+    """Fuse per-arm hand-eye solves into one shared ``gripper_T_camera`` (identical-mount prior).
+
+    Averages the arms' independent solves (translation: mean; rotation: SVD-projected mean, see
+    ``_average_poses``) rather than re-solving over pooled captures -- see ``SharedWristExtrinsic``
+    for why that pooling would be invalid. One arm alone fuses to itself (spread 0), which is the
+    point: a session that only got one arm to 3+ varied poses still yields a mount for BOTH.
+    """
+    if not per_arm:
+        raise ValueError("no per-arm wrist extrinsics to fuse")
+    arms = sorted(per_arm)
+    fused, per_t, per_r = _average_poses([per_arm[a].gripper_t_camera for a in arms])
+    return SharedWristExtrinsic(
+        gripper_t_camera=fused,
+        contributing_arms=arms,
+        n_captures_total=sum(per_arm[a].n_captures for a in arms),
+        translation_spread_mm=max(per_t),
+        rotation_spread_deg=max(per_r),
     )
 
 
@@ -609,19 +664,28 @@ def format_arm_offset_yaml(result: ArmOffsetResult, *, calibrated_at: str, inden
     ]
 
 
-def format_wrist_extrinsic_yaml(result: WristExtrinsicResult, *, calibrated_at: str, indent: int = 6) -> List[str]:
+def format_wrist_extrinsic_yaml(
+    result: WristExtrinsicResult, *, calibrated_at: str, indent: int = 6, shared: bool = False
+) -> List[str]:
     """The body of one wrist camera's ``extrinsic`` entry -- ready under
     ``cameras.wrist_<arm>.extrinsic`` (see ``splice_wrist_extrinsic``). ``matrix`` is
-    ``gripper_T_camera``, the hand-eye replacement for ``WristCameraGeometry``'s CAD constant."""
+    ``gripper_T_camera``, the hand-eye replacement for ``WristCameraGeometry``'s CAD constant.
+
+    ``shared`` records (as ``shared_across_arms: true``) that this value was fused across both
+    arms' solves under the identical-mount assumption -- so a reader knows the two wrist cameras
+    intentionally carry the same matrix, and ``translation_rms_mm``/``rotation_rms_deg`` are the
+    cross-arm spread rather than a single arm's board-consistency residual."""
     pad = " " * indent
-    return [
-        f"{pad}matrix:",
-        *_format_matrix_yaml(result.gripper_t_camera, indent + 2),
+    lines = [f"{pad}matrix:", *_format_matrix_yaml(result.gripper_t_camera, indent + 2)]
+    if shared:
+        lines.append(f"{pad}shared_across_arms: true")
+    lines += [
         f"{pad}n_captures: {result.n_captures}",
         f"{pad}translation_rms_mm: {result.translation_rms_mm:.3f}",
         f"{pad}rotation_rms_deg: {result.rotation_rms_deg:.4f}",
         f'{pad}calibrated_at: "{calibrated_at}"',
     ]
+    return lines
 
 
 def format_unified_yaml(result: UnifiedRigCalibration, *, calibrated_at: str, indent: int = 8) -> List[str]:
@@ -815,17 +879,19 @@ def splice_arm_offset(text: str, result: ArmOffsetResult, *, calibrated_at: str)
     )
 
 
-def splice_wrist_extrinsic(text: str, arm: str, result: WristExtrinsicResult, *, calibrated_at: str) -> str:
+def splice_wrist_extrinsic(
+    text: str, arm: str, result: WristExtrinsicResult, *, calibrated_at: str, shared: bool = False
+) -> str:
     """Insert/replace ``cameras.wrist_<arm>.extrinsic`` (``gripper_T_camera``) in a config.yaml.
 
     Writing this OVER the CAD default is the whole point of hand-eye: a consumer building a
     ``WristCameraGeometry`` should read this back instead of the hardcoded ``T_GRIPPER_CAMERA``
     when it exists. ``cameras.wrist_<arm>`` must already exist (it does -- every rig config lists
-    the wrist cameras by serial); this only adds/replaces its ``extrinsic`` child.
-    """
+    the wrist cameras by serial); this only adds/replaces its ``extrinsic`` child. ``shared``
+    marks the value as fused across arms (identical-mount mode)."""
     cam_key = f"wrist_{arm}"
     text = _expand_scalar_camera(text, cam_key)  # so a scalar "wrist_x: serial" can take a child
-    block = format_wrist_extrinsic_yaml(result, calibrated_at=calibrated_at, indent=6)
+    block = format_wrist_extrinsic_yaml(result, calibrated_at=calibrated_at, indent=6, shared=shared)
     return _splice_leaf(
         text,
         ("cameras", cam_key),

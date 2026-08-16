@@ -73,6 +73,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument(
+        "--no-shared-wrist-mount",
+        dest="shared_wrist_mount",
+        action="store_false",
+        help="solve each wrist mount separately instead of fusing them into one shared "
+        "gripper_T_camera (default: fuse, since both mounts are the same part)",
+    )
+    p.add_argument(
         "--no-auto-capture",
         dest="auto_capture",
         action="store_false",
@@ -160,6 +167,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         capture_buttons=args.capture_buttons,
         auto_capture=args.auto_capture,
         auto_dwell_s=args.auto_dwell,
+        shared_wrist_mount=args.shared_wrist_mount,
     )
 
 

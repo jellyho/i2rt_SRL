@@ -25,12 +25,22 @@ presses.
 
 The solve re-runs automatically after every capture -- no need to click "Solve" and wait; watch
 the numbers on screen while you work instead of guessing how many more poses to collect. Hand-eye
-(step 1) needs 3+ varied-orientation captures per arm; until an arm reaches that, steps 2-3 fall
-back to the CAD wrist extrinsic (and say so) so they still produce an early, less-trustworthy
-answer. Everything is PER ARM, never pooled: each arm's ``WristCameraGeometry`` is its own MJCF
-with no known transform to the other's -- there is no shared "robot base" frame anywhere in this
-codebase (see ``charuco``'s module docstring), which is exactly what the arm offset (step 3)
-recovers. Each line carries a **convergence trend** (the RMS from the last several re-solves) so
+(step 1) needs 3+ varied-orientation captures per arm.
+
+The two wrist mounts are the same part in the same place, so by default the arms' hand-eye solves
+are FUSED into ONE ``gripper_T_camera`` used for both (``--no-shared-wrist-mount`` to solve each
+separately). That means one well-calibrated arm gives the other its mount too -- so an arm still
+short of 3 varied captures, or one whose wrist can't see the board much, gets the measured mount
+rather than the CAD fallback. The reported **cross-arm spread** (how far the arms' independent
+solves sat apart) is a direct check on "the mounts really are identical"; and each wrist line also
+shows **vs CAD Δ** -- how far the solve is from the unverified CAD constant, so a wildly-off result
+(wrong board size, degenerate poses, bad FK) is obvious rather than silently saved. Only when NO
+arm has solved yet do steps 2-3 fall back to CAD.
+
+The agentview extrinsics and the arm offset are still PER ARM, never pooled: each arm's FK is its
+own frame with no known transform to the other's -- there is no shared "robot base" frame anywhere
+in this codebase (see ``charuco``'s module docstring), which is exactly what the arm offset (step
+3) recovers. Each line carries a **convergence trend** (the RMS from the last several re-solves) so
 "still dropping" reads differently from "flat for the last 3".
 
 "Save" writes into ``config.yaml`` -- THE single source of truth for the rig (camera serials,
@@ -63,9 +73,12 @@ from workstation.lerobot_recorder.charuco import (
     BoardSpec,
     CalibrationResult,
     Capture,
+    SharedWristExtrinsic,
     UnifiedRigCalibration,
     WristExtrinsicResult,
     detect_board_pose,
+    fuse_wrist_extrinsics,
+    pose_delta,
     solve_agentview_extrinsic_per_arm,
     solve_arm_offset,
     solve_wrist_extrinsic_per_arm,
@@ -141,6 +154,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         capture_buttons: Sequence[str] = (),
         auto_capture: bool = True,
         auto_dwell_s: float = 1.0,
+        shared_wrist_mount: bool = True,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Calibrate rig -- wrist extrinsics, agentview, arm offset (one desk board)")
@@ -151,6 +165,12 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.board = board
         self.config_path = config_path  # None = no config.yaml found; Save will say so
         self.mock = mock
+        # Both wrist mounts are the same part in the same place, so gripper_T_camera is ONE
+        # transform: fuse the arms' independent hand-eye solves into a shared value used for both
+        # (see charuco.fuse_wrist_extrinsics). Less noise, one good arm calibrates both, and the
+        # cross-arm spread checks the "identical mount" assumption. --no-shared-wrist-mount to
+        # solve each arm separately instead (e.g. if the mounts are known to differ).
+        self.shared_wrist_mount = bool(shared_wrist_mount)
         # "<side>.<index>" leader-handle buttons (upper=0, lower=1) that trigger a capture, any
         # ONE firing. EMPTY BY DEFAULT: in teleop the robot server already consumes these while
         # engaged (outcome buttons -> homing, fine button -> recentering; see i2rt controllers),
@@ -258,7 +278,8 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.result_label)
 
         # What the last successful _solve_and_report found -- what _on_save actually writes.
-        self._last_wrist: Dict[str, WristExtrinsicResult] = {}
+        self._last_wrist: Dict[str, WristExtrinsicResult] = {}  # per-arm independent hand-eye
+        self._last_shared_wrist: Optional[SharedWristExtrinsic] = None  # fused (shared-mount mode)
         self._last_results: Dict[str, CalibrationResult] = {}
         self._last_arm_offset: Optional[ArmOffsetResult] = None
         self._last_unified: Optional[UnifiedRigCalibration] = None
@@ -492,21 +513,44 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         # captures with varied ORIENTATION; until then the agentview/offset solves below fall
         # back to the CAD constant so they still produce a (less trustworthy) answer early on.
         wrist = solve_wrist_extrinsic_per_arm(self.captures)
-        extrinsics = {}
         for arm in self.arms:
             if arm in wrist:
                 w = wrist[arm]
-                extrinsics[arm] = w.gripper_t_camera
                 self._record(self._wrist_history[arm], w.n_captures, w.translation_rms_mm, w.rotation_rms_deg)
                 quality = "good" if w.rotation_rms_deg < 1.0 and w.translation_rms_mm < 10.0 else "CHECK POSES"
+                # Sanity vs the CAD mount: a few mm / deg off is plausibly right; tens of cm/deg
+                # means something is wrong (board size, degenerate poses, FK). See pose_delta.
+                cad_t, cad_r = pose_delta(w.gripper_t_camera, T_GRIPPER_CAMERA)
                 lines.append(
                     f"[wrist {arm}] hand-eye n={w.n_captures}  board-consistency RMS "
                     f"{w.translation_rms_mm:.2f} mm / {w.rotation_rms_deg:.3f} deg  -- {quality}  "
-                    f"{_convergence_note(self._wrist_history[arm])}"
+                    f"vs CAD Δ {cad_t:.1f} mm / {cad_r:.1f} deg  {_convergence_note(self._wrist_history[arm])}"
                 )
             elif counts.get(arm):
-                extrinsics[arm] = T_GRIPPER_CAMERA  # CAD fallback until 3+ varied captures exist
-                lines.append(f"[wrist {arm}] {counts[arm]} capture(s) -- need 3+ (varied tilt) to hand-eye; using CAD")
+                lines.append(f"[wrist {arm}] {counts[arm]} capture(s) -- need 3+ (varied tilt) to hand-eye")
+
+        # Both mounts identical -> fuse the solved arms into ONE gripper_T_camera and use it for
+        # every arm that has captures (so one hand-eye'd arm gives the other its mount too);
+        # otherwise each arm uses its own solve, and any unsolved arm falls back to CAD.
+        shared = fuse_wrist_extrinsics(wrist) if (self.shared_wrist_mount and wrist) else None
+        self._last_shared_wrist = shared
+        extrinsics = {}
+        for arm in self.arms:
+            if not counts.get(arm):
+                continue
+            if shared is not None:
+                extrinsics[arm] = shared.gripper_t_camera
+            elif arm in wrist:
+                extrinsics[arm] = wrist[arm].gripper_t_camera
+            else:
+                extrinsics[arm] = T_GRIPPER_CAMERA  # CAD fallback until this arm has its own solve
+        if shared is not None:
+            cad_t, cad_r = pose_delta(shared.gripper_t_camera, T_GRIPPER_CAMERA)
+            lines.append(
+                f"[wrist shared] from {'+'.join(shared.contributing_arms)}  cross-arm spread "
+                f"{shared.translation_spread_mm:.2f} mm / {shared.rotation_spread_deg:.3f} deg "
+                f"(small if mounts identical)  vs CAD Δ {cad_t:.1f} mm / {cad_r:.1f} deg  -- used for both arms"
+            )
 
         # Step 2: agentview extrinsic per arm, chained through each arm's wrist extrinsic (solved
         # above, or CAD fallback).
@@ -516,7 +560,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             quality = (
                 "good" if result.rotation_rms_deg < 1.0 and result.translation_rms_mm < 10.0 else "CHECK CAPTURES"
             )
-            via = "hand-eye" if arm in wrist else "CAD extrinsic"
+            if shared is not None:
+                via = "hand-eye" if arm in wrist else "hand-eye (shared from other arm)"
+            else:
+                via = "hand-eye" if arm in wrist else "CAD extrinsic"
             lines.append(
                 f"[agentview {arm}] n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
                 f"rotation RMS {result.rotation_rms_deg:.3f} deg  ({via})  -- {quality}  "
@@ -599,9 +646,26 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             with open(self.config_path, encoding="utf-8") as fh:
                 original = fh.read()
             updated = original
-            for arm, w in self._last_wrist.items():
-                updated = splice_wrist_extrinsic(updated, arm, w, calibrated_at=calibrated_at)
-                written.append(f"wrist_{arm}.extrinsic")
+            if self._last_shared_wrist is not None:
+                # Identical-mount mode: write the ONE fused matrix to every arm that had captures
+                # (so an arm calibrated only via the other still gets the measured mount).
+                sh = self._last_shared_wrist
+                for arm in sorted({c.arm for c in self.captures}):
+                    w = WristExtrinsicResult(
+                        arm,
+                        sh.gripper_t_camera,
+                        sh.n_captures_total,
+                        sh.translation_spread_mm,
+                        sh.rotation_spread_deg,
+                        [],
+                        [],
+                    )
+                    updated = splice_wrist_extrinsic(updated, arm, w, calibrated_at=calibrated_at, shared=True)
+                    written.append(f"wrist_{arm}.extrinsic(shared)")
+            else:
+                for arm, w in self._last_wrist.items():
+                    updated = splice_wrist_extrinsic(updated, arm, w, calibrated_at=calibrated_at)
+                    written.append(f"wrist_{arm}.extrinsic")
             for arm, result in self._last_results.items():
                 updated = splice_agentview_extrinsic(updated, arm, result, calibrated_at=calibrated_at)
                 written.append(f"agentview.extrinsic.{arm}")
@@ -649,6 +713,7 @@ def run(
     capture_buttons: Sequence[str] = (),
     auto_capture: bool = True,
     auto_dwell_s: float = 1.0,
+    shared_wrist_mount: bool = True,
 ) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     cams = CameraManager(cfg)
@@ -663,6 +728,7 @@ def run(
         capture_buttons=capture_buttons,
         auto_capture=auto_capture,
         auto_dwell_s=auto_dwell_s,
+        shared_wrist_mount=shared_wrist_mount,
     )
     win.resize(1600, 800)
     win.show()
