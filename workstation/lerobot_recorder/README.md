@@ -87,9 +87,28 @@ opened and no frames are buffered. See *C. Deployment*.
 | `action`            | (14,) float32 | both arms × `applied`(7) |
 | task                | string | the language instruction |
 
-Recorded at **60 fps** (matched to the cameras). Uses the official v3.0 API
+Recorded at the rate `config.yaml` sets — **30 fps** as checked in, matched to the camera
+streams (`RecorderConfig`'s own default is 60, but the config pins both to 30 because three
+640x480 streams at 60 overrun a single USB 2.0 bus). Uses the official v3.0 API
 (`create` / `add_frame` with a `task` key / `save_episode` / `clear_episode_buffer`
 / **`finalize`**); the version-sensitive calls live in `dataset_writer.py`.
+
+### Training on one of these: pass `--tolerance_s=1e-3`
+
+```bash
+lerobot-train --dataset.root=~/lerobot_data/<name> ... --tolerance_s=1e-3
+```
+
+Without it, training dies partway through with `FrameTimestampError: One or several query
+timestamps unexpectedly violate the tolerance (tensor([0.0001]) > tolerance_s=0.0001)`.
+
+Nothing is wrong with the dataset, and re-recording will not help — it is arithmetic. v3.0
+timestamps are `float32` and v3.0 packs many episodes into one mp4, so the file-relative query
+time climbs into the hundreds of seconds. Past **t = 1024 s** the gap between adjacent `float32`
+values is 1.22e-4 s, which is already larger than the 1e-4 default tolerance: no frame can satisfy
+it, however well the data was collected. Any sufficiently long v3.0 dataset hits this.
+
+`1e-3` is still 3% of a frame at 30 fps, so it rejects a genuinely wrong frame just as well.
 
 ---
 
@@ -147,7 +166,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 # (optional) realsense-viewer for live preview: sudo apt install -y librealsense2-utils
 ```
 
-Plug the cameras into **USB 3** ports (USB 2 can't sustain 60 fps), then map each
+Plug the cameras into **USB 3** ports (three 640x480 streams do not fit on one USB 2.0 bus —
+one camera starves with "stopped delivering frames"), then map each
 **serial → role**. Each camera's serial is a permanent firmware ID — no udev
 renaming needed (unlike CAN), you just record which serial is which physical view:
 
@@ -233,7 +253,7 @@ component runs locally).
 ```bash
 # [robot]
 robot/yam canup                 # bring up the 4 CAN interfaces (after boot)
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 # lift both gellos to engage; bring both home to stop & auto-return.
 ```
 
@@ -242,7 +262,7 @@ robot/yam teleop --bilateral-kp 0.15
 ```bash
 # 1. [robot]   start the teleop server (serves state/action/gate over portal)
 robot/yam canup
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 
 # 2. [workstation]   start the recorder GUI
 workstation/yam-data record \
@@ -324,7 +344,7 @@ follower and what the leader is for:
 |---|---|---|
 | drives the follower | the human, through the leader (gello) arm | the **policy**, via `set_policy_action` from the workstation |
 | accepts policy actions | no | yes |
-| what the leader is | the **input device**; `bilateral_kp` gives force feedback | an **override handle**: mirrors the follower while the policy drives, goes free when you take over |
+| what the leader is | the **input device** (free by default; `bilateral_kp` > 0 adds force feel) | an **override handle**: mirrors the follower while the policy drives, goes free when you take over |
 | episode boundary | the engage gate (IDLE → ENGAGED → HOMING → IDLE) | a policy rollout (start/stop by button or UI) |
 | handle buttons | label the episode (success / fail / discard) | drive the rollout state machine (start/stop, takeover, keep/discard + home) |
 | used by | `yam-data record` | `yam-data deploy` (GUI or `--headless`) |
@@ -332,6 +352,37 @@ follower and what the leader is for:
 (The `deploy` controller was called `dagger` until it also started serving plain
 deployment — HG-DAgger is one *use* of it, not what it is. `robot/yam dagger` still
 works as an alias, and an un-updated robot server reporting the old name is accepted.)
+
+### Which policy server (step 2)
+
+**openpi and LeRobot checkpoints both work, through the same client and the same wire.**
+openpi's protocol is what the client speaks; a LeRobot checkpoint runs behind an adapter on
+this side, so there is nothing to convert.
+
+```bash
+python -m yam_policy.serve                                    # zero-model smoke test ("hold pose")
+
+python -m yam_policy.serve \
+    --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
+    --config pretrained_path=outputs/train/my_act/checkpoints/last/pretrained_model \
+    --config device=cuda                                      # a LeRobot checkpoint
+```
+
+Nothing on the workstation changes: the client reads the camera names, image size and chunk
+length out of the handshake. It also **names what answered** — `LeRobot · act`,
+`ACRFT · pi05_yam_lego_taxi` — next to the connection dot and in `--headless` logs, because
+all of these serve the same wire while reading different observations, and the wrong one
+still returns a well-formed chunk.
+
+The cameras line up on their own: this recorder writes `observation.images.<role>`, so a
+policy trained on its data already names its image features after `wrist_left` /
+`wrist_right` / `agentview`. A checkpoint trained elsewhere needs one `--config camera_map=…`.
+
+> **Before training on one of these datasets, exclude `observation.leader`.** LeRobot's
+> trainer takes every column as a policy input, and on a teleop dataset the leader pose *is*
+> the action — so the policy can copy the answer, the loss looks better for it, and the
+> checkpoint then fails on the robot. Full details and the exact invocation:
+> [`policy_serving/README.md`](../../policy_serving/README.md).
 
 A `teleop` server ignores `set_policy_action` entirely, so deployment against it does
 nothing — hence the startup check below.
@@ -344,7 +395,7 @@ which are CAN-bus utilities rather than modes.
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
 robot/yam canup
-robot/yam deploy --mirror-kp 0.2
+robot/yam deploy
 
 # 2. [policy]   serve your policy (own env; openpi-compatible websocket)
 #               see policy_serving/README.md
@@ -383,7 +434,7 @@ no dataset is created, opened, or resumed and no frames are buffered.
 
 Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
 (it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /
-`--no-leader-mirror` only set the initial values; `robot/yam deploy --mirror-kp 0` makes
+`--no-leader-mirror` only set the initial values; `robot/yam deploy --no-leader-mirror` makes
 "no mirroring" the robot's own default. The mirror setting is latched workstation-side and
 re-applied on reconnect, so the robot never silently reverts mid-session.
 
@@ -461,14 +512,15 @@ Dry run: `workstation/yam-data replay --mock`.
 
 - **finalize**: closing the recorder window (or `recorder.shutdown()`) calls
   `LeRobotDataset.finalize()`. Skipping it leaves parquet files incomplete.
-- The record loop is clocked at 60 fps. Cameras grab on their **own capture thread**
+- The record loop is clocked at `recorder.fps` (30 as checked in). Cameras grab on their **own capture thread**
   and cache the latest frame; the loop and GUI read that cache **non-blocking**, so a
   slow frame or a pipe re-open never stalls recording or freezes the view. Each tick
   pairs the latest cached frame with the latest robot state/action polled over portal.
 - **Camera fps fallback**: the requested fps (60) is auto-reduced to the highest the
   device supports (e.g. 30 on USB 2.0) — no config edit needed. Over **USB 2.0** a
   640×480 stream caps at 30 fps and can drop frames under 3-camera load, so use the
-  **USB 3 cables** for true 60 fps (a USB-2 cable downgrades the link even on a USB-3 port).
+  **USB 3 cables** before raising the stream rate (a USB-2 cable downgrades the link even on a
+  USB-3 port; `config.yaml` shows how to check every camera's negotiated speed).
 - **Single instance**: the recorder takes a lock so a second instance can't fight
   over the cameras; starting a second one reports a clear error instead of flapping.
 - `lerobot`'s API can shift between releases — the version-sensitive calls are

@@ -20,10 +20,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "policy_serving"))
 
+from yam_policy.action_chunk_broker import ActionChunkBroker
+
 from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
-from workstation.policy_bridge.deploy_runner import _extra_features_from_meta
-from yam_policy.action_chunk_broker import ActionChunkBroker
+from workstation.policy_bridge.deploy_runner import _describe_policy, _extra_features_from_meta
 
 HORIZON = 30
 CANDIDATES = 4
@@ -33,9 +34,7 @@ CANDIDATES = 4
 # The declaration
 # --------------------------------------------------------------------------------------- #
 def test_the_server_names_the_features_not_the_client():
-    declared = _extra_features_from_meta(
-        {"extra_features": {"critic_q": [1], "action_samples": [CANDIDATES, 14]}}
-    )
+    declared = _extra_features_from_meta({"extra_features": {"critic_q": [1], "action_samples": [CANDIDATES, 14]}})
     assert declared == {"critic_q": (1,), "action_samples": (CANDIDATES, 14)}
 
 
@@ -51,10 +50,10 @@ def test_a_policy_that_declares_nothing_gets_nothing():
 @pytest.mark.parametrize(
     "declared",
     [
-        {"extra_features": [1, 2]},                       # not a mapping
-        {"extra_features": {"a": "wide"}},                # shape is not numbers
-        {"extra_features": {"a": [0]}},                   # a dimension of zero
-        {"extra_features": {"a": []}},                    # no dimensions at all
+        {"extra_features": [1, 2]},  # not a mapping
+        {"extra_features": {"a": "wide"}},  # shape is not numbers
+        {"extra_features": {"a": [0]}},  # a dimension of zero
+        {"extra_features": {"a": []}},  # no dimensions at all
     ],
 )
 def test_a_malformed_declaration_is_dropped_rather_than_trusted(declared):
@@ -64,6 +63,43 @@ def test_a_malformed_declaration_is_dropped_rather_than_trusted(declared):
 
 def test_one_bad_entry_does_not_take_the_good_ones_with_it():
     assert _extra_features_from_meta({"extra_features": {"bad": [0], "good": [2]}}) == {"good": (2,)}
+
+
+# --------------------------------------------------------------------------------------- #
+# Naming what answered on the port
+# --------------------------------------------------------------------------------------- #
+def test_each_stack_is_named_from_its_own_handshake():
+    """openpi, its ACRFT fork and a LeRobot checkpoint all speak this wire, and all three return
+    a well-formed chunk from an observation the other two would read differently."""
+    assert _describe_policy({"framework": "acrft", "policy_name": "pi05_yam_lego_taxi"}) == (
+        "ACRFT · pi05_yam_lego_taxi"
+    )
+    assert _describe_policy({"framework": "lerobot", "policy_type": "act"}) == "LeRobot · act"
+    assert _describe_policy({"framework": "openpi", "policy_name": "pi0_fast_droid"}) == ("openpi · pi0_fast_droid")
+
+
+def test_a_framework_with_no_policy_name_still_names_the_framework():
+    assert _describe_policy({"framework": "lerobot"}) == "LeRobot"
+
+
+def test_the_launcher_spec_is_trimmed_to_the_class():
+    """serve.py puts `module:Class` on the wire; the module path is noise in a status bar."""
+    assert (
+        _describe_policy({"framework": "yam-policy", "policy": "yam_policy.policies.dummy:DummyPolicy"})
+        == "yam-policy · DummyPolicy"
+    )
+
+
+def test_a_server_that_does_not_name_itself_is_a_guess_not_an_assertion():
+    """Upstream openpi predates this field. Showing a confident wrong name would be worse than
+    showing none, so an inferred one is marked as inferred."""
+    assert _describe_policy({"action_horizon": 30}).endswith("?")
+    assert _describe_policy({"action_horizon": 30, "supports_multi_sample": True}) == "ACRFT?"
+
+
+def test_an_empty_handshake_says_so():
+    assert _describe_policy({}) == "unidentified server"
+    assert _describe_policy(None) == "unidentified server"
 
 
 # --------------------------------------------------------------------------------------- #
@@ -81,11 +117,9 @@ class _Policy:
             "actions": np.zeros((HORIZON, 14), np.float32),
             # value of step i is i, so a mis-slice is visible rather than plausible
             "critic_q": np.arange(HORIZON, dtype=np.float32).reshape(HORIZON, 1),
-            "action_samples": np.tile(
-                np.arange(CANDIDATES, dtype=np.float32)[None, :, None], (HORIZON, 1, 14)
-            ),
-            "run_id": np.array([7.0], np.float32),        # NOT per-step
-            "note": "hello",                              # not an array at all
+            "action_samples": np.tile(np.arange(CANDIDATES, dtype=np.float32)[None, :, None], (HORIZON, 1, 14)),
+            "run_id": np.array([7.0], np.float32),  # NOT per-step
+            "note": "hello",  # not an array at all
         }
 
     def reset(self):

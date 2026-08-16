@@ -20,14 +20,14 @@ pytest.importorskip("portal")
 pytest.importorskip("mujoco")  # sim robot
 pytest.importorskip("websockets")
 
+from yam_policy import WebsocketPolicyServer
+
 from i2rt.serving.controllers import DeployConfig, DeployController
 from i2rt.serving.robot_server import RobotServer
+from tests._util import free_port, wait_port
 from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
 from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
-from yam_policy import WebsocketPolicyServer
-
-from tests._util import free_port, wait_port
 
 CHUNK = 30  # what the YAM configs actually train with; deliberately != any client default
 ACTION_DIM = 14
@@ -140,7 +140,19 @@ def test_the_observation_the_policy_receives_is_openpi_shaped(policy_server, rob
         assert obs[key].dtype == np.uint8
 
     assert obs["prompt"] == "assemble lego blocks to make yellow taxi"
-    assert not any(k.startswith("observation.") for k in obs), f"unread keys sent: {sorted(obs)}"
+
+    # The dotted keys alongside these are the recorder's other columns, and they are sent on
+    # purpose: LeRobot's trainer takes every dataset column as a policy input, so a checkpoint
+    # trained on this stack's data may require any of them, and one that does could not be
+    # deployed at all when they were withheld. openpi never reads them.
+    #
+    # Pinned as an exact set rather than allowed wholesale -- the original point of this line was
+    # that the client does not put arbitrary things on the wire, and that still holds.
+    assert {k for k in obs if k.startswith("observation.")} == {
+        "observation.leader",
+        "observation.eef",
+        "observation.control_mode",
+    }, f"unexpected keys sent: {sorted(obs)}"
 
 
 def test_the_chunk_size_comes_from_the_policy(policy_server, robot_server):

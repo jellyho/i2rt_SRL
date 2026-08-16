@@ -17,10 +17,59 @@ from typing import Callable, Dict, Optional
 
 import numpy as np
 
-from workstation.lerobot_recorder.config import ARM_DOF, ARMS, RecorderConfig
+from workstation.lerobot_recorder.config import (
+    ARM_DOF,
+    ARMS,
+    CONTROL_MODE,
+    EEF_DIM,
+    LEADER_DIM,
+    RecorderConfig,
+)
 from workstation.policy_bridge.config import BridgeConfig
 
 logger = logging.getLogger(__name__)
+
+
+#: Frameworks a server may name itself as, mapped to how it is shown.
+_FRAMEWORK_LABELS = {
+    "openpi": "openpi",
+    "acrft": "ACRFT",
+    "lerobot": "LeRobot",
+    "yam-policy": "yam-policy",
+}
+
+
+def _describe_policy(meta: Dict) -> str:
+    """A short label for what is actually answering on the policy port.
+
+    Three different stacks can serve this wire -- openpi, its ACRFT fork, and a LeRobot
+    checkpoint behind our adapter -- and the observations they take are not interchangeable. When
+    the wrong one is up, every symptom appears at the robot: an action chunk arrives, of the right
+    shape, computed from an observation the checkpoint never trained on. Naming the server at the
+    handshake is what turns that into something visible before the rollout starts.
+
+    A server that names itself is taken at its word. One that does not is described from what it
+    does advertise, and said to be a guess -- rather than shown a confident wrong name.
+    """
+    if not isinstance(meta, dict) or not meta:
+        return "unidentified server"
+
+    framework = str(meta.get("framework") or "").strip().lower()
+    name = next(
+        (str(meta[k]) for k in ("policy_name", "policy_type", "train_config", "policy") if meta.get(k)),
+        "",
+    )
+    name = name.rsplit(":", 1)[-1] if name else ""
+
+    if framework:
+        label = _FRAMEWORK_LABELS.get(framework, framework)
+        return f"{label} · {name}" if name else label
+
+    # Undeclared. `supports_multi_sample` is ACRFT's marker for the several-chunks-per-observation
+    # request, which upstream openpi has no notion of -- but a fork could add one, so this stays
+    # flagged as inferred rather than asserted.
+    guess = "ACRFT?" if meta.get("supports_multi_sample") else "openpi-compatible?"
+    return f"{guess} · {name}" if name else guess
 
 
 def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
@@ -59,7 +108,9 @@ def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
 
 
 class DeploymentPolicyRunner:
-    def __init__(self, cfg: BridgeConfig, recorder_cfg: RecorderConfig, images_fn: Callable[[], Dict[str, np.ndarray]]):
+    def __init__(
+        self, cfg: BridgeConfig, recorder_cfg: RecorderConfig, images_fn: Callable[[], Dict[str, np.ndarray]]
+    ):
         self.cfg = cfg
         self.recorder_cfg = recorder_cfg
         self.images_fn = images_fn
@@ -88,6 +139,8 @@ class DeploymentPolicyRunner:
             # Not "" -- an empty error next to a red dot reads as "no problem", when what it
             # really means is that nothing has been tried yet.
             "last_error": "connecting…",
+            # Which stack is answering (openpi / ACRFT / LeRobot), read off the handshake.
+            "policy_name": "",
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
@@ -131,13 +184,15 @@ class DeploymentPolicyRunner:
 
         for key, _was, now in transitions:
             link = "policy" if key == "policy_connected" else "robot"
-            host, port = ((self.cfg.policy_host, self.cfg.policy_port) if link == "policy"
-                          else (self.cfg.robot_host, self.cfg.robot_port))
+            host, port = (
+                (self.cfg.policy_host, self.cfg.policy_port)
+                if link == "policy"
+                else (self.cfg.robot_host, self.cfg.robot_port)
+            )
             if now:
                 logger.info("%s CONNECTED at %s:%s", link, host, port)
             else:
-                logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port,
-                               f" ({error})" if error else "")
+                logger.warning("%s DISCONNECTED from %s:%s%s", link, host, port, f" ({error})" if error else "")
 
     def _connect_robot(self) -> None:
         if self.recorder_cfg.mock or self._robot is not None:
@@ -192,8 +247,9 @@ class DeploymentPolicyRunner:
         image_keys = meta.get("image_keys", self.cfg.image_keys)
         self._extra_features = _extra_features_from_meta(meta)
         if self._extra_features:
-            logger.info("policy also returns per-step %s", ", ".join(
-                f"{k}{tuple(v)}" for k, v in self._extra_features.items()))
+            logger.info(
+                "policy also returns per-step %s", ", ".join(f"{k}{tuple(v)}" for k, v in self._extra_features.items())
+            )
         # No action_horizon here on purpose: the broker reads the chunk size off each
         # response, so a checkpoint's horizon can never disagree with a client setting.
         self._policy_client = client
@@ -201,10 +257,11 @@ class DeploymentPolicyRunner:
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,
+            policy_name=_describe_policy(meta),
             image_size=self._image_shape[0],
             image_shape=self._image_shape,
         )
-        logger.info("deploy policy metadata: %s", meta)
+        logger.info("deploy policy: %s | metadata: %s", _describe_policy(meta), meta)
         # The extra-feature declaration only exists now, and the dataset schema is fixed on the
         # first recorded frame -- so whoever owns the recorder is told here, not at construction.
         if self.on_connected is not None:
@@ -231,8 +288,12 @@ class DeploymentPolicyRunner:
             if array.size != int(np.prod(shape)):
                 if name not in self._extra_warned:
                     self._extra_warned.add(name)
-                    logger.warning("extra feature %r: expected %s values, got %d — not recorded",
-                                   name, int(np.prod(shape)), array.size)
+                    logger.warning(
+                        "extra feature %r: expected %s values, got %d — not recorded",
+                        name,
+                        int(np.prod(shape)),
+                        array.size,
+                    )
                 continue
             values[name] = array
         with self._lock:
@@ -299,7 +360,8 @@ class DeploymentPolicyRunner:
                 if "policy" in msg:
                     self._policy = None
                     self._policy_client = None
-                    self._set(policy_connected=False)
+                    # Drop the name too: a stale one next to a red dot reads as still-identified.
+                    self._set(policy_connected=False, policy_name="")
                 else:
                     self._robot = None
                     self._set(robot_connected=False)
@@ -344,9 +406,12 @@ class DeploymentPolicyRunner:
                 self._last_probe_error = reason
                 logger.warning(
                     "policy NOT CONNECTED at %s:%s (%s) — retrying every %.0fs",
-                    self.cfg.policy_host, self.cfg.policy_port, reason, self._PROBE_PERIOD_S,
+                    self.cfg.policy_host,
+                    self.cfg.policy_port,
+                    reason,
+                    self._PROBE_PERIOD_S,
                 )
-            self._set(policy_connected=False, last_error=reason)
+            self._set(policy_connected=False, policy_name="", last_error=reason)
 
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:
@@ -368,6 +433,18 @@ class DeploymentPolicyRunner:
             parts.append(vec)
         return np.concatenate(parts).astype(np.float32)
 
+    @staticmethod
+    def _fit(value: np.ndarray | None, dim: int) -> np.ndarray:
+        """Exactly ``dim`` values: zeros when the robot cannot report this at all (an arm with
+        no FK reports no eef), padded or truncated otherwise, so the column keeps its width."""
+        out = np.zeros(dim, dtype=np.float32)
+        if value is None:
+            return out
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+        n = min(dim, arr.size)
+        if n:
+            out[:n] = arr[:n]
+        return out
 
     def _build_obs(self, robot_obs: Dict, images: Dict[str, np.ndarray]) -> Dict:
         from yam_policy import image_tools
@@ -383,6 +460,16 @@ class DeploymentPolicyRunner:
             return {}
 
         obs = {"observation/state": state, "prompt": self.cfg.prompt}
+        # The rest of the dataset's non-image columns, under the names the dataset uses. openpi
+        # reads `observation/state` and ignores these; a LeRobot policy trained on data from this
+        # recorder may declare any of them as an input, because LeRobot's trainer takes every
+        # column it finds. Sending them costs 27 floats and is what makes such a checkpoint
+        # deployable without retraining.
+        obs["observation.leader"] = self._fit(self._fuse(sides, ("leader_pos",)), LEADER_DIM)
+        obs["observation.eef"] = self._fit(self._fuse(sides, ("eef",)), EEF_DIM)
+        # The policy is what is driving when this observation is used, so that is what is
+        # reported -- the recorder labels those frames the same way.
+        obs["observation.control_mode"] = np.array([CONTROL_MODE["policy"]], dtype=np.float32)
         # Only sent when actually wanted: a server that supports it does N forward passes for
         # N samples, and an unpatched one ignores an unknown key rather than failing.
         if self.cfg.num_samples > 1:

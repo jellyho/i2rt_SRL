@@ -50,7 +50,7 @@ cameras: { agentview: "<D455>", wrist_left: "<D405>", wrist_right: "<D405>" }
 ```bash
 # 🤖 robot
 robot/yam canup                       # bring up the 4 CAN interfaces (after each boot)
-robot/yam teleop --bilateral-kp 0.15
+robot/yam teleop
 # lift both gellos to engage; bring both home to stop & auto-return.
 ```
 
@@ -90,7 +90,7 @@ is selected automatically; set live-camera opacity to `100%` to hide the referen
 
 Then teleoperate — **lift both gellos** to start recording, **bring both home** to end the episode:
 
-- With `review_before_save: true` the episode is held for **Keep** / **Delete**. With `false` it **auto-saves** on each engage→idle.
+- `review_before_save` decides what happens next: `true` holds the episode for **Keep** / **Delete**, `false` (what `config.yaml` ships) **auto-saves** on each engage→idle.
 - **Leader handle buttons:** left upper toggles **fine-grained control** (2.5:1 with the checked-in `fine_grained_scale: 0.4`). When toggled off, recording and teleoperation pause while the follower holds and the leader safely realigns; left lower → **success**, right lower → **fail**, right upper → **discard** (force-home, no save).
 - Close the window when done (calls `finalize()` so the dataset is complete). Cameras run on their own capture thread, so the live view and saving never stall on a slow frame.
 
@@ -99,13 +99,31 @@ Then teleoperate — **lift both gellos** to start recording, **bring both home*
 ### C · Deployment / DAgger (policy + human takeover)
 
 ```bash
-robot/yam deploy --mirror-kp 0.2 --feedback-kp 0.0      # 🤖 robot
+robot/yam deploy                                         # 🤖 robot
 python -m yam_policy.serve                               # 🧠 policy host (:8000)
 workstation/yam-data deploy --repo-id user/yam_pick --prompt "pick up the cube"  # 💻 workstation UI
 # Left upper starts/stops rollout, or toggles fine control during intervention.
 # Other handle buttons toggle intervention and keep/discard + home.
 # Past demonstration overlay is inherited from the recorder UI and remains preview-only.
 ```
+
+**openpi and LeRobot checkpoints both deploy through the same client.** openpi's is the wire
+protocol; a LeRobot checkpoint runs through an adapter on our side, with no conversion step:
+
+```bash
+# 🧠 a LeRobot checkpoint (local dir or a Hub repo id)
+python -m yam_policy.serve \
+    --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
+    --config pretrained_path=outputs/train/my_act/checkpoints/last/pretrained_model \
+    --config device=cuda
+```
+
+The client configures itself from the handshake — camera names, image size, chunk length —
+and the deploy UI names what answered (`LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`), because
+all of these speak the same wire while reading different observations. See
+[`policy_serving/README.md`](policy_serving/README.md), which also covers the one thing to get
+right before training on this recorder's data: **drop `observation.leader`**, or the policy is
+handed the answer as an input.
 
 ### D · Replay a dataset onto the robot
 
@@ -313,7 +331,7 @@ takeovers ramp smoothly.
 | Subsystem | Path | What it is |
 |-----------|------|------------|
 | Robot serving (portal) | [`i2rt/serving/`](i2rt/serving/README.md) | teleop / DAgger / wrapper servers + `RobotClient`; snapshot contract; safety (e-stop, joint/effort limits, link-loss watchdog), EEF FK + safe resolved-rate OSC |
-| Policy serving (websocket) | [`policy_serving/`](policy_serving/README.md) | openpi-compatible `WebsocketPolicyServer`/`Client` + `serve.py` + policy templates |
+| Policy serving (websocket) | [`policy_serving/`](policy_serving/README.md) | openpi-compatible `WebsocketPolicyServer`/`Client` + `serve.py`; deploys **openpi and LeRobot checkpoints** through the same client |
 | Workstation tools | [`workstation/lerobot_recorder/`](workstation/lerobot_recorder/README.md) | LeRobot recorder (teleop/dagger/eval), replay+overlay, policy bridge; modern themed GUI with status banner, health, live stats, audio cues, success/fail/discard labeling |
 
 Quick CLIs (workstation): `workstation/yam-data {record\|replay\|bridge\|cams\|tune\|doctor}`.

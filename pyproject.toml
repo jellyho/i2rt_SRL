@@ -20,7 +20,11 @@ dependencies = [
     "python-can==4.5.0",
     "pyyaml>=6.0.0",
     "qpsolvers[quadprog]==4.7.1",
-    "ruckig==0.15.3",
+    # 0.15.3 ships no cp312 wheel, so it builds from source -- and scikit-build-core >= 0.10
+    # rejects its build config ("Use build.targets instead of cmake.targets"), which made a fresh
+    # `uv sync` impossible. 0.19.4 has wheels; the API this repo uses (Ruckig, InputParameter,
+    # OutputParameter, ControlInterface, Result, pass_to_input) is unchanged.
+    "ruckig>=0.19.4",
     "threadpoolctl==3.6.0",
     "tyro==0.9.26",
     "viser>=0.2.0",

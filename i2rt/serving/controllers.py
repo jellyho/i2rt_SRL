@@ -284,10 +284,14 @@ class TeleopController(BaseController):
         self._recenter_started = 0.0
         self._recenter_within_since: Optional[float] = None
         self.pairs = build_bimanual(
-            default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
-                                   leader_gripper=cfg.leader_gripper,
-                                   follower_gripper=cfg.follower_gripper),
-            sim=cfg.sim)
+            default_bimanual_specs(
+                cfg.sim,
+                arm_type=cfg.arm_type,
+                leader_gripper=cfg.leader_gripper,
+                follower_gripper=cfg.follower_gripper,
+            ),
+            sim=cfg.sim,
+        )
         self._ramp_step = max_step_from_speed(cfg.ramp_speed, cfg.rate)
         self._home_step = max_step_from_speed(cfg.home_speed, cfg.rate)
         self._gate_joints = [int(x) for x in cfg.gate_joints.split(",") if x.strip() != ""] if cfg.gate_joints else []
@@ -313,9 +317,7 @@ class TeleopController(BaseController):
         self._last_applied = {s: target.copy() for s, target in self._recenter_target.items()}
         recenter_step = max_step_from_speed(cfg.fine_recenter_speed, cfg.rate)
         self._recenter_smooth = {
-            s: TargetSmoother(
-                np.asarray(p.leader.get_joint_pos(), dtype=float)[:n_arm], recenter_step
-            )
+            s: TargetSmoother(np.asarray(p.leader.get_joint_pos(), dtype=float)[:n_arm], recenter_step)
             for s, p in self.pairs.items()
         }
 
@@ -410,7 +412,10 @@ class TeleopController(BaseController):
             target = self._recenter_target[side][: self.home_arm.size]
             leader = np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
             follower = np.asarray(pair.follower.get_joint_pos(), dtype=float)[: self.home_arm.size]
-            if max(float(np.max(np.abs(leader - target))), float(np.max(np.abs(follower - target)))) > self.cfg.fine_recenter_tolerance:
+            if (
+                max(float(np.max(np.abs(leader - target))), float(np.max(np.abs(follower - target))))
+                > self.cfg.fine_recenter_tolerance
+            ):
                 aligned = False
                 break
         if aligned:
@@ -422,9 +427,7 @@ class TeleopController(BaseController):
                 for side, mapper in self._fine_mapper.items():
                     mapper.reset()
                     mapper.map(
-                        np.asarray(self.pairs[side].leader.get_joint_pos(), dtype=float)[
-                            : self.home_arm.size
-                        ],
+                        np.asarray(self.pairs[side].leader.get_joint_pos(), dtype=float)[: self.home_arm.size],
                         self._recenter_target[side][: self.home_arm.size],
                         enabled=False,
                     )
@@ -701,8 +704,10 @@ class TeleopController(BaseController):
 class DeployConfig:
     sim: bool = False
     home: str = ""
-    mirror_kp: float = cc.DAGGER_MIRROR_KP
-    feedback_kp: float = cc.DAGGER_FEEDBACK_KP
+    # Whether the leader mirrors the policy at launch. There is no gain to set: mirroring
+    # drives the leader with its own nominal PD (see control_config). The workstation owns
+    # this per run mode and re-applies it on reconnect, so this is only the boot default.
+    leader_mirror: bool = True
     fine_grained_scale: float = cc.FINE_GRAINED_SCALE
     fine_grained_button: str = cc.FINE_GRAINED_BUTTON
     fine_recenter_speed: float = cc.FINE_RECENTER_SPEED
@@ -742,13 +747,12 @@ class DeployController(BaseController):
     def __init__(self, cfg: DeployConfig):
         self.cfg = cfg
         self.command_timeout = cfg.command_timeout
-        self.mirror_kp = cfg.mirror_kp
         # Whether the leader physically follows the policy while the policy drives.
         # Mirroring exists so a takeover starts from the follower's pose (grab the leader
         # and it is already where the arm is). With it off the leader just hangs free, so
         # the follower travels — rate-limited — to wherever the leader happens to be when
-        # intervention starts. Launch default comes from mirror_kp; togglable at runtime.
-        self._leader_mirror = cfg.mirror_kp > 0.0
+        # intervention starts. Boot default is cfg.leader_mirror; togglable at runtime.
+        self._leader_mirror = bool(cfg.leader_mirror)
         # Set while the followers close their grippers at the start of a rollout; the
         # policy does not drive until it clears (see set_policy_running).
         self._closing_grip = False
@@ -764,7 +768,9 @@ class DeployController(BaseController):
         # True once the homing travel is under way, so the closing phase that follows it
         # knows to go back to idle rather than hand control to the policy.
         self._closing_at_home = False
-        self.feedback_kp = cfg.feedback_kp
+        # A human holding the leader while the follower tracks is the same situation teleop
+        # calls "engaged", so it uses the same gain rather than a DAgger-only copy of it.
+        self.bilateral_kp = cc.BILATERAL_KP
         self.home_kp = cfg.home_kp
         self.fine_grained_button = str(cfg.fine_grained_button).lower()
         self._fine_grained = False
@@ -773,10 +779,14 @@ class DeployController(BaseController):
         self._recenter_started = 0.0
         self._recenter_within_since: Optional[float] = None
         self.pairs = build_bimanual(
-            default_bimanual_specs(cfg.sim, arm_type=cfg.arm_type,
-                                   leader_gripper=cfg.leader_gripper,
-                                   follower_gripper=cfg.follower_gripper),
-            sim=cfg.sim)
+            default_bimanual_specs(
+                cfg.sim,
+                arm_type=cfg.arm_type,
+                leader_gripper=cfg.leader_gripper,
+                follower_gripper=cfg.follower_gripper,
+            ),
+            sim=cfg.sim,
+        )
         self._run_step = max_step_from_speed(cfg.max_joint_speed, cfg.rate)
         self._home_step = max_step_from_speed(cfg.home_speed, cfg.rate)
 
@@ -816,9 +826,7 @@ class DeployController(BaseController):
         self._last_applied = {s: target.copy() for s, target in self._recenter_target.items()}
         recenter_step = max_step_from_speed(cfg.fine_recenter_speed, cfg.rate)
         self._recenter_smooth = {
-            s: TargetSmoother(
-                np.asarray(p.leader.get_joint_pos(), dtype=float)[:n_arm], recenter_step
-            )
+            s: TargetSmoother(np.asarray(p.leader.get_joint_pos(), dtype=float)[:n_arm], recenter_step)
             for s, p in self.pairs.items()
         }
         self._leader_smooth = {
@@ -842,11 +850,11 @@ class DeployController(BaseController):
         }
         self._metadata = {"mode": self.mode, "sides": list(self.pairs), "has_gripper": self._has_grip}
         logger.info(
-            "DaggerController up: sides=%s home_arm=%s mirror_kp=%s feedback_kp=%s max_joint_speed=%s sim=%s",
+            "DaggerController up: sides=%s home_arm=%s leader_mirror=%s bilateral_kp=%s max_joint_speed=%s sim=%s",
             list(self.pairs),
             np.round(self.home_arm, 2).tolist(),
-            cfg.mirror_kp,
-            cfg.feedback_kp,
+            cfg.leader_mirror,
+            self.bilateral_kp,
             cfg.max_joint_speed,
             cfg.sim,
         )
@@ -893,9 +901,7 @@ class DeployController(BaseController):
         # Handoff to policy mirroring starts from the physical leader pose, never
         # from a potentially distant target left by an offset intervention.
         for side, pair in self.pairs.items():
-            self._leader_smooth[side].reset(
-                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
-            )
+            self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size])
 
     def set_leader_mirror(self, flag: bool) -> None:
         """Turn leader mirroring on/off while the policy drives.
@@ -912,9 +918,7 @@ class DeployController(BaseController):
         # Re-seed the mirror limiter from the physical leader so re-enabling mid-rollout
         # ramps from where the leader actually is rather than a stale target.
         for side, pair in self.pairs.items():
-            self._leader_smooth[side].reset(
-                np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
-            )
+            self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size])
 
     def set_policy_running(self, flag: bool) -> None:
         if self._in_homing_sequence():
@@ -939,9 +943,7 @@ class DeployController(BaseController):
                 # stopped and the arm moved by hand — closing from a stale target would drag
                 # the arm there instead of only shutting the gripper.
                 for side, pair in self.pairs.items():
-                    self._smooth[side].reset(
-                        np.asarray(pair.follower.get_joint_pos(), dtype=float)
-                    )
+                    self._smooth[side].reset(np.asarray(pair.follower.get_joint_pos(), dtype=float))
                 logger.info("closing the gripper before starting the rollout")
         self._policy_running = driving
         if requested and not self._policy_running:
@@ -1014,9 +1016,7 @@ class DeployController(BaseController):
         for side, pair in self.pairs.items():
             self._smooth[side].reset(pair.follower.get_joint_pos())
             self._leader_smooth[side].reset(np.asarray(pair.leader.get_joint_pos())[: self.home_arm.size])
-            self._home_d0[side] = max(
-                float(np.linalg.norm(self._smooth[side].cur - self.home_full_released)), 1e-6
-            )
+            self._home_d0[side] = max(float(np.linalg.norm(self._smooth[side].cur - self.home_full_released)), 1e-6)
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":
@@ -1070,7 +1070,10 @@ class DeployController(BaseController):
             target = self._recenter_target[side][: self.home_arm.size]
             leader = np.asarray(pair.leader.get_joint_pos(), dtype=float)[: self.home_arm.size]
             follower = np.asarray(pair.follower.get_joint_pos(), dtype=float)[: self.home_arm.size]
-            if max(float(np.max(np.abs(leader - target))), float(np.max(np.abs(follower - target)))) > self.cfg.fine_recenter_tolerance:
+            if (
+                max(float(np.max(np.abs(leader - target))), float(np.max(np.abs(follower - target))))
+                > self.cfg.fine_recenter_tolerance
+            ):
                 aligned = False
                 break
         if aligned:
@@ -1082,9 +1085,7 @@ class DeployController(BaseController):
                 for side, mapper in self._fine_mapper.items():
                     mapper.reset()
                     mapper.map(
-                        np.asarray(self.pairs[side].leader.get_joint_pos(), dtype=float)[
-                            : self.home_arm.size
-                        ],
+                        np.asarray(self.pairs[side].leader.get_joint_pos(), dtype=float)[: self.home_arm.size],
                         self._recenter_target[side][: self.home_arm.size],
                         enabled=False,
                     )
@@ -1160,9 +1161,7 @@ class DeployController(BaseController):
             try:
                 self._effort_guard(pair.follower)
                 # override feel only while the human actually holds the leader
-                self._sync_leader_feel(
-                    pair, side, held=self._intervening and not self._leader_recentering
-                )
+                self._sync_leader_feel(pair, side, held=self._intervening and not self._leader_recentering)
                 desired = None
                 if self._releasing_grip:
                     # Hold the arm exactly where it is and move only the gripper, so the
@@ -1201,14 +1200,14 @@ class DeployController(BaseController):
                             self._fine_grained,
                         )
                         desired = human
-                        if self.feedback_kp > 0.0:
+                        if self.bilateral_kp > 0.0:
                             self._drive_leader(
                                 pair,
                                 np.asarray(pair.follower.get_joint_pos())[: pair.leader.num_dofs()],
-                                self.feedback_kp,
+                                self.bilateral_kp,
                             )
                         else:
-                            # feedback_kp=0: fully free leader — grav-comp idle with ZERO
+                            # bilateral_kp=0: fully free leader — grav-comp idle with ZERO
                             # damping (grav_comp_kd off), not a stale PD hold from mirroring.
                             self._free_leader(pair)
                 elif self._closing_grip:
@@ -1253,7 +1252,11 @@ class DeployController(BaseController):
                             mirror_target = leader_smoother.step(
                                 np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
                             )
-                            self._drive_leader(pair, mirror_target, self.mirror_kp, kd=self._mirror_kd)
+                            # Scale 1.0: the leader's own nominal kp, paired with the arm's
+                            # yam.yml kd. Leader and follower are the same arm, so this is the
+                            # follower's PD -- which is what makes the leader track the policy
+                            # the way the follower does instead of trailing a softer spring.
+                            self._drive_leader(pair, mirror_target, 1.0, kd=self._mirror_kd)
                         else:
                             # Mirroring off: hold the leader gravity-compensated and FREE.
                             # Explicitly freeing it matters — simply skipping the drive
@@ -1286,8 +1289,8 @@ class DeployController(BaseController):
                 # Jammed, or nothing to let go of. Homing still has to happen, so say what
                 # is about to travel rather than stranding the arm mid-workspace.
                 logger.warning(
-                    "gripper did not open within %.0fs — homing anyway, possibly still holding "
-                    "something", _GRIP_CLOSE_TIMEOUT,
+                    "gripper did not open within %.0fs — homing anyway, possibly still holding something",
+                    _GRIP_CLOSE_TIMEOUT,
                 )
                 self._begin_homing()
 
@@ -1382,8 +1385,9 @@ class DeployController(BaseController):
         except Exception:
             pass
 
-    def _drive_leader(self, pair: ArmPair, target_q: np.ndarray, kp_scale: float,
-                      kd: Optional[np.ndarray] = None) -> None:
+    def _drive_leader(
+        self, pair: ArmPair, target_q: np.ndarray, kp_scale: float, kd: Optional[np.ndarray] = None
+    ) -> None:
         leader = pair.leader
         if kp_scale <= 0.0 or not hasattr(leader, "update_kp_kd") or pair.base_kp is None:
             return

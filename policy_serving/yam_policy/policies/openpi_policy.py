@@ -28,6 +28,12 @@ class OpenPiPolicy(BasePolicy):
 
         cfg = openpi_config.get_config(config_name)
         self._policy = policy_config.create_trained_policy(cfg, checkpoint_dir)
+        #: Merged into the handshake by serve.py, so deploy names what it connected to.
+        self.policy_info = {
+            "framework": "openpi",
+            "policy_name": config_name,
+            "checkpoint": str(checkpoint_dir),
+        }
 
     def infer(self, obs: Dict) -> Dict:
         # openpi policies already return {"actions": (horizon, dim), ...}.

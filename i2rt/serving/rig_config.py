@@ -51,8 +51,6 @@ _CONTROL_MAP = {
     "leader_gravity_comp_factor": "LEADER_GRAVITY_COMP_FACTOR",
     "leader_grav_comp_kd": "LEADER_GRAV_COMP_KD",
     "leader_coulomb_friction": "LEADER_COULOMB_FRICTION",
-    "dagger_mirror_kp": "DAGGER_MIRROR_KP",
-    "dagger_feedback_kp": "DAGGER_FEEDBACK_KP",
     "follower_joint_limits": "FOLLOWER_JOINT_LIMITS",
     "follower_effort_limit": "FOLLOWER_EFFORT_LIMIT",
     "follower_payload_kg": "FOLLOWER_PAYLOAD_KG",
@@ -108,9 +106,7 @@ def apply_control_overrides(rig: Dict[str, Any]) -> Dict[str, Any]:
     applied: Dict[str, Any] = {}
     for key, value in section.items():
         if key == "home_buttons":
-            raise ValueError(
-                "control.home_buttons was removed; teleop homing is derived from recorder.buttons"
-            )
+            raise ValueError("control.home_buttons was removed; teleop homing is derived from recorder.buttons")
         attr = _CONTROL_MAP.get(key)
         if attr is None:
             continue
@@ -148,8 +144,7 @@ def teleop_button_outcomes(rig: Dict[str, Any]) -> Dict[str, str]:
             raise ValueError(f"invalid recorder button key {raw_key!r}; expected left/right and a non-negative index")
         if outcome not in _TELEOP_OUTCOMES:
             raise ValueError(
-                f"invalid outcome {raw_outcome!r} for recorder button {raw_key!r}; "
-                "expected success, fail, or discard"
+                f"invalid outcome {raw_outcome!r} for recorder button {raw_key!r}; expected success, fail, or discard"
             )
         if key in resolved:
             raise ValueError(f"duplicate recorder button after normalization: {raw_key!r}")
@@ -193,9 +188,7 @@ def apply_camera_serials(cameras: List[Any], rig: Dict[str, Any]) -> List[Any]:
                 value = entry[name]
                 # bool is an int subclass — `fps: true` is a config error, not 1 fps.
                 if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                    raise ValueError(
-                        f"camera {cam.key!r}: {name!r} must be a positive integer, got {value!r}"
-                    )
+                    raise ValueError(f"camera {cam.key!r}: {name!r} must be a positive integer, got {value!r}")
                 setattr(cam, name, value)
             options = entry.get("options") or {}
             if not isinstance(options, dict):
@@ -207,9 +200,7 @@ def apply_camera_serials(cameras: List[Any], rig: Dict[str, Any]) -> List[Any]:
                 elif isinstance(value, (int, float)):
                     value = float(value)
                 else:
-                    raise ValueError(
-                        f"camera {cam.key!r}: option {name!r} must be a number or boolean, got {value!r}"
-                    )
+                    raise ValueError(f"camera {cam.key!r}: option {name!r} must be a number or boolean, got {value!r}")
                 resolved[str(name)] = value
             cam.options = resolved
         elif entry:

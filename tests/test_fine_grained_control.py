@@ -214,9 +214,7 @@ def test_teleop_homing_is_derived_from_outcome_mapping(monkeypatch):
         "read_handle",
         lambda _leader: (leader.pos.copy(), 0.0, list(current["buttons"])),
     )
-    ctrl = ctl.TeleopController(
-        ctl.TeleopConfig(button_outcomes={"left.2": "success"}, ramp_speed=100.0)
-    )
+    ctrl = ctl.TeleopController(ctl.TeleopConfig(button_outcomes={"left.2": "success"}, ramp_speed=100.0))
     ctrl.set_sim_engage(True)
     ctrl.step()
 
@@ -253,9 +251,7 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
         "read_handle",
         lambda _leader: (leader.pos.copy(), 0.0, list(current["buttons"])),
     )
-    ctrl = ctl.DaggerController(
-        ctl.DaggerConfig(feedback_kp=0.0, fine_grained_scale=0.2, max_joint_speed=1.2, rate=120.0)
-    )
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(fine_grained_scale=0.2, max_joint_speed=1.2, rate=120.0))
 
     # Outside intervention left.0 retains rollout-toggle behavior.
     current["buttons"] = [1, 0]

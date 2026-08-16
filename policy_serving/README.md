@@ -9,6 +9,12 @@ The wire protocol is **identical to openpi** (`openpi_client`), so a real openpi
 checkpoint served by `openpi` works against our client, and a policy written
 against `BasePolicy` can be served by openpi.
 
+**openpi and LeRobot checkpoints both deploy here**, through the same client and the same wire.
+openpi's is the protocol; LeRobot's models arrive through an adapter on this side
+([`policies/lerobot_policy.py`](yam_policy/policies/lerobot_policy.py)) that mirrors LeRobot's own
+inference path — see [Deploying a LeRobot checkpoint](#deploying-a-lerobot-checkpoint). Neither
+upstream is modified or vendored.
+
 ```
 workstation (policy bridge)              policy server (this package)
   WebsocketClientPolicy  ──ws+msgpack──▶  WebsocketPolicyServer(policy)
@@ -42,16 +48,101 @@ uv pip install -e .          # + your model deps, e.g. uv pip install -e /path/t
 # zero-model smoke test (returns a "hold pose" chunk):
 python -m yam_policy.serve
 
-# a real LeRobot policy (template — adapt policies/lerobot_policy.py):
+# a LeRobot checkpoint (see "Deploying a LeRobot checkpoint" below):
 python -m yam_policy.serve \
     --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
-    --config pretrained_path=/abs/path --config device=cuda
+    --config pretrained_path=outputs/train/my_act/checkpoints/last/pretrained_model \
+    --config device=cuda
 
 # a real openpi checkpoint (template — needs openpi installed here):
 python -m yam_policy.serve \
     --policy yam_policy.policies.openpi_policy:OpenPiPolicy \
     --config config_name=pi0_fast_droid --config checkpoint_dir=/abs/ckpt
 ```
+
+## Deploying a LeRobot checkpoint
+
+Train with LeRobot, point the server at the checkpoint, run deploy. There is no conversion step
+and nothing to hand-match on the client.
+
+```bash
+# in the policy-server env
+uv pip install -e "policy_serving[lerobot]"
+
+python -m yam_policy.serve \
+    --policy yam_policy.policies.lerobot_policy:LeRobotPolicy \
+    --config pretrained_path=outputs/train/my_act/checkpoints/last/pretrained_model \
+    --config device=cuda
+```
+
+`pretrained_path` takes a local checkpoint directory or a Hub repo id. Then start deploy as
+usual — the client reads the camera names, image size and chunk length off the handshake.
+
+**Why the cameras line up on their own.** This recorder writes `observation.images.<role>` for
+each of its cameras (`wrist_left`, `wrist_right`, `agentview`), so a policy trained on its data
+already names its image features after them. The adapter hands those names back as `image_keys`
+and the client sends each camera to the key the checkpoint reads. A checkpoint trained elsewhere
+needs one line:
+
+```bash
+--config camera_map=agentview=observation.images.top,wrist_left=observation.images.wrist
+```
+
+A `camera_map` naming an image the policy does not have fails at startup, where it is a typo,
+rather than at the first rollout, where it is a robot.
+
+**Both key conventions are accepted.** openpi checkpoints read `observation/state`, LeRobot ones
+read `observation.state`, and the client sends both — the dotted one wins, because they are
+different vectors (openpi's 14 joint targets vs. this stack's 42-value record) that would
+otherwise collapse onto the same name.
+
+**A missing camera is refused, not zero-filled.** Deploy reports the error and holds, instead of
+driving from a black frame and reporting nothing wrong.
+
+**What is served is the whole predicted chunk** (`chunk_size`), not the `n_action_steps` a
+closed-loop LeRobot rollout consumes before replanning — this stack replans on its own schedule.
+Use `--config actions_per_chunk=N` to serve less.
+
+### Before training: drop `observation.leader`
+
+**LeRobot's trainer takes every column in the dataset as a policy input**, and this recorder
+writes more columns than a policy should see. On a teleop dataset the leader pose *is* the action
+— measured at **2e-4 rad** apart on `yam_cable_tie_v4` — so a policy handed `observation.leader`
+can copy the answer straight out of its input. Training loss looks excellent for exactly that
+reason, and the checkpoint is useless at deploy, where the leader is either hanging free or
+mirroring the follower. `observation.control_mode` is worth dropping too: it is constant within a
+teleop dataset, so it teaches nothing.
+
+Name the inputs you want in the training config. The dataset is not touched — LeRobot only infers
+features when `input_features` is empty (LeRobot's own `policies/factory.py`:
+`if not cfg.input_features`), so setting it wins:
+
+```bash
+lerobot-train ... --tolerance_s=1e-3 \
+    --policy.input_features='{
+        "observation.state":               {"type": "STATE",  "shape": [42]},
+        "observation.images.wrist_left":   {"type": "VISUAL", "shape": [3, 480, 640]},
+        "observation.images.wrist_right":  {"type": "VISUAL", "shape": [3, 480, 640]},
+        "observation.images.agentview":    {"type": "VISUAL", "shape": [3, 480, 640]}}'
+```
+
+List every input you *do* want — this replaces the inferred set rather than subtracting from it.
+`output_features` is always derived from the dataset, so `action` needs no mention. Add
+`observation.eef` if you want it; it is a real signal and available at deploy.
+
+The server warns at load if a checkpoint reads a leaking column, since nothing later can: such a
+policy trains beautifully and simply behaves badly on the robot. The deploy client does send all
+of these columns, so an already-trained checkpoint still runs — it just runs with a leader signal
+that no longer means what it meant during collection.
+
+The inference path deliberately mirrors LeRobot's own `async_inference.policy_server`, whose two
+easy mistakes are silent: the pre/post processors need an explicit device override or the batch
+stays on the CPU while the model sits on the GPU, and the postprocessor unnormalises one
+`(B, action_dim)` step at a time — handing it a whole chunk does not raise, it just unnormalises
+against the wrong axis. `tests/test_lerobot_policy.py` builds a real ACT checkpoint and checks the
+actions against the known stats for exactly that reason.
+
+Nothing in LeRobot is modified or vendored; the adapter is one file on this side.
 
 ## Add your own policy
 
@@ -84,6 +175,28 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from
   `get_server_metadata()` — no need to hand-match the bridge to the policy.
+
+## Which server answered
+
+Deploy shows what is behind the policy port — `LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`,
+`openpi · pi0_fast_droid` — next to the connection dot.
+
+This is worth a field of its own because the failure it catches is invisible otherwise. All three
+stacks speak this wire, none of them reads the others' observations, and every one of them answers
+a mismatched observation with a well-formed chunk of the right shape. Nothing raises; the robot
+just moves wrongly. Naming the server at the handshake moves that from a rollout symptom to
+something readable before starting.
+
+A policy declares it by exposing `policy_info`, which `serve.py` merges into the metadata:
+
+```python
+self.policy_info = {"framework": "lerobot", "policy_type": "act", "checkpoint": path}
+```
+
+`framework` is the only key that matters; `policy_name` / `policy_type` fill in the second half of
+the label. A server that declares nothing is described from what it does advertise and shown with
+a trailing `?` — an inferred name is marked as inferred rather than asserted, because a confident
+wrong one is worse than none.
 
 ## Extra per-step data (`extra_features`)
 

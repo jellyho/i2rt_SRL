@@ -28,8 +28,8 @@ DEPLOYMENT
 ```bash
 source .venv/bin/activate        # robot env (uv; see robot/setup_robot_env.sh)
 
-robot/yam teleop  --bilateral-kp 0.15     # auto home/engage bimanual teleop
-robot/yam deploy  --mirror-kp 0.2         # a policy drives the followers, button = takeover
+robot/yam teleop                          # auto home/engage bimanual teleop
+robot/yam deploy                          # a policy drives the followers, button = takeover
 robot/yam wrapper                          # followers track an external command (replay)
 robot/yam teleop  --sim                    # no hardware
 ```

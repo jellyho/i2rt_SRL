@@ -42,7 +42,7 @@ workstation/yam-data cams              # list RealSense serials
 
 ```bash
 # [robot]
-robot/yam teleop --bilateral-kp 0.0
+robot/yam teleop
 # [ws]
 python -c "from i2rt.serving.robot_client import RobotClient; c=RobotClient(host='<ROBOT_IP>'); print(c.metadata); print(sorted(c.get_observation()))"
 ```
@@ -51,22 +51,26 @@ python -c "from i2rt.serving.robot_client import RobotClient; c=RobotClient(host
 ## 3. Teleop gate (auto engage/home)
 
 ```bash
-# [robot]  robot/yam teleop --bilateral-kp 0.0
+# [robot]  robot/yam teleop
 ```
 - [ ] Lift both leaders → state goes **ENGAGED**, followers track.
 - [ ] Return leaders home → **HOMING → IDLE**, robot eases home.
 
-## 4. Bilateral engage — leader stays put
+## 4. Engage — leader stays put
 
 ```bash
-# [robot]  robot/yam teleop --bilateral-kp 0.15
+# [robot]  robot/yam teleop
 ```
-- [ ] With followers at home and **leaders lifted**, press engage: the **leader is NOT yanked toward home**. Leader stays free until the follower catches up, then you feel bilateral force.
+- [ ] With followers at home and **leaders lifted**, press engage: the **leader is NOT yanked toward home**. It stays free until the follower catches up.
+
+> Bilateral force feedback is **off by default** (`BILATERAL_KP = 0.0` in
+> `i2rt/serving/control_config.py`) and is not used for collection. To feel it, pass
+> `--bilateral-kp 0.15` explicitly; the leader then back-drives once the follower has caught up.
 
 ## 5. Gentle homing speed
 
 ```bash
-# [robot]  robot/yam teleop --bilateral-kp 0.15 --home-speed 0.4
+# [robot]  robot/yam teleop --home-speed 0.4
 ```
 - [ ] Homing return is smooth/slow (raise/lower `--home-speed` to taste; engage approach uses `--ramp-speed 0.8`).
 
@@ -84,7 +88,7 @@ python -c "from i2rt.serving.robot_client import RobotClient; c=RobotClient(host
 ## 7. Data collection (recorder)
 
 ```bash
-# [robot]  robot/yam teleop --bilateral-kp 0.15
+# [robot]  robot/yam teleop
 # [ws]
 workstation/yam-data record --robot-host <ROBOT_IP> \
     --repo-id user/yam_pick --root ~/lerobot_data \
@@ -132,7 +136,7 @@ python -c "from i2rt.serving.robot_client import RobotClient; import numpy as np
 ```bash
 # [policy]  smoke test with the zero-model "hold" policy:
 python -m yam_policy.serve            # :8000
-# [robot]  robot/yam deploy --mirror-kp 0.2
+# [robot]  robot/yam deploy
 # [ws]
 workstation/yam-data deploy --headless --robot-host <ROBOT_IP> --policy-host <POLICY_IP> \
     --serials <wl>,<wr>,<agent> --prompt "do the task"
@@ -144,7 +148,7 @@ workstation/yam-data deploy --headless --robot-host <ROBOT_IP> --policy-host <PO
 ## 11. HG-DAgger collection
 
 ```bash
-# [robot]  robot/yam deploy --mirror-kp 0.2   (+ policy server + bridge as above)
+# [robot]  robot/yam deploy   (+ policy server + bridge as above)
 # [ws]
 workstation/yam-data record --source dagger --robot-host <ROBOT_IP> \
     --repo-id user/yam_dagger --serials <wl>,<wr>,<agent>
