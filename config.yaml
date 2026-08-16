@@ -102,6 +102,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       gain: 16
       enable_auto_white_balance: 0
       white_balance: 4600
+      
 recorder:
   repo_id: jellyho/close_bottle_cap
   root: ~/lerobot_data
@@ -154,3 +155,20 @@ tasks:                       # quick-switch language instructions in the recorde
   - "assemble lego blocks to make red firetruck"
   - "assemble lego blocks to make green dumptruck"
   - "Insert the USB-C plug into the USB-C port."
+
+calibration:                 # `workstation/yam-data calibrate` (wrist extrinsics + agentview + arm offset)
+  # The ChArUco board used for calibration. `calibrate` auto-loads these and writes them back
+  # (plus a `calibrated_at:` stamp) after each run, so this is where the geometry lives.
+  # MUST match the PRINTED board -- measure the squares with a ruler; don't trust the printer's
+  # fit-to-page scale. `--squares-x/-y --square-length-m --marker-length-m --dictionary` override
+  # per run. lengths are edge-to-edge in METRES.
+  board:
+    squares_x: 8
+    squares_y: 6
+    square_length_m: 0.030
+    marker_length_m: 0.022
+    dictionary: DICT_4X4_50   # any cv2.aruco predefined dict, e.g. DICT_4X4_50 / DICT_5X5_100
+  # calibrate writes its results elsewhere, next to what they belong to (not here):
+  #   cameras.wrist_left/right.extrinsic   gripper_T_camera (hand-eye; overrides the CAD default)
+  #   cameras.agentview.extrinsic.left/right/.unified   agentview pose (use `unified`)
+  #   robot.arm_offset                     left_T_right (the two arms' frames + distance)
