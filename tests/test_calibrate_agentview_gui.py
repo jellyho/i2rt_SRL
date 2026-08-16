@@ -45,7 +45,7 @@ def window(qapp):
         object(),  # non-None "robot" -- only _check_capture_button's obs dict matters here
         {"left": _FakeGeometry(), "right": _FakeGeometry()},
         board=BoardSpec(),
-        out_path="/tmp/test_calibrate_agentview.json",
+        config_path=None,  # per-test fixtures set this explicitly where the save path matters
         mock=False,  # False so the button path is actually exercised (True short-circuits it)
     )
     det = Detection(cam_t_board=np.eye(4), n_corners=10, reproj_error_px=0.2, corners_px=np.zeros((10, 2)))
@@ -146,3 +146,86 @@ def test_still_dropping_history_does_not_falsely_claim_convergence():
 def test_the_trend_string_shows_the_actual_numbers_in_order():
     history = [(2, 10.0, 0.0), (3, 5.5, 0.0)]
     assert "10.0 -> 5.5" in _convergence_note(history)
+
+
+# --------------------------------------------------------------------------------------- #
+# _on_save: writes into config.yaml, not a separate file (see the module docstring)
+# --------------------------------------------------------------------------------------- #
+_CONFIG_YAML = """\
+robot:
+  host: 192.168.0.42
+
+cameras:
+  agentview:
+    serial: "246322303794"
+    fps: 30
+  wrist_left: "352122271652"
+  wrist_right: "409122274199"
+"""
+
+
+@pytest.fixture
+def config_file(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(_CONFIG_YAML)
+    return path
+
+
+def _confirm_yes(monkeypatch):
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", staticmethod(lambda *a, **k: QtWidgets.QMessageBox.Yes))
+
+
+def _confirm_no(monkeypatch):
+    monkeypatch.setattr(QtWidgets.QMessageBox, "question", staticmethod(lambda *a, **k: QtWidgets.QMessageBox.No))
+
+
+def _solved_window(window, config_path) -> None:
+    """Drive two captures per arm through the real solve path, so _last_results/_last_arm_offset
+    are populated the same way an operator's session would leave them."""
+    window.config_path = str(config_path) if config_path is not None else None
+    for _ in range(2):
+        window._on_capture()
+
+
+def test_save_writes_into_config_yaml_not_a_separate_file(window, config_file, monkeypatch):
+    _confirm_yes(monkeypatch)
+    _solved_window(window, config_file)
+    window._on_save()
+
+    written = config_file.read_text()
+    assert "extrinsic:" in written
+    assert "left:" in written and "right:" in written
+    # nothing else invented alongside it
+    assert not list(config_file.parent.glob("*.json"))
+
+
+def test_save_keeps_a_backup_of_the_original_file(window, config_file, monkeypatch):
+    _confirm_yes(monkeypatch)
+    _solved_window(window, config_file)
+    window._on_save()
+
+    backup = config_file.parent / (config_file.name + ".bak")
+    assert backup.read_text() == _CONFIG_YAML  # the untouched original, before any splice
+
+
+def test_save_leaves_the_file_alone_without_confirmation(window, config_file, monkeypatch):
+    _confirm_no(monkeypatch)
+    _solved_window(window, config_file)
+    window._on_save()
+    assert config_file.read_text() == _CONFIG_YAML
+    assert not (config_file.parent / (config_file.name + ".bak")).exists()
+
+
+def test_save_with_no_config_path_shows_an_error_not_a_crash(window, monkeypatch):
+    shown = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "critical", staticmethod(lambda *a, **k: shown.append(a)))
+    _solved_window(window, None)
+    window._on_save()  # must not raise
+    assert shown  # the "no config.yaml" dialog fired
+
+
+def test_save_button_disabled_until_something_has_solved(window):
+    assert window.save_btn.isEnabled() is False
+    window._on_capture()
+    window._on_capture()
+    assert window.save_btn.isEnabled() is True

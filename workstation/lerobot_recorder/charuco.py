@@ -402,3 +402,149 @@ def unify_rig_calibration(
         cross_check_translation_mm=cross_t,
         cross_check_rotation_deg=cross_r,
     )
+
+
+# --------------------------------------------------------------------------------------- #
+# Writing results into config.yaml -- THE single source of truth for the rig (see its own
+# header comment). Same technique as workstation/lerobot_recorder/exposure_tuner.py's
+# splice_camera_options: a line-range splice, not a yaml.safe_load/dump round trip, because
+# config.yaml is heavily commented and a round trip would strip every comment and reflow the
+# whole document. Only the target block is touched; everything else survives byte for byte.
+# --------------------------------------------------------------------------------------- #
+def _format_matrix_yaml(matrix: np.ndarray, indent: int) -> List[str]:
+    pad = " " * indent
+    return [f"{pad}- [{', '.join(f'{v:.6f}' for v in row)}]" for row in matrix]
+
+
+def format_extrinsic_yaml(result: CalibrationResult, *, calibrated_at: str, indent: int = 8) -> List[str]:
+    """The body of one arm's ``extrinsic`` entry -- ready to splice under
+    ``cameras.agentview.extrinsic.<arm>`` (see ``splice_agentview_extrinsic``)."""
+    pad = " " * indent
+    return [
+        f"{pad}matrix:",
+        *_format_matrix_yaml(result.base_t_agentview, indent + 2),
+        f"{pad}n_captures: {result.n_captures}",
+        f"{pad}translation_rms_mm: {result.translation_rms_mm:.3f}",
+        f"{pad}rotation_rms_deg: {result.rotation_rms_deg:.4f}",
+        f'{pad}calibrated_at: "{calibrated_at}"',
+    ]
+
+
+def format_arm_offset_yaml(result: ArmOffsetResult, *, calibrated_at: str, indent: int = 4) -> List[str]:
+    """The body of the ``robot.arm_offset`` entry (see ``splice_arm_offset``)."""
+    pad = " " * indent
+    return [
+        f"{pad}matrix:",
+        *_format_matrix_yaml(result.left_t_right, indent + 2),
+        f"{pad}distance_m: {result.distance_m:.4f}",
+        f"{pad}n_captures: {result.n_captures}",
+        f"{pad}translation_rms_mm: {result.translation_rms_mm:.3f}",
+        f"{pad}rotation_rms_deg: {result.rotation_rms_deg:.4f}",
+        f'{pad}calibrated_at: "{calibrated_at}"',
+    ]
+
+
+def _locate_block(lines: List[str], search: range, key: str) -> Optional[tuple]:
+    """``(key_line, key_indent, block_end)`` for a ``"<key>:"`` line found within ``search``, or
+    None. ``block_end`` is the line the key's (more-indented) body runs up to -- the same
+    "next line at or below this indent" rule ``exposure_tuner.splice_camera_options`` uses,
+    with blank lines inside the body absorbed rather than treated as the end of it.
+    """
+    key_line = next((i for i in search if lines[i].strip().startswith(f"{key}:")), None)
+    if key_line is None:
+        return None
+    key_indent = len(lines[key_line]) - len(lines[key_line].lstrip())
+    block_end = key_line + 1
+    for i in range(key_line + 1, search.stop):
+        ln = lines[i]
+        if not ln.strip():
+            block_end = i + 1
+            continue
+        if len(ln) - len(ln.lstrip()) <= key_indent:
+            break
+        block_end = i + 1
+    return key_line, key_indent, block_end
+
+
+def _locate_path(lines: List[str], parents: Sequence[str]) -> tuple:
+    """Walk ``parents`` (each must already exist) and return the LAST one's
+    ``(indent, block_end, search_range_for_its_children)``. Raises ``ValueError`` naming
+    whichever segment could not be found, rather than guessing where to invent it."""
+    search = range(0, len(lines))
+    indent, block_end = -2, len(lines)  # indent=-2 so a top-level child comes out at indent 0
+    for name in parents:
+        found = _locate_block(lines, search, name)
+        if found is None:
+            raise ValueError(f"no '{name}:' section found in config.yaml")
+        key_line, indent, block_end = found
+        search = range(key_line + 1, block_end)
+    return indent, block_end, search
+
+
+def _ensure_section(text: str, parents: Sequence[str], key: str, *, comment: str = "") -> str:
+    """Make sure ``<parents...>.<key>:`` exists as a bare (possibly empty) mapping, so a LEAF
+    under it can be spliced in afterwards without first wiping out a sibling already saved
+    there (e.g. adding the right arm's extrinsic must not erase the left arm's). No-op if it
+    already exists -- never resets an existing section back to empty, and never re-adds
+    ``comment`` on top of whatever the section already carries.
+
+    ``comment`` is config.yaml's own convention (every existing field is documented inline) --
+    written once, only at the moment this key is first created, since that is the only point a
+    brand new field genuinely needs an explanation next to it.
+    """
+    lines = text.splitlines()
+    parent_indent, parent_block_end, search = _locate_path(lines, parents)
+    if _locate_block(lines, search, key) is not None:
+        return text
+    header = f"{' ' * (parent_indent + 2)}{key}:"
+    if comment:
+        header += f"  # {comment}"
+    out = lines[:parent_block_end] + [header] + lines[parent_block_end:]
+    result = "\n".join(out)
+    return result + "\n" if text.endswith("\n") and not result.endswith("\n") else result
+
+
+def _splice_leaf(text: str, parents: Sequence[str], key: str, block_lines: Sequence[str], *, comment: str = "") -> str:
+    """Insert or REPLACE ``<parents...>.<key>:``'s own block. Every entry in ``parents`` must
+    already exist (see ``_ensure_section`` to create an intermediate one first); ``key`` itself
+    is replaced if present, or appended at the end of its parent's block if not. ``comment`` is
+    rewritten on every call (unlike ``_ensure_section``'s once-only version) since a leaf that is
+    replaced wholesale each time has no "already explained" state to preserve.
+    """
+    lines = text.splitlines()
+    parent_indent, parent_block_end, search = _locate_path(lines, parents)
+    header = f"{' ' * (parent_indent + 2)}{key}:"
+    if comment:
+        header += f"  # {comment}"
+    replacement = [header, *block_lines]
+    found = _locate_block(lines, search, key)
+    if found is not None:
+        key_line, _indent, block_end = found
+        out = lines[:key_line] + replacement + lines[block_end:]
+    else:
+        out = lines[:parent_block_end] + replacement + lines[parent_block_end:]
+    result = "\n".join(out)
+    return result + "\n" if text.endswith("\n") and not result.endswith("\n") else result
+
+
+def splice_agentview_extrinsic(text: str, arm: str, result: CalibrationResult, *, calibrated_at: str) -> str:
+    """Insert/replace ``cameras.agentview.extrinsic.<arm>`` in a config.yaml (text in, text
+    out). The OTHER arm's entry, if one was saved previously, and everything else in the file
+    -- comments included -- survive untouched."""
+    text = _ensure_section(
+        text,
+        ("cameras", "agentview"),
+        "extrinsic",
+        comment="base_T_agentview per arm's own FK frame (no shared robot-base frame -- see "
+        "workstation/yam-data calibrate-agentview)",
+    )
+    block = format_extrinsic_yaml(result, calibrated_at=calibrated_at, indent=8)
+    return _splice_leaf(text, ("cameras", "agentview", "extrinsic"), arm, block)
+
+
+def splice_arm_offset(text: str, result: ArmOffsetResult, *, calibrated_at: str) -> str:
+    """Insert/replace the top-level ``robot.arm_offset`` block in a config.yaml."""
+    block = format_arm_offset_yaml(result, calibrated_at=calibrated_at, indent=4)
+    return _splice_leaf(
+        text, ("robot",), "arm_offset", block, comment="left_T_right -- see workstation/yam-data calibrate-agentview"
+    )

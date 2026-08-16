@@ -39,13 +39,17 @@ end-to-end confidence number on all three calibrations at once (see
 ``charuco.unify_rig_calibration``). "Solve" (the button) forces an immediate re-run and, if
 nothing has been captured yet, is the one that actually complains about it.
 
-"Save" writes everything available -- per-arm extrinsics, the arm offset, the fused/cross-checked
-answer -- to one JSON file another tool can load.
+"Save" writes into ``config.yaml`` -- THE single source of truth for the rig (camera serials,
+robot host, button map, ... all already live there; see its own header comment). A confirmation
+dialog names the file first, a ``.bak`` copy is kept before writing, and only the touched blocks
+change -- ``cameras.agentview.extrinsic.<arm>`` per arm, ``robot.arm_offset`` if solved -- via a
+line-range splice (see ``charuco.splice_agentview_extrinsic``/``splice_arm_offset``), not a
+YAML load/dump round trip: config.yaml is heavily commented and a round trip would strip every
+comment and reflow the whole document.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
@@ -57,12 +61,16 @@ from i2rt.serving.teleop_common import handle_button_pressed
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.charuco import (
+    ArmOffsetResult,
     ArmPairCapture,
     BoardSpec,
+    CalibrationResult,
     Capture,
     detect_board_pose,
     solve_agentview_extrinsic_per_arm,
     solve_arm_offset,
+    splice_agentview_extrinsic,
+    splice_arm_offset,
     unify_rig_calibration,
 )
 from workstation.lerobot_recorder.config import RecorderConfig
@@ -125,7 +133,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         geometries: Dict[str, object],  # {"left": WristCameraGeometry, "right": WristCameraGeometry}
         *,
         board: BoardSpec,
-        out_path: str,
+        config_path: Optional[str],
         mock: bool = False,
         capture_buttons: Sequence[str] = ("left.1", "right.1"),
     ) -> None:
@@ -136,7 +144,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.geometries = geometries
         self.arms = list(geometries.keys())  # e.g. ["left", "right"]
         self.board = board
-        self.out_path = out_path
+        self.config_path = config_path  # None = no config.yaml found; Save will say so
         self.mock = mock
         # "<side>.<index>" leader-handle buttons (upper=0, lower=1 -- same convention as
         # config.py's button_map / DEFAULT_TELEOP_BUTTON_OUTCOMES), any ONE of which capturing:
@@ -221,7 +229,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.result_label.setWordWrap(True)
         root.addWidget(self.result_label)
 
-        self._result_json: Optional[dict] = None
+        # What the last successful _solve_and_report found -- what _on_save actually writes.
+        self._last_results: Dict[str, CalibrationResult] = {}
+        self._last_arm_offset: Optional[ArmOffsetResult] = None
 
     # ------------------------------------------------------------------ loop
     def _tick(self) -> None:
@@ -395,7 +405,6 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         results = solve_agentview_extrinsic_per_arm(self.captures)
 
         lines = []
-        per_arm_json = {}
         for arm, result in results.items():
             self._record(self._history[arm], result.n_captures, result.translation_rms_mm, result.rotation_rms_deg)
             quality = (
@@ -406,17 +415,6 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
                 f"rotation RMS {result.rotation_rms_deg:.3f} deg  -- {quality}  "
                 f"{_convergence_note(self._history[arm])}"
             )
-            per_arm_json[arm] = {
-                # This extrinsic is expressed in `arm`'s own FK frame -- NOT interchangeable
-                # with the other arm's entry, and not a robot-wide "base" frame. See
-                # charuco.py's module docstring.
-                "base_t_agentview": result.base_t_agentview.tolist(),
-                "n_captures": result.n_captures,
-                "translation_rms_mm": result.translation_rms_mm,
-                "rotation_rms_deg": result.rotation_rms_deg,
-                "per_capture_translation_mm": result.per_capture_translation_mm,
-                "per_capture_rotation_deg": result.per_capture_rotation_deg,
-            }
         for arm, n in counts.items():
             if arm not in results and n:
                 lines.append(f"[{arm}] {n} capture(s) -- need at least 2 to solve")
@@ -424,6 +422,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         # The arm-to-arm offset, and (once both single-arm extrinsics AND the offset exist) the
         # fused/cross-checked shared-frame answer -- see charuco.py's module docstring for why
         # this needs simultaneous both-wrists-see-the-board captures, not just any two captures.
+        # Not itself written to config.yaml (see _on_save): it is fully recoverable from
+        # extrinsic.left/right + arm_offset, so storing it too would just be the same fact
+        # twice, one of which could drift from the other after a future re-calibration.
         arm_offset = None
         if len(self.pair_captures) >= 2:
             arm_offset = solve_arm_offset(self.pair_captures)
@@ -438,7 +439,6 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         elif self.pair_captures:
             lines.append(f"[left<->right] {len(self.pair_captures)} paired capture(s) -- need at least 2")
 
-        unified = None
         if arm_offset is not None and "left" in results and "right" in results:
             unified = unify_rig_calibration(results, arm_offset)
             lines.append(
@@ -448,54 +448,55 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
 
         self.result_label.setText("\n".join(lines) if lines else "not solved yet")
 
-        if not per_arm_json:
-            self.save_btn.setEnabled(False)
-            return
-        self._result_json = {
-            "by_arm": per_arm_json,
-            "board": {
-                "squares_x": self.board.squares_x,
-                "squares_y": self.board.squares_y,
-                "square_length_m": self.board.square_length_m,
-                "marker_length_m": self.board.marker_length_m,
-                "dictionary": self.board.dictionary,
-            },
-            "agentview_intrinsics": self.cams.intrinsics("agentview"),
-            "solved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        if arm_offset is not None:
-            self._result_json["arm_offset"] = {
-                # left_T_right: composes with either arm's own base_t_agentview above to bring
-                # everything into one shared (left) frame by hand, if a consumer wants that
-                # rather than the already-fused "unified_left_frame" below.
-                "left_t_right": arm_offset.left_t_right.tolist(),
-                "distance_m": arm_offset.distance_m,
-                "n_captures": arm_offset.n_captures,
-                "translation_rms_mm": arm_offset.translation_rms_mm,
-                "rotation_rms_deg": arm_offset.rotation_rms_deg,
-            }
-        if unified is not None:
-            self._result_json["unified_left_frame"] = {
-                "left_t_agentview": unified.left_t_agentview.tolist(),
-                "left_t_right": unified.left_t_right.tolist(),
-                "distance_m": unified.distance_m,
-                # How far apart the direct left-arm solve and the right-arm solve (bridged
-                # through left_t_right) landed -- an end-to-end check on all three calibrations
-                # at once, not a separate validation step.
-                "cross_check_translation_mm": unified.cross_check_translation_mm,
-                "cross_check_rotation_deg": unified.cross_check_rotation_deg,
-            }
-        self.save_btn.setEnabled(True)
+        self._last_results = results
+        self._last_arm_offset = arm_offset
+        self.save_btn.setEnabled(bool(results))
 
     def _on_save(self) -> None:
-        if self._result_json is None:
+        """Write the last solve into config.yaml -- see the module docstring for why this is a
+        line-range splice (charuco.splice_agentview_extrinsic/splice_arm_offset) rather than a
+        YAML load/dump round trip, and mirrors tuner_gui.py's ``_write_config`` (confirm dialog
+        naming the file, a ``.bak`` kept before writing, only the touched blocks change)."""
+        if not self._last_results and self._last_arm_offset is None:
             return
-        import pathlib
+        if not self.config_path:
+            QtWidgets.QMessageBox.critical(self, "No config.yaml", "No config.yaml was found to write into.")
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Write config.yaml?",
+            f"Write the solved extrinsic(s) into\n{self.config_path}\n\n"
+            "Only cameras.agentview.extrinsic and robot.arm_offset change; the rest of the file "
+            "(comments included) is left alone. A .bak copy of the current file is kept first.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if confirm != QtWidgets.QMessageBox.Yes:
+            return
 
-        path = pathlib.Path(self.out_path).expanduser()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self._result_json, indent=2))
-        self.status.setText(f"saved -> {path}")
+        calibrated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        written = []
+        try:
+            with open(self.config_path, encoding="utf-8") as fh:
+                original = fh.read()
+            updated = original
+            for arm, result in self._last_results.items():
+                updated = splice_agentview_extrinsic(updated, arm, result, calibrated_at=calibrated_at)
+                written.append(f"extrinsic.{arm}")
+            if self._last_arm_offset is not None:
+                updated = splice_arm_offset(updated, self._last_arm_offset, calibrated_at=calibrated_at)
+                written.append("arm_offset")
+            # keep a .bak so a bad write is always recoverable -- same safety net tuner_gui's
+            # own config.yaml writer uses.
+            with open(self.config_path + ".bak", "w", encoding="utf-8") as fh:
+                fh.write(original)
+            with open(self.config_path, "w", encoding="utf-8") as fh:
+                fh.write(updated)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Write failed", str(e))
+            self.status.setText(f"write failed: {e}")
+            return
+        self.status.setText(f"wrote {', '.join(written)} -> {self.config_path} (backup at .bak)")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         try:
@@ -511,7 +512,7 @@ def run(
     geometries: Dict[str, object],
     *,
     board: BoardSpec,
-    out_path: str,
+    config_path: Optional[str],
     mock: bool = False,
     capture_buttons: Sequence[str] = ("left.1", "right.1"),
 ) -> int:
@@ -519,7 +520,7 @@ def run(
     cams = CameraManager(cfg)
     cams.start()
     win = CalibrateAgentviewWindow(
-        cams, robot, geometries, board=board, out_path=out_path, mock=mock, capture_buttons=capture_buttons
+        cams, robot, geometries, board=board, config_path=config_path, mock=mock, capture_buttons=capture_buttons
     )
     win.resize(1600, 800)
     win.show()
