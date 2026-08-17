@@ -7,7 +7,6 @@
 # policy repos into the same env.
 #
 #   workstation/yam-data record [args]   # GUI recorder (teleop-gated LeRobot capture)
-#   workstation/yam-data replay [args]   # GUI replay (drive the robot from a dataset)
 #   workstation/yam-data mark-homing     # auto-annotate homing tails (control_mode=homing) from the gripper
 #   workstation/yam-data check-videos    # verify videos really hold the frames meta/ claims (--fix repairs)
 #   workstation/yam-data recover         # clear what a crashed recording left behind (--fix moves it aside)
@@ -56,21 +55,20 @@ cmd="${1:-}"
 shift || true
 case "$cmd" in
     record) exec python -m workstation.lerobot_recorder "$@" ;;
-    replay) exec python -m workstation.lerobot_recorder.replay_main "$@" ;;
     mark-homing) exec python -m workstation.lerobot_recorder.mark_homing "$@" ;;
     check-videos) exec python -m workstation.lerobot_recorder.check_videos "$@" ;;
     recover) exec python -m workstation.lerobot_recorder.recover_dataset "$@" ;;
     bridge)
         echo "yam-data bridge has moved: use 'yam-data deploy --headless' (same loop, and it can record)" >&2
         exit 2 ;;
-    deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;
+    deploy) exec python -m workstation.lerobot_recorder.deploy_main "$@" ;;   # also replays a dataset (tick "Replay a recorded dataset")
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     render-samples) exec python -m workstation.lerobot_recorder.render_deploy_samples "$@" ;;
     calibrate) exec python -m workstation.lerobot_recorder.calibrate_main "$@" ;;
     *)
-        echo "usage: yam-data {record|replay|mark-homing|check-videos|recover|deploy|cams|tune|doctor|render-samples|calibrate} [args]" >&2
+        echo "usage: yam-data {record|mark-homing|check-videos|recover|deploy|cams|tune|doctor|render-samples|calibrate} [args]" >&2
         exit 2
         ;;
 esac

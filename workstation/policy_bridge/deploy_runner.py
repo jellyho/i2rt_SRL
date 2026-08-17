@@ -239,16 +239,50 @@ class DeploymentPolicyRunner:
         except OSError:
             return False
 
+    def _build_replay_policy(self) -> tuple:
+        """An in-process DatasetPolicy wrapped as the policy, for a dataset replay source.
+
+        Replay differs from deployment in exactly ONE thing -- where the actions come from -- so it
+        reuses the whole deploy stack (smoother, e-stop, takeover, overlay) by building the same
+        ``ActionChunkBroker`` over a local ``DatasetPolicy`` instead of a websocket client. No
+        server, no port, no subprocess: DatasetPolicy reads the episode's actions from the parquet
+        directly. ``build_metadata`` gives the exact handshake meta the websocket path would have
+        received (framework=dataset-replay, replay_dataset/episode/fps, extra_features), so the meta
+        processing below is shared."""
+        from yam_policy import ActionChunkBroker
+        from yam_policy.policies.dataset_policy import DatasetPolicy
+        from yam_policy.serve import build_metadata
+
+        from workstation.lerobot_recorder.dataset_writer import dataset_dir
+
+        root = dataset_dir(self.recorder_cfg.root, self.cfg.replay_dataset)
+        policy = DatasetPolicy(
+            root=root,
+            episode=int(self.cfg.replay_episode),
+            speed=float(self.cfg.replay_speed),
+            loop=bool(self.cfg.replay_loop),
+        )
+        meta = build_metadata(policy, "yam_policy.policies.dataset_policy:DatasetPolicy", {})
+        return ActionChunkBroker(policy), meta
+
     def _connect_policy(self) -> None:
         if self.recorder_cfg.mock or self._policy is not None:
             self._set(policy_connected=True)
             return
-        if not self._policy_port_open():
-            raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
-        from yam_policy import ActionChunkBroker, WebsocketClientPolicy
 
-        client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
-        meta = client.get_server_metadata() or {}
+        if self.cfg.replay_dataset:
+            # In-process dataset replay -- no server to reach, so no port check / websocket client.
+            policy, meta = self._build_replay_policy()
+        else:
+            if not self._policy_port_open():
+                raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
+            from yam_policy import ActionChunkBroker, WebsocketClientPolicy
+
+            client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
+            meta = client.get_server_metadata() or {}
+            self._policy_client = client
+            policy = ActionChunkBroker(client)
+
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
         self._extra_features = _extra_features_from_meta(meta)
@@ -258,8 +292,7 @@ class DeploymentPolicyRunner:
             )
         # No action_horizon here on purpose: the broker reads the chunk size off each
         # response, so a checkpoint's horizon can never disagree with a client setting.
-        self._policy_client = client
-        self._policy = ActionChunkBroker(client)
+        self._policy = policy
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,

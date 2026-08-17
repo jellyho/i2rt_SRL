@@ -12,7 +12,7 @@ Two tools (both have a PyQt GUI):
 | Tool | Module | What it does |
 |------|--------|--------------|
 | **Recorder** | `workstation.lerobot_recorder` | teleop-gated LeRobot capture + review/delete |
-| **Replay**   | `workstation.lerobot_recorder.replay_main` | play a dataset back onto the robot |
+| **Deploy / Replay** | `workstation.lerobot_recorder.deploy_main` | run a policy — or replay a dataset — on the robot (§C/§D) |
 
 ## Recording video backend
 
@@ -394,9 +394,10 @@ A `teleop` server ignores `set_policy_action` entirely, so deployment against it
 nothing — hence the startup check below.
 
 There is a third mode, `wrapper`: the followers track an external command with **no
-leader arms at all**, which is what `yam-data replay` drives. So the robot server has
-three controllers — `teleop`, `deploy`, `wrapper` — plus `robot/yam can` / `canup`,
-which are CAN-bus utilities rather than modes.
+leader arms at all**. Replay no longer needs it — replay now runs on the **deploy**
+controller (§D, an in-process `DatasetPolicy`) rather than a separate wrapper path. So the
+robot server has three controllers — `teleop`, `deploy`, `wrapper` — plus `robot/yam can` /
+`canup`, which are CAN-bus utilities rather than modes.
 
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
@@ -496,28 +497,25 @@ where it fails → retrain.
 
 ## D. Replay a dataset onto the robot
 
-Replay is deployment with the actions read from a dataset, so it runs on **the deploy stack** —
-same robot server, same UI, same safeguards. There is no `wrapper` server and no separate GUI.
+Replay differs from deployment in exactly one thing — where the actions come from — so it is **not
+a separate tool**: it lives inside `yam-data deploy`. Tick **"Replay a recorded dataset"** on the
+setup page, pick a dataset (searchable) + episode, and Start drives the robot from that episode
+through the whole deploy stack.
 
 ```bash
-# 1. [policy]  serve the episode
-python -m yam_policy.serve \
-    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
-    --config root=~/lerobot_data/yam_pick --config episode=3
-
-# 2. [robot]
-robot/yam canup && robot/yam deploy
-
-# 3. [workstation]
-workstation/yam-data deploy --robot-host <ROBOT_IP> --policy-host <POLICY_IP>
+robot/yam canup && robot/yam deploy          # [robot] the SAME deploy server (no `wrapper`)
+workstation/yam-data deploy                  # [workstation] tick "Replay a recorded dataset"
 ```
 
-- The **past-demonstration overlay** follows the replay automatically: same episode, at the rate
-  it was recorded, paused whenever the rollout is not streaming.
-- Everything deployment has applies — takeover, e-stop, the follower smoother (so there is no
-  separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
-- `--config speed=2` / `speed=0.5` / `loop=true`; see
-  [`policy_serving/README.md`](../../policy_serving/README.md).
+- **No policy server, no websocket, no subprocess.** The runner builds an in-process
+  `DatasetPolicy` (reads the episode's actions straight from the parquet) and wraps it exactly like
+  any policy, so every safeguard still applies — takeover, e-stop, the follower smoother (so there
+  is no separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
+- While replaying, the run is **watch-only and not recorded** (leader free, no dataset written).
+- The **past-demonstration overlay** follows the replay automatically: same episode, at the rate it
+  was recorded, paused whenever the rollout is not streaming.
+- Speed/loop live on `DatasetPolicy` (`policy_serving/yam_policy/policies/dataset_policy.py`); the
+  GUI exposes loop, and `deploy --headless` can be pointed at a dataset via `BridgeConfig`.
 
 The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
 robot (`--mock` for no robot at all).

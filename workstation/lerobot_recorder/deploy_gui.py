@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import logging
 
-from PyQt5 import QtGui, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
+from workstation.lerobot_recorder.dataset_reader import DatasetReader
+from workstation.lerobot_recorder.dataset_writer import list_datasets
 from workstation.lerobot_recorder.gui import PickerComboBox, RecorderGUI
 from workstation.policy_bridge.config import BridgeConfig
 from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
@@ -114,6 +116,7 @@ class DeployGUI(RecorderGUI):
         if form is not None:
             form.addRow("mode", self.mode_combo)
             form.addRow("", self.record_check)
+            self._build_replay_controls(form)
 
         self._sync_run_mode()  # also applies the mode's mirroring default
         if leader_mirror is not None:  # explicit CLI flag wins over the mode default
@@ -125,6 +128,97 @@ class DeployGUI(RecorderGUI):
             if isinstance(box.layout(), QtWidgets.QFormLayout):
                 return box.layout()
         return None
+
+    # ------------------------------------------------------------- replay a dataset
+    def _build_replay_controls(self, form: QtWidgets.QFormLayout) -> None:
+        """A 'replay a recorded dataset' source on the setup page.
+
+        Replay differs from deployment in exactly one thing -- where the actions come from -- so it
+        is not a separate window: tick this, pick a dataset + episode, and Start drives the robot
+        from that episode through the whole deploy stack (live cameras, e-stop, human takeover, the
+        past-demonstration overlay). No policy server: the runner builds an in-process DatasetPolicy
+        (see BridgeConfig.replay_dataset / DeploymentPolicyRunner._build_replay_policy)."""
+        self.replay_check = QtWidgets.QCheckBox("Replay a recorded dataset (instead of a live policy)")
+        self.replay_check.setToolTip(
+            "On: the robot follows a recorded episode's actions -- the same deploy UI/safeguards, "
+            "actions sourced from the dataset instead of a policy server. Nothing is recorded."
+        )
+        self.replay_check.toggled.connect(self._on_replay_toggled)
+
+        # Searchable dataset picker (folders under root) + a substring completer, like the recorder's.
+        self.replay_dataset_combo = PickerComboBox(editable=True)
+        self.replay_dataset_combo.setToolTip("Dataset folder under root -- type to search, or pick from the list")
+        completer = self.replay_dataset_combo.completer()
+        if completer is not None:
+            completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+            completer.setFilterMode(QtCore.Qt.MatchContains)
+            completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+        self.replay_dataset_combo.currentTextChanged.connect(lambda *_: self._on_replay_dataset_changed())
+
+        self.replay_episode_spin = QtWidgets.QSpinBox()
+        self.replay_episode_spin.setMinimum(0)
+        self.replay_episode_spin.setMaximum(0)
+        self.replay_episode_label = QtWidgets.QLabel("")
+        self.replay_episode_label.setStyleSheet(f"color:{theme.MUTED};")
+        ep_row = QtWidgets.QHBoxLayout()
+        ep_row.addWidget(self.replay_episode_spin)
+        ep_row.addWidget(self.replay_episode_label, 1)
+        self.replay_episode_row = QtWidgets.QWidget()
+        self.replay_episode_row.setLayout(ep_row)
+        self.replay_loop_check = QtWidgets.QCheckBox("loop")
+
+        form.addRow("", self.replay_check)
+        form.addRow("replay dataset", self.replay_dataset_combo)
+        form.addRow("replay episode", self.replay_episode_row)
+        form.addRow("", self.replay_loop_check)
+        self._refresh_replay_datasets()
+        self._on_replay_toggled(False)  # start hidden until ticked
+
+    def _refresh_replay_datasets(self) -> None:
+        want = self.replay_dataset_combo.currentText().strip()
+        self.replay_dataset_combo.blockSignals(True)
+        self.replay_dataset_combo.clear()
+        self.replay_dataset_combo.addItems(list_datasets(self.cfg.root))
+        if want:
+            self.replay_dataset_combo.setCurrentText(want)
+        self.replay_dataset_combo.blockSignals(False)
+        self._on_replay_dataset_changed()
+
+    def _on_replay_dataset_changed(self) -> None:
+        """Set the episode range from the chosen dataset's metadata (cheap: metadata only)."""
+        name = self.replay_dataset_combo.currentText().strip()
+        n = 0
+        if name:
+            try:
+                reader = DatasetReader(name, self.cfg.root)
+                reader.load()  # metadata only -- no frames
+                n = int(reader.num_episodes)
+            except Exception as e:
+                logger.warning("could not read %s metadata: %s", name, e)
+        self.replay_episode_spin.setMaximum(max(0, n - 1))
+        self.replay_episode_label.setText(f"of {n} episodes" if n else "(dataset not found)")
+
+    def _on_replay_toggled(self, on: bool) -> None:
+        """Show the replay pickers and, while replaying, force watch-only + no recording."""
+        for w in (self.replay_dataset_combo, self.replay_episode_row, self.replay_loop_check):
+            self._set_form_row_visible(w, on)
+        if on:
+            self._refresh_replay_datasets()
+            # Replay is watching, not collecting: leader free (deploy mode), nothing recorded.
+            self.mode_combo.setCurrentText("deploy")
+            self.record_check.setChecked(False)
+        self.mode_combo.setEnabled(not on)
+        self.record_check.setEnabled(not on)
+        self._apply_replay_to_cfg()
+
+    def _apply_replay_to_cfg(self) -> None:
+        """Push the replay selection into bridge_cfg (empty ``replay_dataset`` = live policy)."""
+        if getattr(self, "replay_check", None) is not None and self.replay_check.isChecked():
+            self.bridge_cfg.replay_dataset = self.replay_dataset_combo.currentText().strip()
+            self.bridge_cfg.replay_episode = int(self.replay_episode_spin.value())
+            self.bridge_cfg.replay_loop = self.replay_loop_check.isChecked()
+        else:
+            self.bridge_cfg.replay_dataset = ""
 
     @property
     def run_mode(self) -> str:
@@ -271,6 +365,7 @@ class DeployGUI(RecorderGUI):
     def _on_start(self) -> None:
         self.source_combo.setCurrentText("deploy" if self.deploy_only else "dagger")
         self.bridge_cfg.prompt = self.task_combo.currentText().strip()
+        self._apply_replay_to_cfg()  # in-process dataset replay vs live policy (empty = live)
         super()._on_start()
         if self.recorder is not None:
             # Push the mirror choice once the link exists; the bridge latches it and
