@@ -41,12 +41,14 @@ logger = logging.getLogger(__name__)
 #
 # The camera frame is +Z along the optical axis, X right, Y down -- the ROS/OpenCV convention a
 # pinhole projection expects, so no axis juggling is needed downstream.
-T_GRIPPER_CAMERA = np.array([
-    [+0.000000000013, +0.906303416866, +0.422627633476, -0.070434978748],
-    [+0.999999999993, +0.000001552386, -0.000003329044, -0.000000076568],
-    [-0.000003673205, +0.422627633474, -0.906303416859, -0.077005929018],
-    [+0.000000000000, +0.000000000000, +0.000000000000, +1.000000000000],
-])
+T_GRIPPER_CAMERA = np.array(
+    [
+        [+0.000000000013, +0.906303416866, +0.422627633476, -0.070434978748],
+        [+0.999999999993, +0.000001552386, -0.000003329044, -0.000000076568],
+        [-0.000003673205, +0.422627633474, -0.906303416859, -0.077005929018],
+        [+0.000000000000, +0.000000000000, +0.000000000000, +1.000000000000],
+    ]
+)
 
 #: The body the extrinsic above is measured from, and the site that stands for "where the
 #: gripper is". They are different frames: tcp_site is rotated 180 deg from the flange.
@@ -94,11 +96,10 @@ class WristCameraGeometry:
     def flange_pose(self, q: Sequence[float]) -> np.ndarray:
         """4x4 pose of the flange body in the arm's base frame -- FK ONLY, no camera extrinsic.
 
-        This is ``camera_pose`` without ``@ self._extrinsic``: the frame the extrinsic is
-        measured *from*. Hand-eye calibration needs it as the "gripper" pose, precisely because
-        it is independent of the extrinsic being solved for (it comes from joint encoders + the
-        arm MJCF, neither of which knows or cares where the camera is mounted) -- see
-        ``charuco.solve_wrist_extrinsic``.
+        This is ``camera_pose`` without ``@ self._extrinsic``: a pure-FK flange pose (joint
+        encoders + the arm MJCF, independent of any camera mount). The agentview eye-to-hand
+        calibration uses it as the moving-hand pose -- see
+        ``charuco.solve_agentview_extrinsic_eyetohand``.
         """
         return self._frame(q, FLANGE_BODY, "body")
 
@@ -161,8 +162,10 @@ class CameraIntrinsics:
         return CameraIntrinsics(self.fx * sx, self.fy * sy, self.cx * sx, self.cy * sy, width, height)
 
     def __repr__(self) -> str:
-        return (f"CameraIntrinsics(fx={self.fx:.1f}, fy={self.fy:.1f}, "
-                f"cx={self.cx:.1f}, cy={self.cy:.1f}, {self.width}x{self.height})")
+        return (
+            f"CameraIntrinsics(fx={self.fx:.1f}, fy={self.fy:.1f}, "
+            f"cx={self.cx:.1f}, cy={self.cy:.1f}, {self.width}x{self.height})"
+        )
 
 
 class WristProjector:
@@ -193,8 +196,14 @@ class WristProjector:
     which reads as a confident wrong prediction rather than as missing data.
     """
 
-    def __init__(self, geometry: "WristCameraGeometry", intrinsics: "CameraIntrinsics",
-                 q_now: Optional[Sequence[float]] = None, *, arm_slice: Optional[slice] = None) -> None:
+    def __init__(
+        self,
+        geometry: "WristCameraGeometry",
+        intrinsics: "CameraIntrinsics",
+        q_now: Optional[Sequence[float]] = None,
+        *,
+        arm_slice: Optional[slice] = None,
+    ) -> None:
         self._geometry = geometry
         self._intrinsics = intrinsics
         self._arm_slice = arm_slice
@@ -216,9 +225,7 @@ class WristProjector:
 
         out = []
         for chunk in chunks:
-            projected = self._geometry.project(
-                self._geometry.chunk_to_path(chunk), self._q, self._intrinsics
-            )
+            projected = self._geometry.project(self._geometry.chunk_to_path(chunk), self._q, self._intrinsics)
             pixels = projected[:, :2].copy()
             pixels[projected[:, 2] < 0.5] = np.nan
             out.append(pixels)

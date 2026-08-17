@@ -170,25 +170,6 @@ def _load_agentview_extrinsics(config_path: Optional[str], arms: List[str]) -> d
     return out
 
 
-def _load_wrist_extrinsics(config_path: Optional[str]) -> dict:
-    """{arm: gripper_T_camera (4x4)} from config's ``cameras.wrist_<arm>.extrinsic.matrix`` (the
-    hand-eye solve), or an empty/partial dict when absent -- the caller then lets
-    ``WristCameraGeometry`` fall back to its CAD ``T_GRIPPER_CAMERA``. Using the calibrated mount
-    here (not CAD) is what makes the wrist overlay land on the pixel rather than only near it."""
-    from i2rt.serving.rig_config import load_rig
-
-    try:
-        cams = (load_rig(config_path).get("cameras")) or {}
-    except Exception:  # no config -> WristCameraGeometry uses its CAD T_GRIPPER_CAMERA default
-        return {}
-    out = {}
-    for arm in ("left", "right"):
-        m = ((cams.get(f"wrist_{arm}") or {}).get("extrinsic") or {}).get("matrix")
-        if m is not None:
-            out[arm] = np.asarray(m, dtype=float)
-    return out
-
-
 def _to_size(img: np.ndarray, width: int, height: int) -> np.ndarray:
     """Resize a frame to ``width x height`` (its native aspect kept when width/height match it).
 
@@ -255,8 +236,8 @@ def _draw_fan(
         pts = _finite_prefix(path)
         if pts is None:
             continue
-        d.line(pts, fill=(150, 175, 200, 120), width=3)
-        d.ellipse([pts[-1][0] - 2.5, pts[-1][1] - 2.5, pts[-1][0] + 2.5, pts[-1][1] + 2.5], fill=(150, 175, 200, 170))
+        d.line(pts, fill=(95, 165, 235, 155), width=3)
+        d.ellipse([pts[-1][0] - 2.5, pts[-1][1] - 2.5, pts[-1][0] + 2.5, pts[-1][1] + 2.5], fill=(95, 165, 235, 200))
 
     if 0 <= chosen < len(paths):
         pts = _finite_prefix(paths[chosen])
@@ -377,9 +358,10 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     # One FK model per arm, built with THAT arm's calibrated wrist extrinsic when config has it
     # (gripper_T_camera; falls back to the CAD default). FK itself is arm-independent, so any of
     # these also serves the agentview projection (chunk_to_path is extrinsic-free).
+    # The wrist camera mount is the CAD T_GRIPPER_CAMERA (WristCameraGeometry's default) -- the
+    # rig uses CAD for the wrists, so there is no per-camera extrinsic to load from config.
     xml = combine_arm_and_gripper_xml(ArmType.YAM, GripperType.LINEAR_4310)
-    wrist_extr = _load_wrist_extrinsics(args.config)
-    geometries = {arm: WristCameraGeometry(xml, extrinsic=wrist_extr.get(arm)) for arm in ("left", "right")}
+    geometries = {arm: WristCameraGeometry(xml) for arm in ("left", "right")}
 
     # Agentview: a FIXED third-person camera, so each arm's overlay projects through its calibrated
     # base_T_agentview (config, board-on-gripper solve) -- no wrist ride, no arm_offset, no shared
@@ -389,9 +371,12 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     agent_extrinsics = _load_agentview_extrinsics(args.config, agentview_arms)
     wrists = list(dict.fromkeys(args.wrists))
 
+    # Chunk size defaults to ONE SECOND of frames (the dataset fps) when --horizon is not given --
+    # a legible default; pass --horizon to match a deploy's action_horizon exactly.
+    horizon = args.horizon or int(reader.fps or 30)
     # Chunks tile the episode on a fixed grid of `horizon` ticks (the last one may be shorter, so
     # the WHOLE trajectory is covered, tail included -- not just the first n//H*H frames).
-    blocks = list(range(0, n_frames, args.horizon))
+    blocks = list(range(0, n_frames, horizon))
     if args.replans:
         blocks = blocks[: args.replans]
     if not blocks:
@@ -403,7 +388,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
     frames = []
     for block_idx, start in enumerate(blocks):
-        block_len = min(args.horizon, n_frames - start)
+        block_len = min(horizon, n_frames - start)
         if args.source == "samples":
             chunk = _load_replan_chunk(reader, args.episode, start, block_len, args.candidates)
             missing = "no action_samples recorded here"
@@ -510,7 +495,13 @@ def main() -> None:
         "'action' overlays the single executed trajectory from the plain action column, so it works "
         "on ANY LeRobot recording (teleop/demo/replay), not just a --num-samples deploy run",
     )
-    p.add_argument("--horizon", type=int, required=True, help="how many future ticks to draw (deploy: action_horizon)")
+    p.add_argument(
+        "--horizon",
+        type=int,
+        default=None,
+        help="chunk size: how many future ticks to draw (default: the dataset fps = 1 second; "
+        "for a deploy fan pass the server's action_horizon)",
+    )
     p.add_argument(
         "--candidates",
         type=int,

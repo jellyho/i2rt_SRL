@@ -16,18 +16,6 @@ robot:
   # follower (end-effector) gripper: linear_4310 | linear_3507 | crank_4310 | flexible_4310 | no_gripper
   gripper: linear_4310
   leader_gripper: yam_teaching_handle   # leader handle (rarely changed)
-
-  arm_offset:  # left_T_right -- see workstation/yam-data calibrate
-    matrix:
-      - [0.999798, 0.001689, -0.020042, 0.031513]
-      - [0.000827, 0.992174, 0.124857, -0.531773]
-      - [0.020096, -0.124849, 0.991972, 0.047124]
-      - [0.000000, 0.000000, 0.000000, 1.000000]
-    distance_m: 0.5348
-    n_captures: 101
-    translation_rms_mm: 31.338
-    rotation_rms_deg: 4.3169
-    calibrated_at: "2026-08-16 23:22:47"
 policy:
   host: 127.0.0.1            # websocket policy server (for the bridge)
   port: 8000
@@ -127,17 +115,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       gain: 16
       enable_auto_white_balance: 0
       white_balance: 4600
-    extrinsic:  # gripper_T_camera, hand-eye solved -- overrides the CAD default in yam_policy.viz.geometry (see workstation/yam-data calibrate)
-      matrix:
-        - [-0.020650, 0.916516, 0.399464, -0.069116]
-        - [0.998663, 0.037851, -0.035219, -0.002783]
-        - [-0.047398, 0.398202, -0.916072, -0.071914]
-        - [0.000000, 0.000000, 0.000000, 1.000000]
-      shared_across_arms: true
-      n_captures: 202
-      translation_rms_mm: 6.674
-      rotation_rms_deg: 3.0331
-      calibrated_at: "2026-08-16 23:22:47"
+    # wrist mount uses the CAD T_GRIPPER_CAMERA (yam_policy.viz.geometry) -- no per-camera extrinsic
   wrist_right:  # D405
     serial: "409122274199"
     fps: 30
@@ -147,18 +125,7 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       gain: 16
       enable_auto_white_balance: 0
       white_balance: 4600
-
-    extrinsic:  # gripper_T_camera, hand-eye solved -- overrides the CAD default in yam_policy.viz.geometry (see workstation/yam-data calibrate)
-      matrix:
-        - [-0.020650, 0.916516, 0.399464, -0.069116]
-        - [0.998663, 0.037851, -0.035219, -0.002783]
-        - [-0.047398, 0.398202, -0.916072, -0.071914]
-        - [0.000000, 0.000000, 0.000000, 1.000000]
-      shared_across_arms: true
-      n_captures: 202
-      translation_rms_mm: 6.674
-      rotation_rms_deg: 3.0331
-      calibrated_at: "2026-08-16 23:22:47"
+    # wrist mount uses the CAD T_GRIPPER_CAMERA (yam_policy.viz.geometry) -- no per-camera extrinsic
 recorder:
   repo_id: jellyho/close_bottle_cap
   root: ~/lerobot_data
