@@ -1,28 +1,25 @@
-"""Entry point for the full-rig camera calibration GUI (wrist extrinsics + agentview + offset).
+"""Entry point for the agentview camera calibration GUI (board-on-gripper, eye-to-hand).
 
-    workstation/yam-data calibrate
-    workstation/yam-data calibrate --arms left
-    workstation/yam-data calibrate --mock                     # GUI shell only, no hardware
-    workstation/yam-data calibrate --capture-button left.0    # enable a handle button (see below)
+    workstation/yam-data calibrate                     # both arms; grasp the board, one arm at a time
+    workstation/yam-data calibrate --arms left         # only calibrate agentview from the left gripper
+    workstation/yam-data calibrate --mock              # GUI shell only, no hardware
+    workstation/yam-data calibrate --capture-button left.1   # enable a handle button (see below)
 
-One ChArUco board on the desk recovers each wrist camera's own extrinsic (hand-eye), each
-agentview extrinsic, and the left<->right arm offset -- see
+The agentview camera is mounted too high to co-see a desk board with a wrist camera, so it is
+calibrated the other way round: **grasp the board with the gripper** and lift it into agentview's
+view. agentview + forward kinematics alone recover ``base_T_agentview`` per arm -- see
 :mod:`workstation.lerobot_recorder.calibrate_gui` for the flow and
-:mod:`workstation.lerobot_recorder.charuco` for the geometry.
+:mod:`workstation.lerobot_recorder.charuco` for the geometry. The wrist cameras are NOT calibrated
+here; their mount comes from the CAD ``T_GRIPPER_CAMERA`` constant.
 
-YAM is bimanual, so both wrist cameras are used as bridges by default -- ``--arms`` narrows that
-to one if the other wrist camera is not mounted/working. **Capture is Space by default**, NOT a
-handle button: in teleop the robot server consumes the handles while engaged (outcome buttons
-force homing, the fine button starts recentering), so a press there would move the arm rather than
-capture. ``--capture-button <side>.<index>`` opts into a handle trigger only if you are running a
-robot mode that leaves the handles free.
+**Capture is hands-free by default** (hold the arm still while engaged). **Space** is the manual
+fallback, NOT a handle button: in teleop the robot server consumes the handles while engaged, so a
+press there would move the arm. ``--capture-button <side>.<index>`` opts into a handle trigger only
+against a robot mode that leaves the handles free.
 
 The robot host/port come from config.yaml's ``robot.host``/``robot.port`` when the flags are not
-passed (``--robot-host``/``--robot-port`` override), so a configured rig needs neither -- same
-precedence deploy uses. The result is written back into ``config.yaml`` itself (the same file, or
-the auto-discovered one -- see :func:`i2rt.serving.rig_config.find_rig`), not a separate file: THE
-single source of truth for the rig already lives there (camera serials, robot host, button map,
-...), so this is the one place any tool that already calls ``load_rig()`` would look.
+passed. The result is written back into ``config.yaml`` itself (``cameras.agentview.extrinsic`` +
+``calibration.board``) -- THE single source of truth for the rig.
 """
 
 from __future__ import annotations
@@ -41,7 +38,7 @@ from workstation.lerobot_recorder.config import RecorderConfig, default_cameras
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Calibrate the camera rig (wrist extrinsics + agentview + arm offset) from one desk ChArUco board"
+        description="Calibrate the agentview camera from a ChArUco board grasped on the gripper (eye-to-hand)"
     )
     p.add_argument("--config", default=None, help="config.yaml (cameras); auto-discovered by default")
     p.add_argument("--mock", action="store_true", help="GUI shell with synthetic frames, no hardware")
@@ -54,7 +51,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         nargs="+",
         choices=["left", "right"],
         default=["left", "right"],
-        help="which wrist camera(s) can bridge to the base frame (default: both)",
+        help="which arm(s) can grasp the board to calibrate agentview from (default: both)",
     )
     p.add_argument(
         "--capture-button",
@@ -65,29 +62,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help=(
             "OPT-IN leader-handle button(s) that also trigger a capture (any ONE firing), "
             "'<side>.<index>' e.g. left.1 -- upper=0, lower=1. Default OFF: in teleop the robot "
-            "consumes the handles (homing/recentering), so enable this only against a robot mode "
-            "that leaves them free. Space is always the capture key regardless."
+            "consumes the handles, so enable this only against a robot mode that leaves them free. "
+            "Space is always the capture key regardless."
         ),
     )
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
-    p.add_argument(
-        "--no-shared-wrist-mount",
-        dest="shared_wrist_mount",
-        action="store_false",
-        help="solve each wrist mount separately instead of fusing them into one shared "
-        "gripper_T_camera (default: fuse, since both mounts are the same part)",
-    )
-    p.add_argument(
-        "--board-on-gripper",
-        action="store_true",
-        help="EYE-TO-HAND agentview mode: instead of the desk board, GRASP the board with the "
-        "gripper and lift it into agentview's view. Solves agentview's extrinsic from agentview + "
-        "FK alone (no wrist bridge) -- use this when agentview is mounted too high to co-see a desk "
-        "board with a wrist camera. Run once per arm; both arms are cross-checked through the "
-        "existing robot.arm_offset (calibrate the wrists on the desk board first to get it).",
-    )
     p.add_argument(
         "--no-auto-capture",
         dest="auto_capture",
@@ -114,10 +95,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     path = find_rig(args.config)
     rig = load_rig(args.config)
     cams = apply_camera_serials(default_cameras(), rig)
-    # Board-on-gripper (eye-to-hand) uses agentview only -- no wrist bridge. The desk-board mode
-    # needs the wrist cameras too.
-    wanted = {"agentview"} if args.board_on_gripper else {"agentview", *(f"wrist_{arm}" for arm in arms)}
-    cams = [c for c in cams if c.key in wanted]
+    cams = [c for c in cams if c.key == "agentview"]  # eye-to-hand uses agentview only
     for cam in cams:
         cam.width, cam.height, cam.fps = args.width, args.height, args.fps
     cfg = RecorderConfig(cameras=cams, mock=args.mock)
@@ -130,11 +108,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             host=rob.get("robot_host", key="host"), port=int(rob.get("robot_port", key="port")), timeout=2.0
         )
 
-    # Same combined arm+gripper model, and the same published wrist extrinsic, that
-    # render_deploy_samples.py's candidate fan uses -- one source of truth for "where is the
-    # wrist camera", not a second copy that could drift from it. Both arms share the model (it
-    # is the kinematic chain, not a per-side mirror); each gets its own instance so its FK is
-    # driven by that arm's own joints only.
+    # The combined arm+gripper model the robot runs, one instance per arm so each arm's FK is
+    # driven by its own joints. FK only -- the wrist extrinsic is not used by eye-to-hand.
     from yam_policy.viz import WristCameraGeometry
 
     from i2rt.robots.utils import ArmType, GripperType, combine_arm_and_gripper_xml
@@ -143,8 +118,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     geometries = {arm: WristCameraGeometry(xml) for arm in arms}
 
     # Board geometry: config.yaml's calibration.board is the baseline; any explicitly passed CLI
-    # flag overrides that field. So a rig configured once needs no board flags thereafter, and a
-    # one-off different board can still be given on the command line.
+    # flag overrides that field.
     board = BoardSpec.from_config((rig.get("calibration") or {}).get("board"))
     overrides = {
         k: v
@@ -159,18 +133,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     board = dataclasses.replace(board, **overrides) if overrides else board
 
-    # For the board-on-gripper cross-check: the left<->right offset from a prior desk-board wrist
-    # calibration (robot.arm_offset in config.yaml). None if never calibrated -- then a two-arm
-    # board-on-gripper run reports "no arm_offset" rather than a bogus cross-check.
-    import numpy as np
-
-    offset_cfg = ((rig.get("robot") or {}).get("arm_offset") or {}).get("matrix")
-    arm_offset_left_t_right = np.asarray(offset_cfg, dtype=float) if offset_cfg is not None else None
-
     from workstation.lerobot_recorder.calibrate_gui import run
 
     logging.info(
-        "calibrate: config=%s arms=%s auto_capture=%s capture_buttons=%s",
+        "calibrate agentview: config=%s arms=%s auto_capture=%s capture_buttons=%s",
         path,
         arms,
         args.auto_capture,
@@ -186,9 +152,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         capture_buttons=args.capture_buttons,
         auto_capture=args.auto_capture,
         auto_dwell_s=args.auto_dwell,
-        shared_wrist_mount=args.shared_wrist_mount,
-        board_on_gripper=args.board_on_gripper,
-        arm_offset_left_t_right=arm_offset_left_t_right,
     )
 
 

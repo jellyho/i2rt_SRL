@@ -549,115 +549,65 @@ workstation/yam-data render-samples \
   next (the header shows `chunk X/N  tick Y/H`). The whole trajectory is covered, tail included.
   `--hold N` repeats each tick for slow motion.
 - **agentview** overlays each arm's path through its **calibrated `base_T_agentview`** (from
-  `config.yaml`, see §F's board-on-gripper mode) — left green, right amber. Each **wrist** shows
-  only its own arm (the wrist rides that arm; the other arm would need the arm offset, which this
-  deliberately avoids, so no shared frame is required). `--wrists`/`--agentview-arms` subset the
-  panels; `--height` sets panel size.
-- **Intrinsics**: the wrist and agentview *extrinsics* come from `config.yaml`, but the *intrinsics*
-  default to rough placeholders — pass the cameras' real numbers (`--fx/fy/cx/cy` wrist,
-  `--agent-fx/…` agentview) for pixel-exact alignment; until then the path's *shape* is meaningful,
-  its exact pixel position is not.
+  `config.yaml`, see §F) — left green, right amber. Each **wrist** shows only its own arm through
+  the **CAD `T_GRIPPER_CAMERA`** mount (the wrist rides that arm; the other arm would need a shared
+  frame, which this deliberately avoids). `--wrists`/`--agentview-arms` subset the panels;
+  `--height` sets panel size.
+- **Intrinsics**: the agentview *extrinsic* comes from `config.yaml` and the wrist mount from CAD,
+  but the camera *intrinsics* default to rough placeholders — pass the cameras' real numbers
+  (`--fx/fy/cx/cy` wrist, `--agent-fx/…` agentview) for pixel-exact alignment; until then the
+  path's *shape* is meaningful, its exact pixel position is not.
 
 Offline on purpose — a *live* per-tick HUD was built once and dropped (watching the spread at 30
 fps was not worth much); this walks the recorded dataset instead. No extra checkout and no
 `matplotlib`: the drawing is vendored (PIL only), so it needs nothing the recorder env lacks.
 
-## F. Calibrate the camera rig
+## F. Calibrate the agentview camera (board-on-gripper, eye-to-hand)
 
-`render-samples`' fan is drawn on the wrist view because that camera's pose is "known" from FK +
-a **CAD** wrist extrinsic (`T_GRIPPER_CAMERA`) that was never checked against the built hardware;
-agentview's pose is not known at all; and **there is no shared "robot base" frame between the two
-arms either** (each `WristCameraGeometry` loads its arm's MJCF in isolation, with no known
-transform to the other). `calibrate` fixes all of that from ONE ChArUco board left sitting on the
-desk (never moved, never attached to the robot), recovering — per arm where applicable:
-
-1. **each wrist camera's own extrinsic** (`gripper_T_camera`), by eye-in-hand hand-eye
-   calibration — so the mount is *measured*, replacing the unverified CAD constant;
-2. **each agentview extrinsic**, chained through that arm's now-measured wrist extrinsic;
-3. **the left↔right arm offset** (`left_T_right`, with straight-line distance), and a fused,
-   cross-checked shared-frame answer.
+The **wrist** cameras are not calibrated — their mount is the CAD `T_GRIPPER_CAMERA`
+(`yam_policy.viz.geometry`), i2rt's published D405 transform, found accurate enough against the
+built hardware to use directly. Only the **agentview** camera needs solving, and it is mounted too
+high to co-see a desk board with a wrist camera — so `calibrate` does it the other way round:
+**grasp the ChArUco board with the gripper** and lift it into agentview's view. The camera is
+fixed and the target rides the hand (the **eye-to-hand** dual of a wrist hand-eye), so agentview +
+forward kinematics alone recover **`base_T_agentview`**, per arm.
 
 ```bash
-workstation/yam-data calibrate
-workstation/yam-data calibrate --arms left     # only the left wrist bridges
+workstation/yam-data calibrate                 # both arms; one grasp at a time
+workstation/yam-data calibrate --arms left     # calibrate agentview from the left gripper only
 workstation/yam-data calibrate --mock          # GUI shell only, no hardware
 ```
 
-Set the ChArUco board on the desk in view of agentview. Board geometry comes from
-`config.yaml`'s `calibration.board` (auto-loaded, and written back after each calibration);
-override per-run with `--squares-x/-y`, `--square-length-m`, `--marker-length-m`, `--dictionary`.
-**Measure the printed squares — don't trust the page-fit scale.** Both wrist cameras bridge by
-default (YAM is bimanual — `--arms left` to use only one).
+Board geometry comes from `config.yaml`'s `calibration.board` (auto-loaded, and written back after
+each calibration); override per-run with `--squares-x/-y`, `--square-length-m`,
+`--marker-length-m`, `--dictionary`. **Measure the printed squares — don't trust the page-fit
+scale.**
 
-**Capture is hands-free by default**, because both hands are on the leaders: run the robot in
-**teleop**, engage, move an arm so its wrist camera and agentview both see the board, and **hold
-it still for ~1 s — it auto-captures**, then move to the next pose (it re-arms once you move
-away). It only auto-captures while engaged, so the homing/ramp motion is never captured. Tune
-with `--auto-dwell <sec>`, or `--no-auto-capture` to turn it off. **Space** (or the on-screen
-button) always works as a manual fallback. A leader-handle trigger is available too but **off by
-default** — in teleop the robot consumes the handles (outcome buttons home the arm, the fine
-button recenters), so only enable `--capture-button <side>.<index>` against a robot mode that
-leaves them free. Capture at several poses, **varying wrist TILT, not just position**, which
-hand-eye needs (a set all at the same tilt can't resolve the mount's rotation).
+**Grasp the board rigidly and do NOT re-grip mid-run** — the solve assumes its pose in the gripper
+is constant across the captures; a slip corrupts it (the reported **grip-consistency RMS** is the
+check). Move to **3+ poses varying the grip TILT, not just position** (hand-eye needs that or the
+rotation is unconstrained). **Capture is hands-free**: run the robot in **teleop**, engage, lift
+the board so agentview sees it, and **hold still for ~1 s — it auto-captures**, then move to the
+next pose (it re-arms once you move away). Only auto-captures while engaged, so homing/ramp motion
+is never captured. Tune with `--auto-dwell <sec>`, or `--no-auto-capture`. **Space** (or the
+on-screen button) is the manual fallback; a leader-handle trigger is available but **off by
+default** (in teleop the robot consumes the handles), enable with `--capture-button <side>.<index>`
+against a robot mode that leaves them free.
 
-**agentview is optional per capture, so you can calibrate the wrists first and link agentview
-later.** A capture only needs a *wrist* to see the board (that feeds hand-eye); if agentview also
-sees it, that same capture additionally feeds the agentview solve — the status line says which.
-So with a board near a wrist (agentview out of view), you still bank wrist hand-eye samples;
-bring the board somewhere agentview can also see it and those captures link agentview on top. A
-pure wrist-only session solves and saves just the wrist extrinsics; agentview simply isn't
-written until it has ≥2 captures where it saw the board.
-
-### Agentview too high for the desk board? `--board-on-gripper` (eye-to-hand)
-
-The desk-board chain above links agentview only at poses where a **wrist camera and agentview see
-the same board at once**. If agentview is mounted too high/far to co-see a desk board with a
-wrist, that never happens — so calibrate agentview the other way round: **grasp the board with the
-gripper** and lift it into agentview's view.
-
-```bash
-workstation/yam-data calibrate --board-on-gripper --arms left    # then again --arms right
-```
-
-This is the **eye-to-hand** dual of the wrist's eye-in-hand solve: the camera is fixed and the
-target rides the hand, so agentview + FK alone recover `base_T_agentview` — **no wrist camera, no
-arm offset, no shared frame**. Grasp the board **rigidly and do not re-grip mid-run** (the solve
-assumes the board's pose in the gripper is constant; a slip corrupts it — the reported
-grip-consistency RMS is the check). Move to **3+ varied-tilt** poses that agentview sees, hold
-still (same auto-capture as above). With both arms available a selector picks which gripper holds
-the board; run one arm, then the other.
-
-Because each arm solves agentview in its own frame, they only agree once bridged through
-`robot.arm_offset` (from a prior desk-board wrist calibration) — if that offset is present, a
-two-arm run reports the **cross-check** (`left vs right`) and writes the fused `unified`. Save
-touches only `cameras.agentview.extrinsic.<arm>` (marked `method: eye_to_hand`) + `unified`; it
-never fabricates a wrist extrinsic or an arm offset. This is what `render-samples`' agentview
-overlay (§E) reads back.
-
-**The solve re-runs after every capture automatically**, no separate step, with a live
-convergence trend (RMS over the last few re-solves) per line so you can watch it settle. Hand-eye
-(step 1) needs **3+ varied captures** per arm; until an arm reaches that, steps 2–3 fall back to
-the CAD wrist extrinsic and say so on screen. Everything is *per arm*, never pooled across arms
-(that would silently average two unrelated frames). The arm-offset sample is banked for free
-whenever a capture catches BOTH wrists seeing the board at once — pose both arms toward it
-together for a couple of captures. When both arms and the offset have solved, the fused answer's
-**cross-check** (bridge the right extrinsic through the offset, compare to the direct left one) is
-an end-to-end confidence number on all three calibrations at once, not a separate step.
+With both arms available, an **"Board held by"** selector picks which gripper's FK a capture is
+attributed to — run one arm, then move the board to the other and switch it. Each arm solves in
+its **own frame**, never pooled (there is no shared "robot base" frame — see `charuco`'s module
+docstring); a consumer overlaying an arm's action uses that arm's own extrinsic (this is exactly
+what `render-samples` §E does). The solve re-runs after every capture with a live convergence
+trend (RMS over the last few re-solves) per line so you can watch it settle.
 
 **Save writes into `config.yaml` itself** — the file `--config` points at, or the auto-discovered
-one — not a separate output file: that is already THE single source of truth for the rig, so it
-is the one place any tool that calls `load_rig()` would look. A confirmation dialog names the file
-first, a `.bak` of the untouched original is kept, and only the touched blocks change:
-`cameras.wrist_<arm>.extrinsic` (the hand-eye mount, overriding the CAD default a
-`WristCameraGeometry` consumer would otherwise use), `cameras.agentview.extrinsic.<arm>` +
-`.unified` (the fused answer — use this one unless you specifically need a single arm's frame),
-`robot.arm_offset`, and `calibration.board` (which board produced all of the above). It is a
-line-range splice — the same technique `workstation/yam-data tune`'s "write config.yaml" button
-uses — **not** a `yaml.safe_load`/dump round trip, which would strip every comment and reflow the
-whole heavily-commented file. Re-running later replaces just the entries it re-solved, leaving
-the other arm's (and everything else) intact. `unified` is recomputable from its parts but stored
-anyway: every save writes all blocks from the same live solve in one call, so nothing this tool
-writes can disagree with anything else it writes.
+one — THE single source of truth for the rig. A confirmation dialog names the file first, a `.bak`
+of the untouched original is kept, and only the touched blocks change:
+`cameras.agentview.extrinsic.<arm>` (marked `method: eye_to_hand`) and `calibration.board` (which
+board produced it). It is a line-range splice — **not** a `yaml.safe_load`/dump round trip, which
+would strip every comment and reflow the whole heavily-commented file. Re-running later replaces
+just the arm it re-solved, leaving the other arm's entry (and everything else) intact.
 
 Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
 separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s

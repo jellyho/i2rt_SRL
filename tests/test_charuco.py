@@ -1,10 +1,9 @@
-"""ChArUco calibration math: the transform chain, and a real detector smoke test.
+"""ChArUco calibration math: the eye-to-hand transform, and a real detector smoke test.
 
-The chain (base_T_wrist @ wrist_T_board @ inv(agentview_T_board)) is pure numpy and the part
-most at risk of a silent sign/inverse mistake, so it is tested against hand-built ground truth
-with no camera or detector involved. The detector itself gets one real smoke test against an
-image `cv2.aruco` renders and reads back -- not a physical rig, but real OpenCV code on both
-ends rather than another layer of hand-built matrices.
+The eye-to-hand solve (board grasped on the gripper -> base_T_agentview) is pure numpy over
+cv2.calibrateHandEye and the part most at risk of a silent sign/inverse mistake, so it is tested
+against hand-built ground truth. The detector itself gets one real smoke test against an image
+`cv2.aruco` renders and reads back -- not a physical rig, but real OpenCV code on both ends.
 """
 
 from __future__ import annotations
@@ -15,27 +14,14 @@ import pytest
 pytest.importorskip("cv2")
 
 from workstation.lerobot_recorder.charuco import (
-    ArmOffsetResult,
-    ArmPairCapture,
     BoardSpec,
-    Capture,
     EyeToHandCapture,
-    WristExtrinsicResult,
     _orthonormalize,
     _rotation_angle_deg,
     detect_board_pose,
-    fuse_wrist_extrinsics,
     make_board,
-    pose_delta,
-    solve_agentview_extrinsic,
     solve_agentview_extrinsic_eyetohand,
     solve_agentview_extrinsic_eyetohand_per_arm,
-    solve_agentview_extrinsic_per_arm,
-    solve_arm_offset,
-    solve_wrist_extrinsic,
-    solve_wrist_extrinsic_per_arm,
-    unify_agentview_eyetohand,
-    unify_rig_calibration,
 )
 
 
@@ -75,508 +61,6 @@ def test_orthonormalize_recovers_a_proper_rotation_from_a_perturbed_matrix():
 def test_rotation_angle_deg_matches_the_angle_it_was_built_from():
     for deg in (0.0, 15.0, 90.0, 179.0):
         assert np.isclose(_rotation_angle_deg(_rotation("x", deg)), deg, atol=1e-6)
-
-
-# --------------------------------------------------------------------------------------- #
-# solve_wrist_extrinsic: eye-in-hand hand-eye, against known ground truth
-# --------------------------------------------------------------------------------------- #
-def _wrist_captures(true_g_t_c, base_t_board, n=8, seed=0):
-    """Captures generated FORWARD from a known gripper_T_camera + fixed board, with varied
-    orientation (hand-eye needs that or the rotation part of X is unconstrained)."""
-    rng = np.random.default_rng(seed)
-    caps = []
-    for i in range(n):
-        base_t_flange = _pose(rng.uniform(-0.2, 0.2, 3), axis=("x", "y", "z")[i % 3], deg=float(rng.uniform(-40, 40)))
-        cam_t_board = np.linalg.inv(base_t_flange @ true_g_t_c) @ base_t_board
-        caps.append(Capture("left", base_t_flange, cam_t_board, np.eye(4), 0.1, 0.1))
-    return caps
-
-
-def test_hand_eye_recovers_the_true_wrist_extrinsic():
-    """The whole reason this tool exists over the CAD constant: solve gripper_T_camera from FK +
-    board detections, and get the real mount back."""
-    true_g_t_c = _pose((0.02, -0.03, 0.05), axis="y", deg=25.0)
-    board = _pose((0.5, 0.1, 0.0), axis="z", deg=10.0)
-    result = solve_wrist_extrinsic(_wrist_captures(true_g_t_c, board))
-
-    assert result.arm == "left"
-    assert np.allclose(result.gripper_t_camera, true_g_t_c, atol=1e-8)
-    assert result.n_captures == 8
-    assert result.translation_rms_mm < 1e-6  # noiseless -> board-in-base is dead consistent
-    assert result.rotation_rms_deg < 1e-4
-
-
-def test_hand_eye_refuses_fewer_than_three_captures():
-    """Two poses is one relative motion -- not enough to pin both rotation and translation of X."""
-    caps = _wrist_captures(_pose((0.02, 0, 0)), _pose((0.4, 0, 0)), n=2)
-    with pytest.raises(ValueError, match="at least 3"):
-        solve_wrist_extrinsic(caps)
-
-
-def test_hand_eye_refuses_mixed_arms():
-    caps = _wrist_captures(_pose((0.02, 0, 0)), _pose((0.4, 0, 0)), n=3)
-    caps[-1] = Capture("right", caps[-1].base_t_flange, caps[-1].wrist_t_board, np.eye(4), 0.1, 0.1)
-    with pytest.raises(ValueError, match="more than one arm"):
-        solve_wrist_extrinsic(caps)
-
-
-def test_hand_eye_per_arm_skips_an_arm_below_three():
-    board = _pose((0.4, 0.0, 0.0))
-    left = _wrist_captures(_pose((0.02, 0, 0), axis="y", deg=10), board, n=4)
-    right = _wrist_captures(_pose((-0.02, 0, 0), axis="y", deg=10), board, n=2)
-    right = [Capture("right", c.base_t_flange, c.wrist_t_board, c.agentview_t_board, 0.1, 0.1) for c in right]
-    out = solve_wrist_extrinsic_per_arm([*left, *right])
-    assert set(out) == {"left"}  # right had only 2, below the hand-eye minimum
-
-
-# --------------------------------------------------------------------------------------- #
-# fuse_wrist_extrinsics: identical-mount prior -- one shared gripper_T_camera for both arms
-# --------------------------------------------------------------------------------------- #
-def _wristresult(arm, t, deg=0.0, axis="y") -> WristExtrinsicResult:
-    return WristExtrinsicResult(
-        arm,
-        _pose(t, axis, deg),
-        n_captures=5,
-        translation_rms_mm=0.1,
-        rotation_rms_deg=0.01,
-        per_capture_translation_mm=[],
-        per_capture_rotation_deg=[],
-    )
-
-
-def test_fuse_of_two_agreeing_arms_is_their_pose_with_tiny_spread():
-    x = (0.02, -0.03, 0.05)
-    fused = fuse_wrist_extrinsics({"left": _wristresult("left", x, 25), "right": _wristresult("right", x, 25)})
-    assert set(fused.contributing_arms) == {"left", "right"}
-    assert np.allclose(fused.gripper_t_camera, _pose(x, "y", 25), atol=1e-9)
-    assert fused.translation_spread_mm < 1e-6 and fused.rotation_spread_deg < 1e-6
-    assert fused.n_captures_total == 10
-
-
-def test_fuse_reports_real_spread_when_the_arms_disagree():
-    """A big cross-arm gap is the signal that the mounts are NOT identical (or a bad solve) --
-    it must show up as spread, not be averaged away silently."""
-    close = fuse_wrist_extrinsics(
-        {"left": _wristresult("left", (0.02, 0, 0)), "right": _wristresult("right", (0.021, 0, 0))}
-    )
-    far = fuse_wrist_extrinsics(
-        {"left": _wristresult("left", (0.02, 0, 0)), "right": _wristresult("right", (0.07, 0, 0))}
-    )  # 5cm apart
-    assert far.translation_spread_mm > close.translation_spread_mm
-    assert far.translation_spread_mm > 10.0
-
-
-def test_fuse_of_one_arm_is_that_arm_and_still_usable_for_both():
-    """One arm calibrated to 3+ varied poses should hand a mount to BOTH arms (spread 0)."""
-    fused = fuse_wrist_extrinsics({"left": _wristresult("left", (0.02, -0.03, 0.05), 25)})
-    assert fused.contributing_arms == ["left"]
-    assert np.allclose(fused.gripper_t_camera, _pose((0.02, -0.03, 0.05), "y", 25), atol=1e-9)
-    assert fused.translation_spread_mm == 0.0
-
-
-def test_fuse_refuses_empty():
-    with pytest.raises(ValueError, match="no per-arm"):
-        fuse_wrist_extrinsics({})
-
-
-# --------------------------------------------------------------------------------------- #
-# pose_delta: the "vs CAD" sanity check
-# --------------------------------------------------------------------------------------- #
-def test_pose_delta_zero_for_identical_poses():
-    a = _pose((1.0, 2.0, 3.0), "z", 30)
-    t_mm, r_deg = pose_delta(a, a)
-    assert t_mm < 1e-9 and r_deg < 1e-6
-
-
-def test_pose_delta_reports_translation_in_mm_and_rotation_in_deg():
-    a = _pose((0.10, 0.0, 0.0))
-    b = _pose((0.09, 0.0, 0.0), "y", 5.0)  # 10mm + 5deg from a
-    t_mm, r_deg = pose_delta(a, b)
-    assert t_mm == pytest.approx(10.0, abs=1e-6)
-    assert r_deg == pytest.approx(5.0, abs=1e-4)
-
-
-def test_agentview_uses_the_wrist_extrinsic_it_is_given():
-    """A wrong wrist extrinsic must change the agentview answer -- proof the chain actually
-    routes through it, so hand-eye replacing CAD genuinely matters."""
-    true_base_t_agent = _pose((1.0, 0.0, 0.5))
-    g_t_c = _pose((0.03, 0.0, 0.0))  # camera offset from flange
-    board = _pose((0.4, 0.0, 0.0))
-    caps = []
-    for wt in ((0.0, 0.0, 0.0), (0.02, 0.0, 0.0)):
-        base_t_flange = _pose(wt)
-        base_t_cam = base_t_flange @ g_t_c
-        caps.append(
-            Capture(
-                "left",
-                base_t_flange,
-                np.linalg.inv(base_t_cam) @ board,  # camera_T_board consistent with g_t_c
-                np.linalg.inv(true_base_t_agent) @ board,
-                0.1,
-                0.1,
-            )
-        )
-    right = solve_agentview_extrinsic(caps, wrist_extrinsic=g_t_c)
-    wrong = solve_agentview_extrinsic(caps, wrist_extrinsic=np.eye(4))
-    assert np.allclose(right.base_t_agentview, true_base_t_agent, atol=1e-8)
-    assert not np.allclose(wrong.base_t_agentview, true_base_t_agent, atol=1e-3)
-
-
-# --------------------------------------------------------------------------------------- #
-# solve_agentview_extrinsic: the transform chain, against known ground truth
-# --------------------------------------------------------------------------------------- #
-def test_recovers_the_true_extrinsic_from_noiseless_captures():
-    """Build captures by RUNNING THE CHAIN FORWARD from a known base_T_agentview and known arm
-    poses, then check solve_agentview_extrinsic inverts it -- the one thing this module exists
-    to get right."""
-    true_base_t_agent = _pose((1.2, -0.3, 0.8), axis="y", deg=25.0)
-    board_pose_in_base = _pose((0.5, 0.1, 0.0), axis="z", deg=5.0)  # the board, sitting on the desk
-
-    rng = np.random.default_rng(1)
-    captures = []
-    for _ in range(4):
-        # A different arm pose each time -- the board does not move, the wrist camera does.
-        base_t_flange = _pose(rng.uniform(-0.1, 0.1, 3), axis="x", deg=float(rng.uniform(-20, 20)))
-        wrist_t_board = np.linalg.inv(base_t_flange) @ board_pose_in_base
-        agent_t_board = np.linalg.inv(true_base_t_agent) @ board_pose_in_base
-        captures.append(
-            Capture(
-                arm="left",
-                base_t_flange=base_t_flange,
-                wrist_t_board=wrist_t_board,
-                agentview_t_board=agent_t_board,
-                wrist_reproj_error_px=0.1,
-                agentview_reproj_error_px=0.1,
-            )
-        )
-
-    result = solve_agentview_extrinsic(captures, wrist_extrinsic=np.eye(4))
-    assert result.arm == "left"
-    assert np.allclose(result.base_t_agentview, true_base_t_agent, atol=1e-8)
-    assert result.translation_rms_mm < 1e-3
-    assert result.rotation_rms_deg < 1e-3
-    assert result.n_captures == 4
-
-
-def test_disagreeing_captures_show_up_as_nonzero_spread_not_silently_averaged_away():
-    """One capture perturbed away from the rest must move the RMS spread, not vanish into a
-    mean that looks as confident as if every capture had agreed."""
-    true_base_t_agent = _pose((1.0, 0.0, 0.5))
-    board_pose_in_base = _pose((0.4, 0.0, 0.0))
-
-    def make_capture(wrist_t: tuple, detection_error: np.ndarray | None = None) -> Capture:
-        # wrist_t moves the ARM to a different (still internally-consistent) pose -- by itself
-        # this cancels out of the chain exactly (base_t_flange @ inv(base_t_flange) @ board_pose),
-        # regardless of where the arm is, which is the whole reason averaging several arm poses
-        # is trustworthy. Only `detection_error` -- a wrong PnP READ, not a different truth --
-        # can make one capture actually disagree with the rest.
-        base_t_flange = _pose(wrist_t)
-        wrist_t_board = np.linalg.inv(base_t_flange) @ board_pose_in_base
-        if detection_error is not None:
-            wrist_t_board = wrist_t_board @ detection_error
-        return Capture(
-            arm="left",
-            base_t_flange=base_t_flange,
-            wrist_t_board=wrist_t_board,
-            agentview_t_board=np.linalg.inv(true_base_t_agent) @ board_pose_in_base,
-            wrist_reproj_error_px=0.1,
-            agentview_reproj_error_px=0.1,
-        )
-
-    agreeing = [make_capture((0.0, 0.0, 0.0)), make_capture((0.01, 0.0, 0.0)), make_capture((0.0, 0.01, 0.0))]
-    clean = solve_agentview_extrinsic(agreeing, wrist_extrinsic=np.eye(4))
-    assert clean.translation_rms_mm < 1.0
-
-    # A 5cm error in ONE capture's DETECTED board pose (a bad PnP read, not just a different arm
-    # pose) -- solve_agentview_extrinsic cannot know it is wrong (no independent ground truth
-    # either), so it must show up as spread instead of vanishing into the mean.
-    outlier = [*agreeing, make_capture((0.0, 0.0, 0.0), detection_error=_pose((0.05, 0.0, 0.0)))]
-    dirty = solve_agentview_extrinsic(outlier, wrist_extrinsic=np.eye(4))
-    assert dirty.translation_rms_mm > clean.translation_rms_mm
-    assert max(dirty.per_capture_translation_mm) > 10.0  # the outlier itself is findable in the list
-
-
-def test_refuses_to_solve_from_a_single_capture():
-    """One capture cannot show whether the estimate is trustworthy -- there is nothing to
-    compare it against, which is the entire point of averaging several."""
-    c = Capture("left", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
-    with pytest.raises(ValueError, match="at least 2"):
-        solve_agentview_extrinsic([c], wrist_extrinsic=np.eye(4))
-
-
-# --------------------------------------------------------------------------------------- #
-# Arms must never be pooled: each wrist camera is its own, unrelated FK frame (see the
-# module docstring) -- there is no shared "robot base" anywhere in this codebase.
-# --------------------------------------------------------------------------------------- #
-def test_refuses_to_solve_captures_from_two_different_arms_together():
-    """Silently averaging a left-wrist estimate with a right-wrist estimate would blend two
-    numerically valid answers to two different questions -- this must be loud, not silent."""
-    c_left = Capture("left", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
-    c_right = Capture("right", np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
-    with pytest.raises(ValueError, match="more than one arm"):
-        solve_agentview_extrinsic([c_left, c_right, c_left], wrist_extrinsic=np.eye(4))
-
-
-def test_per_arm_solves_each_arm_independently_and_reports_which_is_which():
-    true_left_t_agent = _pose((1.0, 0.0, 0.5))
-    true_right_t_agent = _pose((-1.0, 0.2, 0.5), axis="z", deg=180.0)  # a DIFFERENT frame/answer
-    board_pose = _pose((0.4, 0.0, 0.0))
-
-    def make(arm: str, true_t_agent: np.ndarray, wrist_t: tuple) -> Capture:
-        base_t_flange = _pose(wrist_t)
-        return Capture(
-            arm=arm,
-            base_t_flange=base_t_flange,
-            wrist_t_board=np.linalg.inv(base_t_flange) @ board_pose,
-            agentview_t_board=np.linalg.inv(true_t_agent) @ board_pose,
-            wrist_reproj_error_px=0.1,
-            agentview_reproj_error_px=0.1,
-        )
-
-    captures = [
-        make("left", true_left_t_agent, (0.0, 0.0, 0.0)),
-        make("left", true_left_t_agent, (0.02, 0.0, 0.0)),
-        make("right", true_right_t_agent, (0.0, 0.0, 0.0)),
-        make("right", true_right_t_agent, (0.0, -0.02, 0.0)),
-    ]
-
-    results = solve_agentview_extrinsic_per_arm(captures, wrist_extrinsics={"left": np.eye(4), "right": np.eye(4)})
-
-    assert set(results) == {"left", "right"}
-    assert np.allclose(results["left"].base_t_agentview, true_left_t_agent, atol=1e-8)
-    assert np.allclose(results["right"].base_t_agentview, true_right_t_agent, atol=1e-8)
-    # If arms had been pooled, neither answer would match either true pose.
-    assert not np.allclose(results["left"].base_t_agentview, true_right_t_agent, atol=1e-3)
-
-
-def test_per_arm_skips_an_arm_with_too_few_captures_instead_of_raising():
-    """A session that only managed one right-wrist capture should still get the left arm's
-    result back, not lose everything to the arm that is not ready yet."""
-    left_pose = _pose((1.0, 0.0, 0.5))
-    board_pose = _pose((0.4, 0.0, 0.0))
-
-    def make(arm: str, wrist_t: tuple) -> Capture:
-        base_t_flange = _pose(wrist_t)
-        return Capture(
-            arm=arm,
-            base_t_flange=base_t_flange,
-            wrist_t_board=np.linalg.inv(base_t_flange) @ board_pose,
-            agentview_t_board=np.linalg.inv(left_pose) @ board_pose,
-            wrist_reproj_error_px=0.1,
-            agentview_reproj_error_px=0.1,
-        )
-
-    captures = [make("left", (0.0, 0.0, 0.0)), make("left", (0.01, 0.0, 0.0)), make("right", (0.0, 0.0, 0.0))]
-    results = solve_agentview_extrinsic_per_arm(captures, wrist_extrinsics={"left": np.eye(4), "right": np.eye(4)})
-    assert set(results) == {"left"}
-
-
-# --------------------------------------------------------------------------------------- #
-# agentview optional: wrist-only captures (agentview out of view) feed hand-eye, not agentview
-# --------------------------------------------------------------------------------------- #
-def test_wrist_only_captures_still_hand_eye_but_do_not_agentview():
-    """A high/far agentview may never see the board -- those captures must still calibrate the
-    wrist (hand-eye), and the agentview solve must simply skip that arm, not crash."""
-    true_g_t_c = _pose((0.02, -0.03, 0.05), axis="y", deg=25.0)
-    board = _pose((0.5, 0.1, 0.0), axis="z", deg=10.0)
-    caps = _wrist_captures(true_g_t_c, board)  # agentview_t_board is np.eye(4) placeholder...
-    # ...make it explicitly None: agentview never saw the board this session
-    caps = [Capture(c.arm, c.base_t_flange, c.wrist_t_board, None, c.wrist_reproj_error_px, None) for c in caps]
-
-    wrist = solve_wrist_extrinsic_per_arm(caps)
-    assert "left" in wrist  # hand-eye solved from wrist-only captures
-    assert np.allclose(wrist["left"].gripper_t_camera, true_g_t_c, atol=1e-8)
-
-    agentview = solve_agentview_extrinsic_per_arm(caps, wrist_extrinsics={"left": wrist["left"].gripper_t_camera})
-    assert agentview == {}  # nothing to place agentview against -> skipped, not raised
-
-
-def test_agentview_uses_only_the_captures_where_agentview_saw_the_board():
-    """A mix: some poses agentview saw, some it didn't. The agentview solve counts only the ones
-    it saw; the rest still counted toward hand-eye."""
-    true_base_t_agent = _pose((1.0, 0.0, 0.5))
-    g_t_c = _pose((0.03, 0.0, 0.0))
-    board = _pose((0.4, 0.0, 0.0))
-
-    def cap(wrist_t, *, agent_sees):
-        base_t_flange = _pose(wrist_t)
-        base_t_cam = base_t_flange @ g_t_c
-        return Capture(
-            "left",
-            base_t_flange,
-            np.linalg.inv(base_t_cam) @ board,
-            (np.linalg.inv(true_base_t_agent) @ board) if agent_sees else None,
-            0.1,
-            0.1 if agent_sees else None,
-        )
-
-    caps = [cap((0, 0, 0), agent_sees=True), cap((0.02, 0, 0), agent_sees=True), cap((0.04, 0, 0), agent_sees=False)]
-    result = solve_agentview_extrinsic(caps, wrist_extrinsic=g_t_c)
-    assert result.n_captures == 2  # only the two agentview-seeing captures
-    assert np.allclose(result.base_t_agentview, true_base_t_agent, atol=1e-8)
-
-
-def test_agentview_refuses_with_fewer_than_two_agentview_captures():
-    g_t_c = _pose((0.03, 0, 0))
-    board = _pose((0.4, 0, 0))
-    fl = _pose((0.0, 0, 0))
-    one = Capture("left", fl, np.linalg.inv(fl @ g_t_c) @ board, np.eye(4), 0.1, 0.1)
-    none = Capture("left", _pose((0.02, 0, 0)), np.eye(4), None, 0.1, None)
-    with pytest.raises(ValueError, match="at least 2"):
-        solve_agentview_extrinsic([one, none], wrist_extrinsic=g_t_c)
-
-
-# --------------------------------------------------------------------------------------- #
-# solve_arm_offset: left_T_right from simultaneous both-wrists-see-the-board captures
-# --------------------------------------------------------------------------------------- #
-def test_recovers_the_true_arm_offset_and_its_distance():
-    true_left_t_right = _pose((0.6, -0.05, 0.0), axis="z", deg=178.0)  # ~60cm apart, facing in
-    board_pose = _pose((0.3, 0.0, 0.0))  # the board, between the two arms
-
-    rng = np.random.default_rng(2)
-    captures = []
-    for _ in range(4):
-        left_t_flange = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
-        right_t_flange = _pose(rng.uniform(-0.05, 0.05, 3), axis="y", deg=float(rng.uniform(-15, 15)))
-        left_t_board_true = np.linalg.inv(left_t_flange) @ board_pose
-        # right's board pose, EXPRESSED IN right's own frame -- board_pose is in "left's frame"
-        # here only because that is the ground truth we picked; right sees it through the
-        # (also ground-truth) arm offset.
-        right_t_board_true = np.linalg.inv(right_t_flange) @ np.linalg.inv(true_left_t_right) @ board_pose
-        captures.append(
-            ArmPairCapture(
-                left_t_flange=left_t_flange,
-                left_wrist_t_board=left_t_board_true,
-                right_t_flange=right_t_flange,
-                right_wrist_t_board=right_t_board_true,
-                left_reproj_error_px=0.1,
-                right_reproj_error_px=0.1,
-            )
-        )
-
-    result = solve_arm_offset(captures, left_extrinsic=np.eye(4), right_extrinsic=np.eye(4))
-    assert np.allclose(result.left_t_right, true_left_t_right, atol=1e-8)
-    assert np.isclose(result.distance_m, float(np.linalg.norm(true_left_t_right[:3, 3])), atol=1e-8)
-    assert result.n_captures == 4
-    assert result.translation_rms_mm < 1e-3
-
-
-def test_arm_offset_refuses_a_single_capture():
-    c = ArmPairCapture(np.eye(4), np.eye(4), np.eye(4), np.eye(4), 0.0, 0.0)
-    with pytest.raises(ValueError, match="at least 2"):
-        solve_arm_offset([c], left_extrinsic=np.eye(4), right_extrinsic=np.eye(4))
-
-
-# --------------------------------------------------------------------------------------- #
-# unify_rig_calibration: fuse + cross-check the two agentview routes via the arm offset
-# --------------------------------------------------------------------------------------- #
-def test_unify_fuses_agreeing_estimates_with_a_small_cross_check():
-    """When left's direct solve and right's solve bridged through left_T_right agree (as they
-    must, if every calibration was solved correctly against the same physical rig), the fused
-    answer should sit close to both and the cross-check should be small."""
-    true_left_t_agent = _pose((1.0, 0.0, 0.5))
-    true_left_t_right = _pose((0.6, 0.0, 0.0), axis="z", deg=180.0)
-    true_right_t_agent = np.linalg.inv(true_left_t_right) @ true_left_t_agent  # self-consistent
-
-    left_result = solve_agentview_extrinsic(
-        [
-            Capture("left", np.eye(4), np.eye(4), np.linalg.inv(true_left_t_agent), 0.1, 0.1),
-            Capture(
-                "left",
-                _pose((0.01, 0, 0)),
-                np.linalg.inv(_pose((0.01, 0, 0))),
-                np.linalg.inv(true_left_t_agent),
-                0.1,
-                0.1,
-            ),
-        ],
-        wrist_extrinsic=np.eye(4),
-    )
-    right_result = solve_agentview_extrinsic(
-        [
-            Capture("right", np.eye(4), np.eye(4), np.linalg.inv(true_right_t_agent), 0.1, 0.1),
-            Capture(
-                "right",
-                _pose((0.01, 0, 0)),
-                np.linalg.inv(_pose((0.01, 0, 0))),
-                np.linalg.inv(true_right_t_agent),
-                0.1,
-                0.1,
-            ),
-        ],
-        wrist_extrinsic=np.eye(4),
-    )
-    arm_offset = ArmOffsetResult(
-        true_left_t_right, float(np.linalg.norm(true_left_t_right[:3, 3])), 4, 0.0, 0.0, [], []
-    )
-
-    unified = unify_rig_calibration({"left": left_result, "right": right_result}, arm_offset)
-
-    assert np.allclose(unified.left_t_agentview, true_left_t_agent, atol=1e-6)
-    assert unified.cross_check_translation_mm is not None
-    assert unified.cross_check_translation_mm < 1e-3
-    assert unified.cross_check_rotation_deg < 1e-3
-    assert np.isclose(unified.distance_m, 0.6, atol=1e-8)
-
-
-def test_unify_falls_back_to_whichever_single_arm_is_available():
-    """A rig calibrated so far from only one arm's captures still produces a usable answer --
-    just without the cross-check, since there is nothing independent to check it against."""
-    true_left_t_agent = _pose((1.0, 0.0, 0.5))
-    left_result = solve_agentview_extrinsic(
-        [
-            Capture("left", np.eye(4), np.eye(4), np.linalg.inv(true_left_t_agent), 0.1, 0.1),
-            Capture(
-                "left",
-                _pose((0.01, 0, 0)),
-                np.linalg.inv(_pose((0.01, 0, 0))),
-                np.linalg.inv(true_left_t_agent),
-                0.1,
-                0.1,
-            ),
-        ],
-        wrist_extrinsic=np.eye(4),
-    )
-    arm_offset = ArmOffsetResult(np.eye(4), 0.0, 2, 0.0, 0.0, [], [])
-
-    unified = unify_rig_calibration({"left": left_result}, arm_offset)
-
-    assert np.allclose(unified.left_t_agentview, true_left_t_agent, atol=1e-8)
-    assert unified.cross_check_translation_mm is None
-    assert unified.cross_check_rotation_deg is None
-
-
-def test_unify_refuses_when_neither_arm_is_available():
-    with pytest.raises(ValueError, match="neither"):
-        unify_rig_calibration({}, ArmOffsetResult(np.eye(4), 0.0, 0, 0.0, 0.0, [], []))
-
-
-# --------------------------------------------------------------------------------------- #
-# detect_board_pose: one real cv2.aruco round trip (render -> detect), not hand-built matrices
-# --------------------------------------------------------------------------------------- #
-def test_detects_a_board_cv2_rendered_itself():
-    spec = BoardSpec(squares_x=5, squares_y=4, square_length_m=0.03, marker_length_m=0.022)
-    board = make_board(spec)
-    img_size = 640
-    image = board.generateImage((img_size, img_size), marginSize=20)
-
-    # Intrinsics self-consistent with a frame that is (about) the board's own top-down render --
-    # not a physical camera, but real enough for solvePnP to have something to solve.
-    intr = {"fx": img_size, "fy": img_size, "cx": img_size / 2, "cy": img_size / 2}
-
-    detection = detect_board_pose(image, spec, intr)
-
-    assert detection is not None
-    assert detection.n_corners >= 6
-    assert detection.reproj_error_px < 1.0  # a clean synthetic render, not a photo -- should be tight
-    assert detection.cam_t_board[2, 3] > 0  # the board is in front of the camera, not behind it
-
-
-def test_returns_none_for_an_image_with_no_board_in_it():
-    spec = BoardSpec()
-    blank = np.full((480, 640, 3), 128, np.uint8)
-    intr = {"fx": 600, "fy": 600, "cx": 320, "cy": 240}
-    assert detect_board_pose(blank, spec, intr) is None
 
 
 # --------------------------------------------------------------------------------------- #
@@ -646,40 +130,29 @@ def test_eyetohand_per_arm_skips_an_arm_below_three():
     assert set(out) == {"left"}  # the 2-capture right arm is dropped, not an error
 
 
-def test_eyetohand_cross_check_is_tiny_when_both_arms_and_offset_agree():
-    """Two arms solve agentview in their OWN frames; bridged through the true left_T_right they
-    must coincide -- the end-to-end confidence number a real two-arm run reports."""
-    y_true = _pose((0.03, 0.0, 0.12), "y", 30.0)
-    x_left = _pose((0.4, -0.1, 0.9), "x", 150.0)
-    left_t_right = _pose((0.03, -0.53, 0.05), "z", 5.0)
-    x_right = np.linalg.inv(left_t_right) @ x_left  # the SAME camera, expressed in the right frame
-    caps = _eth_captures(x_left, y_true, arm="left", n=6, seed=1) + _eth_captures(
-        x_right, y_true, arm="right", n=5, seed=2
-    )
-    out = solve_agentview_extrinsic_eyetohand_per_arm(caps)
-    unified = unify_agentview_eyetohand(out, left_t_right)
-    assert unified.cross_check_translation_mm < 1e-6
-    assert unified.cross_check_rotation_deg < 1e-6
-    assert np.allclose(unified.left_t_agentview, x_left, atol=1e-9)  # fused answer in the left frame
+# --------------------------------------------------------------------------------------- #
+# detect_board_pose: one real cv2.aruco round trip (render -> detect), not hand-built matrices
+# --------------------------------------------------------------------------------------- #
+def test_detects_a_board_cv2_rendered_itself():
+    spec = BoardSpec(squares_x=5, squares_y=4, square_length_m=0.03, marker_length_m=0.022)
+    board = make_board(spec)
+    img_size = 640
+    image = board.generateImage((img_size, img_size), marginSize=20)
+
+    # Intrinsics self-consistent with a frame that is (about) the board's own top-down render --
+    # not a physical camera, but real enough for solvePnP to have something to solve.
+    intr = {"fx": img_size, "fy": img_size, "cx": img_size / 2, "cy": img_size / 2}
+
+    detection = detect_board_pose(image, spec, intr)
+
+    assert detection is not None
+    assert detection.n_corners >= 6
+    assert detection.reproj_error_px < 1.0  # a clean synthetic render, not a photo -- should be tight
+    assert detection.cam_t_board[2, 3] > 0  # the board is in front of the camera, not behind it
 
 
-def test_eyetohand_cross_check_catches_a_wrong_offset():
-    y_true = _pose((0.03, 0.0, 0.12), "y", 30.0)
-    x_left = _pose((0.4, -0.1, 0.9), "x", 150.0)
-    left_t_right = _pose((0.03, -0.53, 0.05), "z", 5.0)
-    x_right = np.linalg.inv(left_t_right) @ x_left
-    caps = _eth_captures(x_left, y_true, arm="left", n=6, seed=1) + _eth_captures(
-        x_right, y_true, arm="right", n=5, seed=2
-    )
-    out = solve_agentview_extrinsic_eyetohand_per_arm(caps)
-    wrong = _pose((0.10, -0.53, 0.05), "z", 5.0)  # offset off by 7 cm
-    unified = unify_agentview_eyetohand(out, wrong)
-    assert unified.cross_check_translation_mm > 50.0  # the disagreement surfaces, not silently fused
-
-
-def test_eyetohand_unify_with_one_arm_has_no_cross_check():
-    x_true, y_true = _pose((0.4, 0, 0.9), "x", 150.0), _pose((0.03, 0, 0.12), "y", 30.0)
-    out = solve_agentview_extrinsic_eyetohand_per_arm(_eth_captures(x_true, y_true, arm="left", n=5))
-    unified = unify_agentview_eyetohand(out, _pose((0.0, -0.53, 0.0)))
-    assert unified.cross_check_translation_mm is None
-    assert unified.cross_check_rotation_deg is None
+def test_returns_none_for_an_image_with_no_board_in_it():
+    spec = BoardSpec()
+    blank = np.full((480, 640, 3), 128, np.uint8)
+    intr = {"fx": 600, "fy": 600, "cx": 320, "cy": 240}
+    assert detect_board_pose(blank, spec, intr) is None

@@ -1,57 +1,29 @@
-"""Calibrate the whole camera rig against one ChArUco board sitting on the desk.
+"""Calibrate the AGENTVIEW camera by grasping a ChArUco board with the gripper (eye-to-hand).
 
-From a single board (never moved, never attached to the robot) this recovers, per re-solve, in
-order -- see :mod:`workstation.lerobot_recorder.charuco` for the geometry:
+The agentview camera sits too high to co-see a desk board with a wrist camera, so it is calibrated
+the other way round: **grasp the board with the gripper** and lift it into agentview's view. The
+camera is fixed and the target rides the hand, so agentview + forward kinematics alone recover
+``base_T_agentview`` per arm -- no wrist camera, no arm offset, no shared frame (see
+:mod:`workstation.lerobot_recorder.charuco`). The wrist cameras are NOT calibrated here; their
+mount comes from the CAD ``T_GRIPPER_CAMERA`` constant.
 
-1. **each wrist camera's own extrinsic** (``gripper_T_camera``), by eye-in-hand hand-eye
-   calibration -- so the mount is measured, not trusted from the unverified CAD constant;
-2. **each agentview extrinsic**, chained through that arm's (now measured) wrist extrinsic;
-3. **the left<->right arm offset**, and the fused/cross-checked shared-frame answer.
+Live agentview preview with the board outline drawn when found. Grasp the board **rigidly and do
+not re-grip mid-run** (the solve assumes its pose in the gripper is constant). Move to a few
+poses **varying the grip TILT, not just position** (hand-eye needs that or the rotation is
+unconstrained), and each pose is captured hands-free: while teleop is ENGAGED and agentview sees
+the board, holding the arm still for ~1 s auto-captures, then re-arms once you move away. **Space**
+(or the on-screen button) is a manual fallback; a leader-handle trigger is available but off by
+default. With both arms available an "arm holding the board" selector picks which gripper's FK a
+capture is attributed to -- run one arm, then move the board to the other and switch it.
 
-YAM is bimanual, so BOTH wrist cameras can bridge -- whichever one currently has the board in
-view. Live preview of agentview + both wrists with the board outline drawn when found; hit
-**Space** (or click Capture) to grab one sample per wrist camera that currently sees the board
-(0, 1, or 2 -- both arms do not have to be posed at once, and when they are, one press banks two
-independent estimates instead of one). A **leader-handle button** can trigger capture too, but is
-OFF by default (``--capture-button`` to enable): in teleop the robot server already consumes the
-handles while engaged -- the outcome buttons force homing, the fine button starts recentering --
-so a press there would move the arm rather than capture. Only enable it against a robot mode that
-leaves the handles free. Every enabled trigger is gated by the same readiness check, so none can
-capture out of a bad state. Move the arm(s) to a few different poses -- **varying wrist TILT, not
-just position**, which hand-eye needs -- and capture at each. Whenever a press happens to catch
-BOTH wrist cameras seeing the board AT ONCE, it also banks an ``ArmPairCapture`` for free towards
-the arm-to-arm offset; this needs both arms actually posed together for at least a couple of
-presses.
+The solve re-runs after every capture, per arm, with a live convergence trend (RMS over the last
+few re-solves). Each arm needs **3+ varied-tilt captures**. Each arm solves in its OWN frame; they
+are never pooled (see charuco's module docstring), so a consumer overlaying an arm's action uses
+that arm's own extrinsic.
 
-The solve re-runs automatically after every capture -- no need to click "Solve" and wait; watch
-the numbers on screen while you work instead of guessing how many more poses to collect. Hand-eye
-(step 1) needs 3+ varied-orientation captures per arm.
-
-The two wrist mounts are the same part in the same place, so by default the arms' hand-eye solves
-are FUSED into ONE ``gripper_T_camera`` used for both (``--no-shared-wrist-mount`` to solve each
-separately). That means one well-calibrated arm gives the other its mount too -- so an arm still
-short of 3 varied captures, or one whose wrist can't see the board much, gets the measured mount
-rather than the CAD fallback. The reported **cross-arm spread** (how far the arms' independent
-solves sat apart) is a direct check on "the mounts really are identical"; and each wrist line also
-shows **vs CAD Δ** -- how far the solve is from the unverified CAD constant, so a wildly-off result
-(wrong board size, degenerate poses, bad FK) is obvious rather than silently saved. Only when NO
-arm has solved yet do steps 2-3 fall back to CAD.
-
-The agentview extrinsics and the arm offset are still PER ARM, never pooled: each arm's FK is its
-own frame with no known transform to the other's -- there is no shared "robot base" frame anywhere
-in this codebase (see ``charuco``'s module docstring), which is exactly what the arm offset (step
-3) recovers. Each line carries a **convergence trend** (the RMS from the last several re-solves) so
-"still dropping" reads differently from "flat for the last 3".
-
-"Save" writes into ``config.yaml`` -- THE single source of truth for the rig (camera serials,
-robot host, button map, ... all already live there). A confirmation dialog names the file first,
-a ``.bak`` copy is kept before writing, and only the touched blocks change --
-``cameras.wrist_<arm>.extrinsic`` (the hand-eye mount, overriding CAD), ``cameras.agentview
-.extrinsic.<arm>`` per arm, ``cameras.agentview.extrinsic.unified`` (the fused answer) when both
-arms solved, and ``robot.arm_offset`` -- via a line-range splice (see ``charuco.splice_*``), not
-a YAML load/dump round trip that would strip every comment and reflow the whole document. All
-blocks are written from the SAME live solve in one call, so nothing this tool writes can disagree
-with anything else it writes.
+"Save" writes into ``config.yaml`` -- THE single source of truth for the rig -- via a line-range
+splice (a ``.bak`` kept, only ``cameras.agentview.extrinsic.<arm>`` + ``calibration.board``
+change, comments preserved), not a YAML load/dump round trip.
 """
 
 from __future__ import annotations
@@ -62,36 +34,18 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
-from yam_policy.viz import T_GRIPPER_CAMERA
 
 from i2rt.serving.teleop_common import handle_button_pressed
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.charuco import (
     AgentviewEyeToHandResult,
-    ArmOffsetResult,
-    ArmPairCapture,
     BoardSpec,
-    CalibrationResult,
-    Capture,
     EyeToHandCapture,
-    SharedWristExtrinsic,
-    UnifiedRigCalibration,
-    WristExtrinsicResult,
     detect_board_pose,
-    fuse_wrist_extrinsics,
-    pose_delta,
     solve_agentview_extrinsic_eyetohand_per_arm,
-    solve_agentview_extrinsic_per_arm,
-    solve_arm_offset,
-    solve_wrist_extrinsic_per_arm,
     splice_agentview_extrinsic,
-    splice_agentview_unified,
-    splice_arm_offset,
     splice_board,
-    splice_wrist_extrinsic,
-    unify_agentview_eyetohand,
-    unify_rig_calibration,
 )
 from workstation.lerobot_recorder.config import RecorderConfig
 
@@ -111,30 +65,29 @@ def _draw_detection(img: np.ndarray, corners_px: Optional[np.ndarray]) -> np.nda
     """The frame, with the board's detected corners marked -- or left untouched if not seen.
 
     A separate copy, not an in-place draw: the caller still needs the clean frame for the actual
-    PnP solve on ``Capture``, only the *preview* gets decorated.
+    PnP solve, only the *preview* gets decorated.
     """
     if corners_px is None:
         return img
     out = np.ascontiguousarray(img).copy()
     for x, y in corners_px:
-        # x, y are numpy float64 here, not Python float: round() on them returns a numpy
-        # scalar too (unlike the builtin's int-returning overload ruff assumes), so int() is
-        # not redundant -- it is what makes these valid slice bounds below.
+        # x, y are numpy float64 here, not Python float: round() on them returns a numpy scalar
+        # too (unlike the builtin's int-returning overload ruff assumes), so int() is not
+        # redundant -- it is what makes these valid slice bounds below.
         xi, yi = int(round(x)), int(round(y))  # noqa: RUF046
         out[max(0, yi - 3) : yi + 3, max(0, xi - 3) : xi + 3] = (60, 220, 130)
     return out
 
 
 def _convergence_note(history: List[tuple], *, stable_mm: float = 1.0, window: int = 3) -> str:
-    """A trend string from a ``[(n_captures, translation_rms_mm, rotation_rms_deg), ...]``
-    history, one entry per re-solve (see ``CalibrateAgentviewWindow._record``).
+    """A trend string from a ``[(n_captures, translation_rms_mm, rotation_rms_deg), ...]`` history,
+    one entry per re-solve (see ``CalibrateAgentviewWindow._record``).
 
-    "Converged" is read straight off the numbers, not a separate model: if the last ``window``
-    re-solves' translation RMS swung by less than ``stable_mm``, more captures are not visibly
-    changing the answer. That is a statement about what has been seen so far, not a proof the
-    true value is close -- a rig with too few DIVERSE poses can sit falsely flat (e.g. every
-    capture from nearly the same angle). It is still the honest, cheap signal to put on screen
-    live; the per-capture disagreement numbers next to it are the deeper check.
+    "Converged" is read straight off the numbers: if the last ``window`` re-solves' translation RMS
+    swung by less than ``stable_mm``, more captures are not visibly changing the answer. That is a
+    statement about what has been seen so far, not a proof the true value is close -- too few
+    DIVERSE poses can sit falsely flat. It is still the honest, cheap signal to put on screen live;
+    the per-capture disagreement numbers next to it are the deeper check.
     """
     if len(history) < 2:
         return "(need more captures to judge convergence)"
@@ -158,11 +111,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         capture_buttons: Sequence[str] = (),
         auto_capture: bool = True,
         auto_dwell_s: float = 1.0,
-        shared_wrist_mount: bool = True,
-        board_on_gripper: bool = False,
-        arm_offset_left_t_right: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
+        self.setWindowTitle("Calibrate agentview -- board grasped on the gripper (eye-to-hand)")
         self.cams = cams
         self.robot = robot
         self.geometries = geometries
@@ -170,39 +121,17 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.board = board
         self.config_path = config_path  # None = no config.yaml found; Save will say so
         self.mock = mock
-        # Board-on-gripper (eye-to-hand) mode: the board is GRASPED and lifted into agentview's
-        # view, so agentview alone + FK solves its extrinsic -- no wrist camera, no desk board
-        # co-visibility needed (the desk-board chain's requirement, which fails when agentview is
-        # mounted too high to co-see a desk board with a wrist). See charuco.solve_agentview_
-        # extrinsic_eyetohand. arm_offset_left_t_right (from a prior wrist calibration in
-        # config.yaml's robot.arm_offset) lets two single-arm solves be cross-checked.
-        self.board_on_gripper = bool(board_on_gripper)
-        self.arm_offset_left_t_right = arm_offset_left_t_right
-        self.setWindowTitle(
-            "Calibrate agentview -- board grasped on the gripper (eye-to-hand)"
-            if self.board_on_gripper
-            else "Calibrate rig -- wrist extrinsics, agentview, arm offset (one desk board)"
-        )
-        # Both wrist mounts are the same part in the same place, so gripper_T_camera is ONE
-        # transform: fuse the arms' independent hand-eye solves into a shared value used for both
-        # (see charuco.fuse_wrist_extrinsics). Less noise, one good arm calibrates both, and the
-        # cross-arm spread checks the "identical mount" assumption. --no-shared-wrist-mount to
-        # solve each arm separately instead (e.g. if the mounts are known to differ).
-        self.shared_wrist_mount = bool(shared_wrist_mount)
-        # "<side>.<index>" leader-handle buttons (upper=0, lower=1) that trigger a capture, any
-        # ONE firing. EMPTY BY DEFAULT: in teleop the robot server already consumes these while
-        # engaged (outcome buttons -> homing, fine button -> recentering; see i2rt controllers),
-        # so a handle press would move the arm rather than capture. Opt in with --capture-button
-        # only against a robot mode that leaves the handles free. Space always works.
+
+        # "<side>.<index>" leader-handle buttons (upper=0, lower=1) that trigger a capture, any ONE
+        # firing. EMPTY BY DEFAULT: in teleop the robot server already consumes these while engaged
+        # (outcome buttons -> homing, fine button -> recentering), so a handle press would move the
+        # arm rather than capture. Space always works.
         self.capture_buttons = list(capture_buttons)
         self._capture_btn_prev = False  # rising-edge state across the WHOLE set, not per-button
 
         # Hands-free capture: while teleop is ENGAGED and the board is in view, holding the arm
-        # still for `auto_dwell_s` fires one capture; you must move away before it re-arms. This
-        # is the primary trigger -- both hands are on the leaders, so Space and handle buttons are
-        # both awkward -- so it defaults on. Holding still (vs. snapping on a timer while moving)
-        # also keeps each capture's image and joint pose from the same instant. See
-        # _auto_capture_check for the state machine and the (tuned) motion thresholds.
+        # still for `auto_dwell_s` fires one capture; you must move away before it re-arms. Primary
+        # trigger since both hands are on the leaders. See _auto_capture_check.
         self.auto_capture = bool(auto_capture)
         self.auto_dwell_s = float(auto_dwell_s)
         self._auto_still_rad = 0.01  # ~0.6 deg: drift under this over the dwell counts as "still"
@@ -214,25 +143,13 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self._engaged: Optional[bool] = None  # teleop engage state from the last obs (None = unknown)
 
         self._last_agent_det = None
-        self._last_wrist_det: Dict[str, object] = {}  # arm -> Detection | None
         self._last_q: Dict[str, Optional[np.ndarray]] = {}  # arm -> joints | None
-        self.captures: List[Capture] = []
-        # Only ever appended alongside a regular Capture (see _on_capture), and only when BOTH
-        # wrist cameras saw the board in the SAME tick -- see ArmPairCapture's docstring for why
-        # "same tick" (board unmoved) is what makes the offset valid at all.
-        self.pair_captures: List[ArmPairCapture] = []
-        # One (n_captures, translation_rms_mm, rotation_rms_deg) appended per re-solve that
-        # actually added a new capture -- see _convergence_note and _record.
+        self.captures: List[EyeToHandCapture] = []
+        # One (n_captures, translation_rms_mm, rotation_rms_deg) appended per re-solve that added a
+        # new capture -- see _convergence_note and _record.
         self._history: Dict[str, List[tuple]] = {arm: [] for arm in self.arms}
-        self._wrist_history: Dict[str, List[tuple]] = {arm: [] for arm in self.arms}
-        self._offset_history: List[tuple] = []
-
-        # Board-on-gripper (eye-to-hand) mode: its own capture list + solve outputs, kept separate
-        # from the desk-board ones above so the two modes never cross-contaminate a solve.
-        self.eth_captures: List[EyeToHandCapture] = []
-        self._eth_history: Dict[str, List[tuple]] = {arm: [] for arm in self.arms}
-        self._last_eth_results: Dict[str, AgentviewEyeToHandResult] = {}
-        self._last_eth_unified: Optional[UnifiedRigCalibration] = None
+        # What the last successful solve found -- what _on_save writes.
+        self._last_results: Dict[str, AgentviewEyeToHandResult] = {}
 
         self._build_ui()
         self.timer = QtCore.QTimer(self)
@@ -246,28 +163,16 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
 
-        views = QtWidgets.QHBoxLayout()
         self.agent_view = QtWidgets.QLabel("agentview")
-        self.wrist_views: Dict[str, QtWidgets.QLabel] = {arm: QtWidgets.QLabel(f"wrist_{arm}") for arm in self.arms}
-        for lbl in (self.agent_view, *self.wrist_views.values()):
-            lbl.setMinimumSize(360, 270)
-            lbl.setAlignment(QtCore.Qt.AlignCenter)
-            lbl.setStyleSheet(f"background:#000; border:1px solid {theme.IDLE}; border-radius:8px;")
-        views.addWidget(self.agent_view)
-        # Board-on-gripper mode uses agentview only (no wrist bridge), so its wrist previews stay
-        # hidden -- one fewer thing on screen that does nothing in this mode.
-        for lbl in self.wrist_views.values():
-            if self.board_on_gripper:
-                lbl.hide()
-            views.addWidget(lbl)
-        root.addLayout(views, 1)
+        self.agent_view.setMinimumSize(480, 360)
+        self.agent_view.setAlignment(QtCore.Qt.AlignCenter)
+        self.agent_view.setStyleSheet(f"background:#000; border:1px solid {theme.IDLE}; border-radius:8px;")
+        root.addWidget(self.agent_view, 1)
 
-        # Board-on-gripper with both arms available: which arm is currently holding the board.
-        # Captures are attributed to it (the tool cannot tell from the cameras which gripper the
-        # board is in). One arm at a time -- grasp with left, capture poses, then move the board to
-        # the right gripper, switch this, capture again. With a single arm there is nothing to pick.
+        # With both arms available: which arm is currently holding the board. Captures are
+        # attributed to it (the tool cannot tell from the camera which gripper the board is in).
         self.arm_selector: Optional[QtWidgets.QComboBox] = None
-        if self.board_on_gripper and len(self.arms) > 1:
+        if len(self.arms) > 1:
             selrow = QtWidgets.QHBoxLayout()
             selrow.addWidget(QtWidgets.QLabel("Board held by:"))
             self.arm_selector = QtWidgets.QComboBox()
@@ -277,7 +182,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             selrow.addStretch(1)
             root.addLayout(selrow)
 
-        self.status = QtWidgets.QLabel("waiting for the board...")
+        self.status = QtWidgets.QLabel("waiting for the grasped board...")
         self.status.setStyleSheet(f"color:{theme.MUTED};")
         root.addWidget(self.status)
 
@@ -285,11 +190,8 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.capture_btn = QtWidgets.QPushButton("Capture  [Space]")
         self.capture_btn.setEnabled(False)
         self.capture_btn.clicked.connect(self._on_capture)
-        # Space, not the button, is the intended way to capture: both hands are usually busy
-        # holding the robot in position by the time a pose is worth capturing. Bound on the
-        # window (WidgetWithChildrenShortcut default would miss it once focus is on a button/
-        # list), and only fires the click when the button itself is enabled -- same readiness
-        # gate as clicking it, so this cannot capture out of a bad state either.
+        # Space is the intended way to capture (both hands are usually busy). Bound on the window,
+        # and only fires when the button itself is enabled -- same readiness gate as clicking it.
         self._capture_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Space), self)
         self._capture_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self._capture_shortcut.activated.connect(lambda: self.capture_btn.isEnabled() and self._on_capture())
@@ -312,42 +214,26 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self.capture_list.setMaximumHeight(160)
         root.addWidget(self.capture_list)
 
-        self.pair_label = QtWidgets.QLabel("arm-pair samples (for the left/right offset): 0")
-        self.pair_label.setStyleSheet(f"color:{theme.MUTED};")
-        if self.board_on_gripper:
-            self.pair_label.hide()  # no arm-pair offset in this mode (agentview-only, no wrist)
-        root.addWidget(self.pair_label)
-
-        # Read-only scrolling log, not a QLabel: the solve report grows past a screenful
-        # (per-arm wrist + shared + vs-CAD + per-arm agentview + offset + unified), and a
-        # QLabel just clips it with no way to scroll. Monospace so the aligned columns
-        # (RMS / vs CAD / spread) line up.
+        # Read-only scrolling log (monospace so the RMS columns line up), not a QLabel that would
+        # clip the multi-line per-arm report.
         self.result_label = QtWidgets.QPlainTextEdit("not solved yet")
         self.result_label.setReadOnly(True)
         self.result_label.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        self.result_label.setMinimumHeight(180)
+        self.result_label.setMinimumHeight(120)
         mono = QtGui.QFont("monospace", 12)
         mono.setStyleHint(QtGui.QFont.Monospace)
         self.result_label.setFont(mono)
         root.addWidget(self.result_label, 1)
 
-        # What the last successful _solve_and_report found -- what _on_save actually writes.
-        self._last_wrist: Dict[str, WristExtrinsicResult] = {}  # per-arm independent hand-eye
-        self._last_shared_wrist: Optional[SharedWristExtrinsic] = None  # fused (shared-mount mode)
-        self._last_results: Dict[str, CalibrationResult] = {}
-        self._last_arm_offset: Optional[ArmOffsetResult] = None
-        self._last_unified: Optional[UnifiedRigCalibration] = None
-
     def _active_arm(self) -> str:
-        """The arm currently holding the board (board-on-gripper mode) -- the selector's value, or
-        the sole arm when there is no selector."""
+        """The arm currently holding the board -- the selector's value, or the sole arm."""
         if self.arm_selector is not None:
             return self.arm_selector.currentText()
         return self.arms[0]
 
     def _on_active_arm_changed(self, _arm: str) -> None:
-        # Switching which arm holds the board must restart the auto-capture dwell (the joints being
-        # watched changed), exactly like toggling auto-capture does.
+        # Switching which arm holds the board restarts the auto-capture dwell (the watched joints
+        # changed), like toggling auto-capture does.
         self._auto_still_since = self._auto_ref_q = self._auto_rearm_q = self._auto_key = None
 
     # ------------------------------------------------------------------ loop
@@ -358,68 +244,6 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             self.status.setText(f"camera read failed: {e}")
             return
 
-        if self.board_on_gripper:
-            self._tick_eth(frames)
-            return
-
-        robot_obs = self._get_robot_obs()  # one RPC round trip for both arms' joints + buttons
-
-        agent_img = frames.get("agentview")
-        agent_intr = self.cams.intrinsics("agentview")
-        self._last_agent_det = (
-            detect_board_pose(agent_img, self.board, agent_intr) if agent_img is not None and agent_intr else None
-        )
-        if agent_img is not None:
-            preview = _draw_detection(agent_img, self._last_agent_det.corners_px if self._last_agent_det else None)
-            self.agent_view.setPixmap(_np_to_pixmap(preview).scaled(self.agent_view.size(), QtCore.Qt.KeepAspectRatio))
-
-        # ready_arms: a wrist sees the board + we have its joints -> capturable (feeds hand-eye).
-        # agentview is NOT required here -- a capture where agentview also sees the board
-        # additionally feeds the agentview solve, but a wrist-only pose is still worth banking
-        # (this is what makes "calibrate wrists first, agentview later" possible).
-        ready_arms = []
-        agent_ready_arms = []
-        for arm in self.arms:
-            key = f"wrist_{arm}"
-            img = frames.get(key)
-            intr = self.cams.intrinsics(key)
-            det = detect_board_pose(img, self.board, intr) if img is not None and intr else None
-            self._last_wrist_det[arm] = det
-            self._last_q[arm] = self._joints_from_obs(robot_obs, arm)
-            if img is not None:
-                preview = _draw_detection(img, det.corners_px if det else None)
-                self.wrist_views[arm].setPixmap(
-                    _np_to_pixmap(preview).scaled(self.wrist_views[arm].size(), QtCore.Qt.KeepAspectRatio)
-                )
-            if det is not None and self._last_q[arm] is not None:
-                ready_arms.append(arm)
-                if self._last_agent_det is not None:
-                    agent_ready_arms.append(arm)
-
-        # Teleop reports its engage state at the top level (controllers.py); None when a robot
-        # does not report it (then auto-capture does not gate on engagement -- see below).
-        self._engaged = robot_obs.get("active") if "active" in robot_obs else None
-
-        self.capture_btn.setEnabled(bool(ready_arms))
-        triggers = "Space" + (f"/leader button ({'/'.join(self.capture_buttons)})" if self.capture_buttons else "")
-        auto = " · auto-capture: hold still" if self.auto_capture else ""
-        if not ready_arms:
-            self.status.setText("not ready -- move a wrist camera so it sees the board")
-        else:
-            engaged_note = "" if self._engaged is None else (" [engaged]" if self._engaged else " [NOT engaged]")
-            if agent_ready_arms:
-                av = f" · agentview also sees it ({', '.join(agent_ready_arms)}) -> feeds agentview too"
-            else:
-                av = " · agentview does NOT see it -> wrist hand-eye only"
-            self.status.setText(f"ready ({triggers}){auto}{engaged_note}: {', '.join(ready_arms)}{av}")
-
-        self._check_capture_button(robot_obs)
-        self._auto_capture_check(ready_arms, self._engaged, time.monotonic())
-
-    def _tick_eth(self, frames: dict) -> None:
-        """Board-on-gripper (eye-to-hand) tick: agentview only. Ready = agentview sees the grasped
-        board AND we have the active arm's joints. Reuses the same auto-capture state machine as
-        the desk-board mode, keyed on the one active arm."""
         robot_obs = self._get_robot_obs()
         agent_img = frames.get("agentview")
         agent_intr = self.cams.intrinsics("agentview")
@@ -456,17 +280,13 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self._auto_still_since = self._auto_ref_q = self._auto_rearm_q = self._auto_key = None
 
     def _auto_capture_check(self, ready_arms: List[str], engaged: Optional[bool], now: float) -> None:
-        """Fire one capture when the arm(s) have been held still, board in view, while engaged.
+        """Fire one capture when the active arm has been held still, board in view, while engaged.
 
-        The primary trigger, since both hands are on the leaders (Space/handle buttons are
-        awkward or unsafe -- see the module docstring). "Held still" is what keeps each capture's
-        image and joint pose from the same instant, and is also what naturally excludes the
-        homing/ramp motion. Re-arms only after the arm moves ``_auto_move_rad`` away, so holding a
-        pose does not machine-gun captures. ``now`` is injected (``time.monotonic()`` from the
-        tick) so the dwell logic is testable without real time.
-
-        ``engaged`` gates it to active teleoperation when the robot reports engage state; None
-        (robot does not report it, or --mock) means "do not gate on it".
+        "Held still" keeps each capture's image and joint pose from the same instant, and naturally
+        excludes homing/ramp motion. Re-arms only after the arm moves ``_auto_move_rad`` away, so
+        holding a pose does not machine-gun captures. ``now`` is injected (``time.monotonic()`` from
+        the tick) so the dwell logic is testable without real time. ``engaged`` gates it to active
+        teleoperation when the robot reports engage state; None means "do not gate on it".
         """
         capturable = self.auto_capture and bool(ready_arms) and self.capture_btn.isEnabled() and engaged is not False
         if not capturable:
@@ -474,7 +294,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             return
         key = tuple(ready_arms)
         q = np.concatenate([np.asarray(self._last_q[a], dtype=float) for a in ready_arms])
-        if key != self._auto_key:  # the set of ready arms changed -> start fresh (avoids shape mismatch)
+        if key != self._auto_key:  # the active arm changed -> start fresh
             self._auto_key, self._auto_ref_q, self._auto_still_since, self._auto_rearm_q = key, q, now, None
             return
         if self._auto_rearm_q is not None:  # captured here already; wait until the arm moves away
@@ -509,12 +329,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
     def _check_capture_button(self, obs: dict) -> None:
         """Fire a capture on the rising edge of any configured leader-handle button.
 
-        Same ``pressed and not was`` edge test ``Recorder._scan_buttons`` uses (recorder.py),
-        against ITS OWN previous-state flag rather than that class's -- this tool has no
-        recorder instance to share one with, and shouldn't: reading its buttons must not
-        interact with whatever the recorder GUI is doing with the SAME physical handles on a
-        different run. Treated as one aggregate signal across every configured button (not one
-        edge test per button), so pressing two at once still fires exactly once.
+        Same ``pressed and not was`` edge test the recorder uses, against ITS OWN previous-state
+        flag. Treated as one aggregate signal across every configured button, so pressing two at
+        once still fires exactly once.
         """
         if self.mock or self.robot is None or not self.capture_buttons:
             return
@@ -526,59 +343,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ actions
     def _on_capture(self) -> None:
-        if self.board_on_gripper:
-            self._on_capture_eth()
-            return
-        agent = self._last_agent_det  # may be None -- agentview far / board out of its view
-        added = 0
-        for arm in self.arms:
-            det = self._last_wrist_det.get(arm)
-            q = self._last_q.get(arm)
-            if det is None or q is None:
-                continue  # this arm's wrist must at least see the board (hand-eye needs it)
-            cap = Capture(
-                arm=arm,
-                # FK ONLY (no camera extrinsic) -- so the solve can hand-eye the mount itself and
-                # apply the measured value, not the CAD one baked in here. See charuco docstring.
-                base_t_flange=self.geometries[arm].flange_pose(q),
-                wrist_t_board=det.cam_t_board,
-                # agentview optional: None when it did not see the board (feeds hand-eye only).
-                agentview_t_board=agent.cam_t_board if agent is not None else None,
-                wrist_reproj_error_px=det.reproj_error_px,
-                agentview_reproj_error_px=agent.reproj_error_px if agent is not None else None,
-            )
-            self.captures.append(cap)
-            av = f"agentview err {agent.reproj_error_px:.2f}px" if agent is not None else "agentview: not in view"
-            self.capture_list.addItem(
-                f"#{len(self.captures)}  [{arm}]  wrist err {cap.wrist_reproj_error_px:.2f}px  "
-                f"{av}  ({time.strftime('%H:%M:%S')})"
-            )
-            added += 1
-
-        if "left" in self.arms and "right" in self.arms:
-            left_det, right_det = self._last_wrist_det.get("left"), self._last_wrist_det.get("right")
-            left_q, right_q = self._last_q.get("left"), self._last_q.get("right")
-            if left_det is not None and right_det is not None and left_q is not None and right_q is not None:
-                self.pair_captures.append(
-                    ArmPairCapture(
-                        left_t_flange=self.geometries["left"].flange_pose(left_q),
-                        left_wrist_t_board=left_det.cam_t_board,
-                        right_t_flange=self.geometries["right"].flange_pose(right_q),
-                        right_wrist_t_board=right_det.cam_t_board,
-                        left_reproj_error_px=left_det.reproj_error_px,
-                        right_reproj_error_px=right_det.reproj_error_px,
-                    )
-                )
-                self.pair_label.setText(f"arm-pair samples (for the left/right offset): {len(self.pair_captures)}")
-
-        if not added:
-            self.status.setText("capture pressed but nothing was ready -- see status above")
-        else:
-            self._solve_and_report(warn_if_empty=False)
-
-    def _on_capture_eth(self) -> None:
-        """Bank one board-on-gripper capture for the active arm (agentview PnP of the grasped
-        board + that arm's FK flange pose)."""
+        """Bank one capture for the active arm (agentview PnP of the grasped board + FK flange pose)."""
         agent = self._last_agent_det
         arm = self._active_arm()
         q = self._last_q.get(arm)
@@ -591,10 +356,10 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             agentview_t_board=agent.cam_t_board,
             agentview_reproj_error_px=agent.reproj_error_px,
         )
-        self.eth_captures.append(cap)
-        n_arm = sum(1 for c in self.eth_captures if c.arm == arm)
+        self.captures.append(cap)
+        n_arm = sum(1 for c in self.captures if c.arm == arm)
         self.capture_list.addItem(
-            f"#{len(self.eth_captures)}  [{arm}]  agentview err {agent.reproj_error_px:.2f}px  "
+            f"#{len(self.captures)}  [{arm}]  agentview err {agent.reproj_error_px:.2f}px  "
             f"(arm total {n_arm})  ({time.strftime('%H:%M:%S')})"
         )
         self._solve_and_report(warn_if_empty=False)
@@ -603,10 +368,7 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         row = self.capture_list.currentRow()
         if row < 0:
             return
-        if self.board_on_gripper:
-            del self.eth_captures[row]
-        else:
-            del self.captures[row]
+        del self.captures[row]
         self.capture_list.takeItem(row)
         self._solve_and_report(warn_if_empty=False)
 
@@ -614,151 +376,19 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         self._solve_and_report(warn_if_empty=True)
 
     def _record(self, history: List[tuple], n: int, t_rms: float, r_rms: float) -> None:
-        """Append to a convergence history, skipping a duplicate entry when re-solving found no
-        new capture for that arm/offset (e.g. removing a capture from a DIFFERENT arm still
-        triggers a re-solve of this one, at the same n as last time)."""
+        """Append to a convergence history, skipping a duplicate entry when re-solving found no new
+        capture for that arm (e.g. removing a capture from a DIFFERENT arm still re-solves this one
+        at the same n as last time)."""
         if not history or history[-1][0] != n:
             history.append((n, t_rms, r_rms))
 
     def _solve_and_report(self, *, warn_if_empty: bool) -> None:
-        """Re-run every solve that currently has enough data and refresh the on-screen report.
+        """Re-run the per-arm eye-to-hand solve and refresh the on-screen report.
 
-        Called after every capture/removal (silently -- ``warn_if_empty=False``, since "not
-        enough yet" is the normal state early on, not an error) and by the Solve button itself
-        (``warn_if_empty=True``, the one case a popup is warranted: the user asked explicitly and
-        got nothing). Idempotent and cheap (closed-form least-squares over however many captures
-        exist), so calling it this often is not a performance concern.
+        Called after every capture/removal (silently) and by the Solve button (``warn_if_empty``).
+        Each arm needs 3+ varied-tilt captures; each solves in its own frame, never pooled.
         """
-        if self.board_on_gripper:
-            self._solve_and_report_eth(warn_if_empty=warn_if_empty)
-            return
-        # Each arm's wrist camera is an independent, uncalibrated FK frame (see charuco.py's
-        # module docstring) -- solved and reported separately, never pooled.
         counts = {arm: sum(1 for c in self.captures if c.arm == arm) for arm in self.arms}
-        if all(n < 2 for n in counts.values()):
-            if warn_if_empty:
-                QtWidgets.QMessageBox.warning(
-                    self, "Not enough captures", f"Need at least 2 captures for some arm; have {counts}."
-                )
-            self.result_label.setPlainText("not solved yet -- capture at least 2 per arm")
-            self.save_btn.setEnabled(False)
-            return
-
-        lines = []
-
-        # Step 1: each arm's own wrist-camera extrinsic (gripper_T_camera), by hand-eye. Needs 3+
-        # captures with varied ORIENTATION; until then the agentview/offset solves below fall
-        # back to the CAD constant so they still produce a (less trustworthy) answer early on.
-        wrist = solve_wrist_extrinsic_per_arm(self.captures)
-        for arm in self.arms:
-            if arm in wrist:
-                w = wrist[arm]
-                self._record(self._wrist_history[arm], w.n_captures, w.translation_rms_mm, w.rotation_rms_deg)
-                quality = "good" if w.rotation_rms_deg < 1.0 and w.translation_rms_mm < 10.0 else "CHECK POSES"
-                # Sanity vs the CAD mount: a few mm / deg off is plausibly right; tens of cm/deg
-                # means something is wrong (board size, degenerate poses, FK). See pose_delta.
-                cad_t, cad_r = pose_delta(w.gripper_t_camera, T_GRIPPER_CAMERA)
-                lines.append(
-                    f"[wrist {arm}] hand-eye n={w.n_captures}  board-consistency RMS "
-                    f"{w.translation_rms_mm:.2f} mm / {w.rotation_rms_deg:.3f} deg  -- {quality}  "
-                    f"vs CAD Δ {cad_t:.1f} mm / {cad_r:.1f} deg  {_convergence_note(self._wrist_history[arm])}"
-                )
-            elif counts.get(arm):
-                lines.append(f"[wrist {arm}] {counts[arm]} capture(s) -- need 3+ (varied tilt) to hand-eye")
-
-        # Both mounts identical -> fuse the solved arms into ONE gripper_T_camera and use it for
-        # every arm that has captures (so one hand-eye'd arm gives the other its mount too);
-        # otherwise each arm uses its own solve, and any unsolved arm falls back to CAD.
-        shared = fuse_wrist_extrinsics(wrist) if (self.shared_wrist_mount and wrist) else None
-        self._last_shared_wrist = shared
-        extrinsics = {}
-        for arm in self.arms:
-            if not counts.get(arm):
-                continue
-            if shared is not None:
-                extrinsics[arm] = shared.gripper_t_camera
-            elif arm in wrist:
-                extrinsics[arm] = wrist[arm].gripper_t_camera
-            else:
-                extrinsics[arm] = T_GRIPPER_CAMERA  # CAD fallback until this arm has its own solve
-        if shared is not None:
-            cad_t, cad_r = pose_delta(shared.gripper_t_camera, T_GRIPPER_CAMERA)
-            lines.append(
-                f"[wrist shared] from {'+'.join(shared.contributing_arms)}  cross-arm spread "
-                f"{shared.translation_spread_mm:.2f} mm / {shared.rotation_spread_deg:.3f} deg "
-                f"(small if mounts identical)  vs CAD Δ {cad_t:.1f} mm / {cad_r:.1f} deg  -- used for both arms"
-            )
-
-        # Step 2: agentview extrinsic per arm, chained through each arm's wrist extrinsic (solved
-        # above, or CAD fallback).
-        results = solve_agentview_extrinsic_per_arm(self.captures, wrist_extrinsics=extrinsics)
-        for arm, result in results.items():
-            self._record(self._history[arm], result.n_captures, result.translation_rms_mm, result.rotation_rms_deg)
-            quality = (
-                "good" if result.rotation_rms_deg < 1.0 and result.translation_rms_mm < 10.0 else "CHECK CAPTURES"
-            )
-            if shared is not None:
-                via = "hand-eye" if arm in wrist else "hand-eye (shared from other arm)"
-            else:
-                via = "hand-eye" if arm in wrist else "CAD extrinsic"
-            lines.append(
-                f"[agentview {arm}] n={result.n_captures}  translation RMS {result.translation_rms_mm:.2f} mm  "
-                f"rotation RMS {result.rotation_rms_deg:.3f} deg  ({via})  -- {quality}  "
-                f"{_convergence_note(self._history[arm])}"
-            )
-        for arm, n in counts.items():
-            if arm not in results and n:
-                # Distinguish "not enough captures at all" from "captures exist but agentview never
-                # saw the board" (the far/high-agentview case -- wrist hand-eye still progresses).
-                n_av = sum(1 for c in self.captures if c.arm == arm and c.agentview_t_board is not None)
-                if n_av < 2:
-                    lines.append(
-                        f"[agentview {arm}] {n_av}/{n} capture(s) with the board in agentview "
-                        "-- need 2 there to solve (wrist-only so far)"
-                    )
-                else:
-                    lines.append(f"[agentview {arm}] {n_av} capture(s) -- solving pending")
-
-        # Step 3: the arm-to-arm offset, and (once both single-arm extrinsics AND the offset
-        # exist) the fused/cross-checked shared-frame answer -- see charuco.py's module docstring
-        # for why this needs simultaneous both-wrists-see-the-board captures. The offset bridges
-        # through each arm's wrist extrinsic too, so it also improves once hand-eye replaces CAD.
-        arm_offset = None
-        if len(self.pair_captures) >= 2 and "left" in extrinsics and "right" in extrinsics:
-            arm_offset = solve_arm_offset(
-                self.pair_captures, left_extrinsic=extrinsics["left"], right_extrinsic=extrinsics["right"]
-            )
-            self._record(
-                self._offset_history, arm_offset.n_captures, arm_offset.translation_rms_mm, arm_offset.rotation_rms_deg
-            )
-            lines.append(
-                f"[left<->right] n={arm_offset.n_captures}  distance {arm_offset.distance_m * 100:.1f} cm  "
-                f"translation RMS {arm_offset.translation_rms_mm:.2f} mm  "
-                f"rotation RMS {arm_offset.rotation_rms_deg:.3f} deg  {_convergence_note(self._offset_history)}"
-            )
-        elif self.pair_captures:
-            lines.append(f"[left<->right] {len(self.pair_captures)} paired capture(s) -- need at least 2")
-
-        unified = None
-        if arm_offset is not None and "left" in results and "right" in results:
-            unified = unify_rig_calibration(results, arm_offset)
-            lines.append(
-                f"[unified, left frame] cross-check {unified.cross_check_translation_mm:.2f} mm / "
-                f"{unified.cross_check_rotation_deg:.3f} deg"
-            )
-
-        self.result_label.setPlainText("\n".join(lines) if lines else "not solved yet")
-
-        self._last_wrist = wrist
-        self._last_results = results
-        self._last_arm_offset = arm_offset
-        self._last_unified = unified
-        self.save_btn.setEnabled(bool(results) or bool(wrist))
-
-    def _solve_and_report_eth(self, *, warn_if_empty: bool) -> None:
-        """Board-on-gripper solve: each arm's agentview extrinsic by eye-to-hand, then (if both
-        arms solved AND a left<->right offset is known) cross-check the two against each other."""
-        counts = {arm: sum(1 for c in self.eth_captures if c.arm == arm) for arm in self.arms}
         if all(n < 3 for n in counts.values()):
             if warn_if_empty:
                 QtWidgets.QMessageBox.warning(
@@ -769,59 +399,35 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             return
 
         lines = []
-        results = solve_agentview_extrinsic_eyetohand_per_arm(self.eth_captures)
+        results = solve_agentview_extrinsic_eyetohand_per_arm(self.captures)
         for arm in self.arms:
             if arm in results:
                 r = results[arm]
-                self._record(self._eth_history[arm], r.n_captures, r.translation_rms_mm, r.rotation_rms_deg)
+                self._record(self._history[arm], r.n_captures, r.translation_rms_mm, r.rotation_rms_deg)
                 quality = "good" if r.rotation_rms_deg < 1.0 and r.translation_rms_mm < 10.0 else "CHECK POSES"
                 lines.append(
                     f"[agentview {arm}] eye-to-hand n={r.n_captures}  grip-consistency RMS "
                     f"{r.translation_rms_mm:.2f} mm / {r.rotation_rms_deg:.3f} deg  -- {quality}  "
-                    f"{_convergence_note(self._eth_history[arm])}"
+                    f"{_convergence_note(self._history[arm])}"
                 )
             elif counts.get(arm):
                 lines.append(f"[agentview {arm}] {counts[arm]} capture(s) -- need 3+ (varied grip tilt) to solve")
 
-        # Cross-check: two single-arm solves, each in its own frame, only agree once bridged through
-        # a known left_T_right (from a prior wrist calibration -- robot.arm_offset in config.yaml).
-        unified = None
-        if "left" in results and "right" in results:
-            if self.arm_offset_left_t_right is not None:
-                unified = unify_agentview_eyetohand(results, self.arm_offset_left_t_right)
-                lines.append(
-                    f"[cross-check, left frame] left vs right (via arm_offset) "
-                    f"{unified.cross_check_translation_mm:.2f} mm / {unified.cross_check_rotation_deg:.3f} deg  "
-                    "-- small = both agentview solves AND arm_offset agree"
-                )
-            else:
-                lines.append(
-                    "[cross-check] both arms solved but no robot.arm_offset in config -- "
-                    "run the desk-board wrist calibration first to enable the left/right cross-check"
-                )
-
         self.result_label.setPlainText("\n".join(lines) if lines else "not solved yet")
-        self._last_eth_results = results
-        self._last_eth_unified = unified
+        self._last_results = results
         self.save_btn.setEnabled(bool(results))
 
     def _on_save(self) -> None:
-        """Write the last solve into config.yaml -- see the module docstring for why this is a
-        line-range splice (charuco.splice_*) rather than a YAML load/dump round trip, and mirrors
-        tuner_gui.py's ``_write_config`` (confirm dialog naming the file, a ``.bak`` kept before
-        writing, only the touched blocks change)."""
-        if self.board_on_gripper:
-            self._on_save_eth()
+        """Write the solved per-arm agentview extrinsics into config.yaml (line-range splice; a
+        ``.bak`` kept, only ``cameras.agentview.extrinsic.<arm>`` + ``calibration.board`` change)."""
+        if not self._last_results:
             return
-        if not self._last_results and self._last_arm_offset is None and not self._last_wrist:
-            return
-        self._commit_config(self._build_deskboard_config)
+        self._commit_config(self._build_config)
 
     def _commit_config(self, build: Callable[[str, str], tuple]) -> None:
-        """Shared config.yaml write path for both modes: confirm dialog naming the file, a ``.bak``
-        of the original kept first, then only the blocks ``build`` touches change (see the module
-        docstring on the line-range splice). ``build(original, calibrated_at) -> (updated, written)``
-        does the mode-specific splicing; ``written`` is the list of block names for the status line.
+        """Config.yaml write path: confirm dialog naming the file, a ``.bak`` of the original kept
+        first, then only the blocks ``build`` touches change. ``build(original, calibrated_at) ->
+        (updated, written)`` does the splicing; ``written`` names the blocks for the status line.
         """
         if not self.config_path:
             QtWidgets.QMessageBox.critical(self, "No config.yaml", "No config.yaml was found to write into.")
@@ -829,9 +435,9 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
         confirm = QtWidgets.QMessageBox.question(
             self,
             "Write config.yaml?",
-            f"Write the solved extrinsic(s) into\n{self.config_path}\n\n"
-            "Only the touched blocks change; the rest of the file (comments included) is left alone. "
-            "A .bak copy of the current file is kept first.",
+            f"Write the solved agentview extrinsic(s) into\n{self.config_path}\n\n"
+            "Only cameras.agentview.extrinsic and calibration.board change; the rest of the file "
+            "(comments included) is left alone. A .bak copy of the current file is kept first.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
@@ -853,68 +459,12 @@ class CalibrateAgentviewWindow(QtWidgets.QMainWindow):
             return
         self.status.setText(f"wrote {', '.join(written)} -> {self.config_path} (backup at .bak)")
 
-    def _build_deskboard_config(self, original: str, calibrated_at: str) -> tuple:
-        """Splice the desk-board solve (wrist extrinsics + agentview + arm offset) into config text."""
+    def _build_config(self, original: str, calibrated_at: str) -> tuple:
         written: List[str] = []
         updated = original
-        if True:
-            if self._last_shared_wrist is not None:
-                # Identical-mount mode: write the ONE fused matrix to every arm that had captures
-                # (so an arm calibrated only via the other still gets the measured mount).
-                sh = self._last_shared_wrist
-                for arm in sorted({c.arm for c in self.captures}):
-                    w = WristExtrinsicResult(
-                        arm,
-                        sh.gripper_t_camera,
-                        sh.n_captures_total,
-                        sh.translation_spread_mm,
-                        sh.rotation_spread_deg,
-                        [],
-                        [],
-                    )
-                    updated = splice_wrist_extrinsic(updated, arm, w, calibrated_at=calibrated_at, shared=True)
-                    written.append(f"wrist_{arm}.extrinsic(shared)")
-            else:
-                for arm, w in self._last_wrist.items():
-                    updated = splice_wrist_extrinsic(updated, arm, w, calibrated_at=calibrated_at)
-                    written.append(f"wrist_{arm}.extrinsic")
-            for arm, result in self._last_results.items():
-                updated = splice_agentview_extrinsic(updated, arm, result, calibrated_at=calibrated_at)
-                written.append(f"agentview.extrinsic.{arm}")
-            if self._last_arm_offset is not None:
-                updated = splice_arm_offset(updated, self._last_arm_offset, calibrated_at=calibrated_at)
-                written.append("arm_offset")
-            if self._last_unified is not None:
-                # Derived from the two writes above, but always from THIS SAME live solve, in
-                # this same save -- see splice_agentview_unified's docstring for why that keeps
-                # it safe to store despite being recomputable.
-                updated = splice_agentview_unified(updated, self._last_unified, calibrated_at=calibrated_at)
-                written.append("extrinsic.unified")
-            # Record which physical board produced all of the above -- provenance, and so the next
-            # calibration auto-loads it (BoardSpec.from_config) without re-passing the flags.
-            updated = splice_board(updated, self.board, calibrated_at=calibrated_at)
-            written.append("calibration.board")
-        return updated, written
-
-    def _on_save_eth(self) -> None:
-        """Save the board-on-gripper (eye-to-hand) solve: agentview extrinsic per solved arm, plus
-        the fused ``unified`` when both arms solved and an offset was available. Never touches the
-        wrist extrinsics or ``robot.arm_offset`` -- those come from the desk-board calibration."""
-        if not self._last_eth_results:
-            return
-        self._commit_config(self._build_eth_config)
-
-    def _build_eth_config(self, original: str, calibrated_at: str) -> tuple:
-        written: List[str] = []
-        updated = original
-        for arm, result in self._last_eth_results.items():
-            updated = splice_agentview_extrinsic(
-                updated, arm, result, calibrated_at=calibrated_at, method="eye_to_hand"
-            )
+        for arm, result in self._last_results.items():
+            updated = splice_agentview_extrinsic(updated, arm, result, calibrated_at=calibrated_at)
             written.append(f"agentview.extrinsic.{arm}")
-        if self._last_eth_unified is not None:
-            updated = splice_agentview_unified(updated, self._last_eth_unified, calibrated_at=calibrated_at)
-            written.append("extrinsic.unified")
         updated = splice_board(updated, self.board, calibrated_at=calibrated_at)
         written.append("calibration.board")
         return updated, written
@@ -938,9 +488,6 @@ def run(
     capture_buttons: Sequence[str] = (),
     auto_capture: bool = True,
     auto_dwell_s: float = 1.0,
-    shared_wrist_mount: bool = True,
-    board_on_gripper: bool = False,
-    arm_offset_left_t_right: Optional[np.ndarray] = None,
 ) -> int:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     cams = CameraManager(cfg)
@@ -955,10 +502,7 @@ def run(
         capture_buttons=capture_buttons,
         auto_capture=auto_capture,
         auto_dwell_s=auto_dwell_s,
-        shared_wrist_mount=shared_wrist_mount,
-        board_on_gripper=board_on_gripper,
-        arm_offset_left_t_right=arm_offset_left_t_right,
     )
-    win.resize(1600, 800)
+    win.resize(1000, 800)
     win.show()
     return app.exec_()
