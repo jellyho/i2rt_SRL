@@ -178,9 +178,10 @@ What replay inherits, none of which the old standalone replay had: the follower 
 joint-speed clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle
 button, the network e-stop, the link-loss watchdog, and pause/resume as a send-gate.
 
-The deploy GUI shows the replayed episode's **first frame** as a scene reference (the overlay
-decoder streams forward and can't seek, so it is not run as a moving ghost that would drift against
-the arm's real speed — the arm itself is the moving reference).
+The deploy GUI plays the replayed episode's video as an overlay in lock-step with the rollout
+(at the arm's frame rate; freezes on pause, rewinds on stop). The decoder can't seek, so it is a
+rate match rather than a per-frame lock — over a long episode the ghost and the arm can drift if
+the control loop can't sustain the rate.
 
 **Only the action column is read**, straight from the parquet: no video decoding, no `lerobot`
 dependency, and a 100-episode dataset opens in about a tenth of a second.

@@ -434,7 +434,7 @@ class DeployGUI(RecorderGUI):
         else:
             super()._update_health(st)
         runner = self.runner.get_status() if self.runner is not None else {}
-        self._sync_replay_overlay(runner)
+        self._sync_replay_overlay(runner, st)
         pol = theme.dot(bool(runner.get("policy_connected")))
         stream = "streaming" if runner.get("streaming") else "idle"
         err = runner.get("last_error") or ""
@@ -451,26 +451,40 @@ class DeployGUI(RecorderGUI):
         self.health.setText(self.health.text() + extra)
 
     # ------------------------------------------------------------- replay overlay
-    def _sync_replay_overlay(self, runner: dict) -> None:
-        """Keep the past-demonstration overlay on the episode being replayed -- as a STILL first
-        frame, not a running video.
+    def _sync_replay_overlay(self, runner: dict, st: dict) -> None:
+        """Play the past-demonstration overlay in lock-step with the replayed rollout.
 
-        The overlay decoder streams forward at a fixed rate and cannot seek, so it can't be frame-
-        synced to the arm, whose real replay speed varies (control-loop timing, the follower
-        smoother). A free-running ghost therefore drifts ahead of the arm and then freezes wherever
-        it stopped. Since the useful thing here is the scene at the FIRST frame (to confirm setup),
-        just show that and never auto-play -- the arm itself is the moving reference.
+        The ghost plays at the ARM's frame rate -- one recorded frame per control tick
+        (``bridge_cfg.rate_hz``), NOT the recording's raw fps, which would run ahead of the arm.
+        It follows the rollout: playing while streaming, frozen while paused (matching the arm's
+        hold), and rewound to the first frame when the rollout is stopped/homed instead of left
+        frozen mid-trajectory. The decoder can't seek, so this is a rate match, not a per-frame
+        lock; if the control loop can't sustain rate_hz the two can still drift over a long episode.
+        Only in replay -- for a live policy there is nothing to line the ghost up to.
         """
         if runner.get("policy_framework") != "dataset-replay":
             self._replay_overlay_key = None
+            self._replay_overlay_running = False
             return
 
         dataset, episode = runner.get("replay_dataset") or "", int(runner.get("replay_episode", -1))
         key = (dataset, episode)
         if dataset and episode >= 0 and key != getattr(self, "_replay_overlay_key", None):
             self._replay_overlay_key = key
-            self._select_reference_episode(dataset, episode)  # shows the first frame, paused
-        # Deliberately no set_rate / set_paused(streaming): the overlay stays on the first frame.
+            self._reference_player.set_rate(max(1.0, float(self.bridge_cfg.rate_hz)))
+            self._select_reference_episode(dataset, episode)  # (re)start at the first frame, paused
+            self._replay_overlay_running = False
+        if self._reference_player.episode is None:
+            return
+
+        if bool(st.get("policy_running")):
+            # Playing or send-gate-paused: follow the arm -- run while streaming, freeze otherwise.
+            self._reference_player.set_paused(not bool(runner.get("streaming")))
+            self._replay_overlay_running = True
+        elif getattr(self, "_replay_overlay_running", False):
+            # Stopped/homed: rewind the ghost to the first frame rather than leave it mid-trajectory.
+            self._replay_overlay_running = False
+            self._select_reference_episode(dataset, episode)
 
     def _select_reference_episode(self, dataset: str, episode: int) -> None:
         """Choose `dataset`/`episode` in the overlay panel, if it is there to choose."""

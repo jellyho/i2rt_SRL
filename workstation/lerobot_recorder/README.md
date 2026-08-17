@@ -529,9 +529,11 @@ workstation/yam-data deploy                  # [workstation] set mode = dataset,
   (the controller's command-timeout hold); resume continues from the same frame. `policy_running`
   is never toggled, so the robot side runs none of its start/stop logic (nothing closes the
   gripper on resume — the recorded actions drive it).
-- The past-demonstration overlay shows the episode's **first frame only** (scene reference), not a
-  running ghost: the streaming decoder can't seek, so a free-running ghost would drift against the
-  arm's real (variable) replay speed. The arm itself is the moving reference.
+- The past-demonstration overlay **plays in lock-step with the rollout**: it runs at the arm's
+  frame rate (one recorded frame per control tick), freezes when you pause, and rewinds to the
+  first frame when you stop/home (rather than freezing mid-trajectory). The decoder can't seek, so
+  this is a rate match, not a per-frame lock — over a long episode the two can drift if the control
+  loop can't sustain the rate.
 - `dataset` mode is **watch-only and not recorded** (leader free, no dataset written). There is no
   separate replay tool — it lives entirely inside `deploy`.
 - Speed/loop live on `DatasetPolicy` (`policy_serving/yam_policy/policies/dataset_policy.py`).

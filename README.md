@@ -163,8 +163,8 @@ workstation/yam-data deploy           # 💻 workstation — set mode = dataset,
   takeover, e-stop, the follower smoother and the link-loss watchdog all apply.
 - The rollout button is **Start Replay → Pause / Resume**: pause is a send-gate (the robot holds,
   nothing on the robot side toggles, so the gripper is never snapped shut on resume).
-- The overlay shows the episode's **first frame** as a scene reference (the arm is the moving
-  reference). Watch-only; nothing is recorded.
+- The past-demonstration overlay **plays along with the rollout** (at the arm's frame rate),
+  freezes on pause, and rewinds to the first frame on stop/home. Watch-only; nothing is recorded.
 - `speed` / `loop` live on `DatasetPolicy`; see [`policy_serving/README.md`](policy_serving/README.md).
 
 > Full hardware bring-up checklist: [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
