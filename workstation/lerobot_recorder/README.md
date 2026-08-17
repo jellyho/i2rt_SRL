@@ -522,22 +522,45 @@ workstation/yam-data deploy --robot-host <ROBOT_IP> --policy-host <POLICY_IP>
 The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
 robot (`--mock` for no robot at all).
 
-## E. Render the candidate fan offline
+## E. Render the predicted path onto the cameras (offline)
 
-For a run recorded with `deploy --num-samples N` against a server started with the same N, the
-`action_samples` column can be drawn back onto the recorded frames:
+`render-samples` draws the policy's predicted path back onto the recorded frames, across **all
+three cameras at once** — agentview + both wrists, hf-utils' dataset-render look (each camera at
+native 4:3, a translucent-box header + per-panel labels, browser-friendly h264).
 
 ```bash
+# deploy fan on all three cameras (needs an action_samples column):
 workstation/yam-data render-samples \
-    --repo-id my_deploy_run --episode 0 --arm left \
-    --horizon 30 --candidates 8 --out .scratch/fan.mp4
+    --repo-id my_deploy_run --episode 0 --horizon 30 --candidates 8 \
+    --out .scratch/fan.mp4
+
+# any dataset — teleop/demo/replay — using the executed trajectory (no action_samples):
+workstation/yam-data render-samples \
+    --repo-id my_demo --episode 0 --source action --horizon 20 \
+    --out .scratch/path.mp4
 ```
 
-Offline on purpose — a live per-tick overlay was built and dropped, because watching the spread
-go past at 30 fps was not worth much; the analysis belongs with the dataset.
+- **Two sources** (`--source`): `samples` (default) draws the multi-candidate **fan** from the
+  `action_samples` column — a run recorded with `deploy --num-samples N` against a server started
+  with the same N. `action` draws the single **executed** trajectory from the plain `action`
+  column, so it works on ANY LeRobot recording (no `--candidates` needed).
+- **Every tick is rendered** (not one frame per chunk): the episode is tiled into `--horizon`
+  chunks and every frame is drawn, so you watch the arm **consume** each chunk, then jump to the
+  next (the header shows `chunk X/N  tick Y/H`). The whole trajectory is covered, tail included.
+  `--hold N` repeats each tick for slow motion.
+- **agentview** overlays each arm's path through its **calibrated `base_T_agentview`** (from
+  `config.yaml`, see §F's board-on-gripper mode) — left green, right amber. Each **wrist** shows
+  only its own arm (the wrist rides that arm; the other arm would need the arm offset, which this
+  deliberately avoids, so no shared frame is required). `--wrists`/`--agentview-arms` subset the
+  panels; `--height` sets panel size.
+- **Intrinsics**: the wrist and agentview *extrinsics* come from `config.yaml`, but the *intrinsics*
+  default to rough placeholders — pass the cameras' real numbers (`--fx/fy/cx/cy` wrist,
+  `--agent-fx/…` agentview) for pixel-exact alignment; until then the path's *shape* is meaningful,
+  its exact pixel position is not.
 
-No extra checkout and no `matplotlib`: the fan drawing is vendored (PIL only), so this needs
-nothing the recorder env does not already have.
+Offline on purpose — a *live* per-tick HUD was built once and dropped (watching the spread at 30
+fps was not worth much); this walks the recorded dataset instead. No extra checkout and no
+`matplotlib`: the drawing is vendored (PIL only), so it needs nothing the recorder env lacks.
 
 ## F. Calibrate the camera rig
 
@@ -584,6 +607,32 @@ So with a board near a wrist (agentview out of view), you still bank wrist hand-
 bring the board somewhere agentview can also see it and those captures link agentview on top. A
 pure wrist-only session solves and saves just the wrist extrinsics; agentview simply isn't
 written until it has ≥2 captures where it saw the board.
+
+### Agentview too high for the desk board? `--board-on-gripper` (eye-to-hand)
+
+The desk-board chain above links agentview only at poses where a **wrist camera and agentview see
+the same board at once**. If agentview is mounted too high/far to co-see a desk board with a
+wrist, that never happens — so calibrate agentview the other way round: **grasp the board with the
+gripper** and lift it into agentview's view.
+
+```bash
+workstation/yam-data calibrate --board-on-gripper --arms left    # then again --arms right
+```
+
+This is the **eye-to-hand** dual of the wrist's eye-in-hand solve: the camera is fixed and the
+target rides the hand, so agentview + FK alone recover `base_T_agentview` — **no wrist camera, no
+arm offset, no shared frame**. Grasp the board **rigidly and do not re-grip mid-run** (the solve
+assumes the board's pose in the gripper is constant; a slip corrupts it — the reported
+grip-consistency RMS is the check). Move to **3+ varied-tilt** poses that agentview sees, hold
+still (same auto-capture as above). With both arms available a selector picks which gripper holds
+the board; run one arm, then the other.
+
+Because each arm solves agentview in its own frame, they only agree once bridged through
+`robot.arm_offset` (from a prior desk-board wrist calibration) — if that offset is present, a
+two-arm run reports the **cross-check** (`left vs right`) and writes the fused `unified`. Save
+touches only `cameras.agentview.extrinsic.<arm>` (marked `method: eye_to_hand`) + `unified`; it
+never fabricates a wrist extrinsic or an arm offset. This is what `render-samples`' agentview
+overlay (§E) reads back.
 
 **The solve re-runs after every capture automatically**, no separate step, with a live
 convergence trend (RMS over the last few re-solves) per line so you can watch it settle. Hand-eye
