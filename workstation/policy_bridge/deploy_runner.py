@@ -127,6 +127,9 @@ class DeploymentPolicyRunner:
         self._extra_warned: set = set()
         #: Called once the handshake is in, so the recorder can declare its columns.
         self.on_connected = None
+        #: Called with the sent action vector every time an action is pushed to the robot, so the
+        #: recorder can log exactly one eval frame per executed action (see Recorder.note_action_sent).
+        self.on_action_sent: Callable[[np.ndarray], None] | None = None
         self._was_streaming = False
         # Replay pause: PURELY a send-gate on this (workstation) side. When paused the loop stops
         # calling infer()/set_policy_action, so the DatasetPolicy cursor freezes and the robot just
@@ -405,7 +408,13 @@ class DeploymentPolicyRunner:
             t0 = time.monotonic()
             try:
                 if self.recorder_cfg.mock:
-                    self._set(robot_connected=True, policy_connected=True, streaming=False, last_error="")
+                    # No robot or policy server: simulate a live policy driving at the control rate,
+                    # so the record path runs end-to-end (headless/GUI wire on_action_sent ->
+                    # Recorder.note_action_sent). One synthetic send per tick == one eval frame,
+                    # exactly as a real rollout would produce -- a no-op unless armed in eval mode.
+                    self._set(robot_connected=True, policy_connected=True, streaming=True, last_error="")
+                    if self.on_action_sent is not None:
+                        self.on_action_sent(np.zeros(1, dtype=float))
                 else:
                     self._connect_robot()
                     obs = self._robot.get_observation()
@@ -428,7 +437,11 @@ class DeploymentPolicyRunner:
                             result = self._policy.infer(policy_obs)
                             action = result["actions"]
                             self._set_extras(result)
-                            self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
+                            action_vec = np.asarray(action, dtype=float).reshape(-1)
+                            self._robot.set_policy_action(self._split(action_vec))
+                            # Log one eval frame for the action we just executed (1 frame == 1 send).
+                            if self.on_action_sent is not None:
+                                self.on_action_sent(action_vec)
                             self._set(
                                 streaming=True,
                                 last_error="",

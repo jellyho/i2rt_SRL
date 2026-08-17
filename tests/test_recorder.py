@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from workstation.lerobot_recorder.config import RecorderConfig
+from workstation.lerobot_recorder.config import ACTION_DIM, RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import dataset_dir
 from workstation.lerobot_recorder.portal_bridge import PortalBridge
 from workstation.lerobot_recorder.recorder import Recorder
@@ -24,9 +24,14 @@ class _FakeWriter(SimpleNamespace):
 
     def __init__(self, **kw):
         super().__init__(
-            num_episodes=0, total_episodes=0, outcome_totals={"success": 0, "fail": 0},
-            queue_depth=0, low_disk=False, finalized=False,
-            progress={"saving": False, "queued": 0}, **kw
+            num_episodes=0,
+            total_episodes=0,
+            outcome_totals={"success": 0, "fail": 0},
+            queue_depth=0,
+            low_disk=False,
+            finalized=False,
+            progress={"saving": False, "queued": 0},
+            **kw,
         )
         self.frames = []
         self.tasks = []
@@ -111,26 +116,49 @@ def test_recorder_records_episode_and_outcome(tmp_path):
     assert entry["episode"] == 0
 
 
-def test_eval_rollout_records_from_arm_to_disarm(tmp_path):
+def test_eval_rollout_records_one_frame_per_sent_action(tmp_path):
+    # Eval recording is SEND-DRIVEN: the runner calls note_action_sent once per action it pushes to
+    # the robot, and the record loop writes exactly one frame per call. So recorded frames ==
+    # executed actions, and nothing is recorded on held/paused ticks (no action is sent then).
     cfg = RecorderConfig(
         repo_id="test/eval", root=str(tmp_path), fps=60, mock=True, record_source="eval", review_before_save=False
     )
     rec = Recorder(cfg)
     rec.start()
     rec.arm()
-    time.sleep(1.0)  # accumulate a rollout
+    time.sleep(0.3)
+    assert rec.get_status()["frames"] == 0  # armed, but no policy is driving yet -> no frames
+
+    n = 8
+    for i in range(n):
+        rec.note_action_sent(np.full(ACTION_DIM, float(i), dtype=np.float32))
+        time.sleep(0.05)  # let the record loop drain the queue
+    time.sleep(0.2)
     frames = rec.get_status()["frames"]
     rec.disarm()  # eval: ends the rollout and submits it
     rec.shutdown()
-    assert frames > 0
+    assert frames == n  # strict 1:1 -- one frame per action sent, no more, no fewer
     assert rec.writer.num_episodes >= 1
     assert (tmp_path / "eval" / "outcomes.jsonl").exists()
 
 
-def test_manual_save_finalizes_and_next_episode_reopens_writer(tmp_path):
+def test_note_action_sent_is_a_noop_until_armed_in_eval(tmp_path):
+    # Sends that arrive before arming (or in a non-eval source) must not leak into any episode.
     cfg = RecorderConfig(
-        repo_id="test/manual", root=str(tmp_path), fps=60, mock=True, review_before_save=False
+        repo_id="test/eval_idle", root=str(tmp_path), fps=60, mock=True, record_source="eval", review_before_save=False
     )
+    rec = Recorder(cfg)
+    rec.start()
+    try:
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))  # not armed -> dropped
+        time.sleep(0.2)
+        assert rec.get_status()["frames"] == 0
+    finally:
+        rec.shutdown()
+
+
+def test_manual_save_finalizes_and_next_episode_reopens_writer(tmp_path):
+    cfg = RecorderConfig(repo_id="test/manual", root=str(tmp_path), fps=60, mock=True, review_before_save=False)
     rec = Recorder(cfg)
     rec.start()
     try:
@@ -155,9 +183,7 @@ def test_manual_save_finalizes_and_next_episode_reopens_writer(tmp_path):
 
 
 def test_manual_save_preserves_armed_idle_state(tmp_path):
-    cfg = RecorderConfig(
-        repo_id="test/armed_save", root=str(tmp_path), fps=60, mock=True, review_before_save=False
-    )
+    cfg = RecorderConfig(repo_id="test/armed_save", root=str(tmp_path), fps=60, mock=True, review_before_save=False)
     rec = Recorder(cfg)
     rec.writer = rec._open_writer()
     rec.arm()
@@ -497,8 +523,7 @@ def test_dagger_recorder_events_do_not_use_expert_button_map():
 # --------------------------------------------------------------- deploy (no recording)
 def test_deploy_source_opens_no_dataset(tmp_path):
     """`deploy` runs the policy but must not create a dataset anywhere on disk."""
-    cfg = RecorderConfig(repo_id="test/deployonly", root=str(tmp_path), fps=60, mock=True,
-                         record_source="deploy")
+    cfg = RecorderConfig(repo_id="test/deployonly", root=str(tmp_path), fps=60, mock=True, record_source="deploy")
     rec = Recorder(cfg)
     rec.start()
     time.sleep(0.5)  # let the loop run — in dagger/eval this would be buffering frames
@@ -513,8 +538,7 @@ def test_deploy_source_opens_no_dataset(tmp_path):
 
 def test_deploy_source_ignores_arm_and_save(tmp_path):
     """Arming/saving are meaningless without a dataset; they must be safe no-ops, not crashes."""
-    cfg = RecorderConfig(repo_id="test/deploynoop", root=str(tmp_path), fps=60, mock=True,
-                         record_source="deploy")
+    cfg = RecorderConfig(repo_id="test/deploynoop", root=str(tmp_path), fps=60, mock=True, record_source="deploy")
     rec = Recorder(cfg)
     rec.start()
     rec.arm()
@@ -531,14 +555,21 @@ def test_deploy_source_ignores_arm_and_save(tmp_path):
 
 def test_deploy_source_still_reports_rollout_state(tmp_path):
     """The UI needs policy/intervention state in deploy mode — that is the whole point."""
-    cfg = RecorderConfig(repo_id="test/deploystate", root=str(tmp_path), fps=60, mock=True,
-                         record_source="deploy")
+    cfg = RecorderConfig(repo_id="test/deploystate", root=str(tmp_path), fps=60, mock=True, record_source="deploy")
     rec = Recorder(cfg)
     snap = {
-        "teleop_state": "IDLE", "state": np.zeros(4), "action": np.zeros(4),
-        "policy_running": True, "intervention": True, "dagger_state": "intervention",
-        "fine_grained": False, "leader_recentering": False, "recenter_fault": False,
-        "homing": False, "estop": False, "buttons": {},
+        "teleop_state": "IDLE",
+        "state": np.zeros(4),
+        "action": np.zeros(4),
+        "policy_running": True,
+        "intervention": True,
+        "dagger_state": "intervention",
+        "fine_grained": False,
+        "leader_recentering": False,
+        "recenter_fault": False,
+        "homing": False,
+        "estop": False,
+        "buttons": {},
     }
     rec._step({}, snap)
     st = rec.get_status()
@@ -560,8 +591,9 @@ def test_deploy_source_does_not_use_expert_button_map():
 def test_wrong_robot_mode_refuses_to_start_with_an_actionable_message(tmp_path, monkeypatch):
     """A crossed robot server otherwise fails SILENTLY (a teleop server just ignores
     policy actions), so starting must refuse and name the command to run."""
-    cfg = RecorderConfig(repo_id="test/mode", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="deploy")
+    cfg = RecorderConfig(
+        repo_id="test/mode", root=str(tmp_path), mock=False, record_source="deploy", expected_robot_mode="deploy"
+    )
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
@@ -579,8 +611,9 @@ def test_wrong_robot_mode_refuses_to_start_with_an_actionable_message(tmp_path, 
 
 
 def test_matching_robot_mode_starts_normally(tmp_path, monkeypatch):
-    cfg = RecorderConfig(repo_id="test/modeok", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="deploy")
+    cfg = RecorderConfig(
+        repo_id="test/modeok", root=str(tmp_path), mock=False, record_source="deploy", expected_robot_mode="deploy"
+    )
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
@@ -594,8 +627,9 @@ def test_matching_robot_mode_starts_normally(tmp_path, monkeypatch):
 
 def test_unknown_robot_mode_does_not_block_startup(tmp_path, monkeypatch):
     """An older server that reports no mode must not become un-startable."""
-    cfg = RecorderConfig(repo_id="test/modenone", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="deploy")
+    cfg = RecorderConfig(
+        repo_id="test/modenone", root=str(tmp_path), mock=False, record_source="deploy", expected_robot_mode="deploy"
+    )
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
@@ -607,8 +641,9 @@ def test_unknown_robot_mode_does_not_block_startup(tmp_path, monkeypatch):
 
 
 def test_mock_sessions_skip_the_mode_check(tmp_path):
-    cfg = RecorderConfig(repo_id="test/modemock", root=str(tmp_path), mock=True,
-                         record_source="deploy", expected_robot_mode="deploy")
+    cfg = RecorderConfig(
+        repo_id="test/modemock", root=str(tmp_path), mock=True, record_source="deploy", expected_robot_mode="deploy"
+    )
     rec = Recorder(cfg)
     rec.start()  # mock has no robot at all — the check must not fire
     rec.shutdown()
@@ -617,8 +652,9 @@ def test_mock_sessions_skip_the_mode_check(tmp_path):
 def test_older_robot_reporting_the_pre_rename_mode_is_accepted(tmp_path, monkeypatch):
     """The controller was renamed dagger -> deploy once it also served plain deployment.
     An un-updated robot server still says "dagger"; that skew must not read as a mismatch."""
-    cfg = RecorderConfig(repo_id="test/modeold", root=str(tmp_path), mock=False,
-                         record_source="deploy", expected_robot_mode="deploy")
+    cfg = RecorderConfig(
+        repo_id="test/modeold", root=str(tmp_path), mock=False, record_source="deploy", expected_robot_mode="deploy"
+    )
     rec = Recorder(cfg)
     monkeypatch.setattr(rec.cameras, "start", lambda: None)
     monkeypatch.setattr(rec.cameras, "stop", lambda: None)
@@ -633,9 +669,15 @@ def test_older_robot_reporting_the_pre_rename_mode_is_accepted(tmp_path, monkeyp
 def test_low_memory_refuses_to_start_an_episode(tmp_path):
     """Better to not start than to buffer an episode there is no room for: a truncated
     take is data nobody asked for, and the OOM kill lands mid-write."""
-    cfg = RecorderConfig(repo_id="test/ram", root=str(tmp_path), fps=60, mock=True,
-                         record_source="eval", review_before_save=False,
-                         min_free_ram_gb=1e9)  # nothing will ever satisfy this
+    cfg = RecorderConfig(
+        repo_id="test/ram",
+        root=str(tmp_path),
+        fps=60,
+        mock=True,
+        record_source="eval",
+        review_before_save=False,
+        min_free_ram_gb=1e9,
+    )  # nothing will ever satisfy this
     rec = Recorder(cfg)
     rec.start()
     rec.arm()
@@ -648,9 +690,15 @@ def test_low_memory_refuses_to_start_an_episode(tmp_path):
 
 
 def test_normal_memory_starts_as_usual(tmp_path):
-    cfg = RecorderConfig(repo_id="test/ramok", root=str(tmp_path), fps=60, mock=True,
-                         record_source="eval", review_before_save=False,
-                         min_free_ram_gb=0.001)
+    cfg = RecorderConfig(
+        repo_id="test/ramok",
+        root=str(tmp_path),
+        fps=60,
+        mock=True,
+        record_source="eval",
+        review_before_save=False,
+        min_free_ram_gb=0.001,
+    )
     rec = Recorder(cfg)
     rec.start()
     rec.arm()
@@ -662,8 +710,15 @@ def test_normal_memory_starts_as_usual(tmp_path):
 
 
 def test_guard_is_off_when_the_threshold_is_zero(tmp_path):
-    cfg = RecorderConfig(repo_id="test/ramoff", root=str(tmp_path), fps=60, mock=True,
-                         record_source="eval", review_before_save=False, min_free_ram_gb=0.0)
+    cfg = RecorderConfig(
+        repo_id="test/ramoff",
+        root=str(tmp_path),
+        fps=60,
+        mock=True,
+        record_source="eval",
+        review_before_save=False,
+        min_free_ram_gb=0.0,
+    )
     rec = Recorder(cfg)
     rec.start()
     rec.arm()
@@ -678,14 +733,24 @@ def test_it_is_checked_once_per_episode_not_per_frame(tmp_path, monkeypatch):
     """One read of /proc/meminfo an episode -- the record loop should not carry it."""
     calls = []
     monkeypatch.setattr(Recorder, "available_ram_gb", staticmethod(lambda: calls.append(1) or 999.0))
-    cfg = RecorderConfig(repo_id="test/ramonce", root=str(tmp_path), fps=60, mock=True,
-                         record_source="eval", review_before_save=False, min_free_ram_gb=1.0)
+    cfg = RecorderConfig(
+        repo_id="test/ramonce",
+        root=str(tmp_path),
+        fps=60,
+        mock=True,
+        record_source="eval",
+        review_before_save=False,
+        min_free_ram_gb=1.0,
+    )
     rec = Recorder(cfg)
     rec.start()
     rec.arm()
-    time.sleep(1.0)  # ~60 frames buffered
+    for i in range(30):  # eval is send-driven: drive some frames into the episode
+        rec.note_action_sent(np.full(ACTION_DIM, float(i), dtype=np.float32))
+        time.sleep(0.02)
+    time.sleep(0.2)  # let the loop drain
     n_during = len(calls)
-    rec.disarm()     # submits -> the after-episode report reads it once more
+    rec.disarm()  # submits -> the after-episode report reads it once more
     rec.shutdown()
     assert n_during == 1, f"expected one check at arm, got {n_during}"
     assert len(calls) == 2, "expected exactly one more when the episode was handed over"
@@ -707,16 +772,24 @@ def test_no_episode_starts_while_the_first_inference_is_still_running():
     bridge = PortalBridge(cfg)
     side = {"pos": np.zeros(7), "vel": np.zeros(7), "eff": np.zeros(7), "applied": np.zeros(7)}
 
-    requested = bridge._assemble({
-        "left": side, "right": side,
-        "policy_running": True, "policy_driving": False,     # asked for, not yet driving
-    })
+    requested = bridge._assemble(
+        {
+            "left": side,
+            "right": side,
+            "policy_running": True,
+            "policy_driving": False,  # asked for, not yet driving
+        }
+    )
     assert requested["teleop_state"] == "IDLE"
 
-    driving = bridge._assemble({
-        "left": side, "right": side,
-        "policy_running": True, "policy_driving": True,
-    })
+    driving = bridge._assemble(
+        {
+            "left": side,
+            "right": side,
+            "policy_running": True,
+            "policy_driving": True,
+        }
+    )
     assert driving["teleop_state"] == "ENGAGED"
 
 

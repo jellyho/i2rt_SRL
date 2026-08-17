@@ -87,6 +87,13 @@ class DeployGUI(RecorderGUI):
         self.runner: DeploymentPolicyRunner | None = None
         mode = mode if mode in self.MIRROR_BY_MODE else "policy"
         cfg.record_source = self.SOURCES[(mode, bool(record))]
+        # Eval recording is send-driven: one frame per action the runner pushes to the robot, at the
+        # bridge control rate. The dataset fps must be that send rate, NOT the 60 Hz camera loop --
+        # otherwise ~30 Hz frames get 60 fps timestamps and the recording plays back at ~2x. (The
+        # record loop drains the whole send queue each tick, so 1 frame == 1 action holds regardless
+        # of the loop rate; this only fixes the timestamps.)
+        if cfg.record_source == "eval":
+            cfg.fps = max(1, round(bridge_cfg.rate_hz))
         super().__init__(cfg)
         self.setWindowTitle("YAM · Policy Deployment")
 
@@ -326,6 +333,9 @@ class DeployGUI(RecorderGUI):
             self.runner.on_connected = lambda: self.recorder.set_extra_features(
                 self.runner.extra_features(), self.runner.get_extras
             )
+            # Record exactly one eval frame per action the runner sends (frames == executed actions).
+            # A no-op unless armed in eval mode, so it is harmless in policy-watch / dagger / dataset.
+            self.runner.on_action_sent = self.recorder.note_action_sent
             self.runner.start()
 
     @property

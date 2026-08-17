@@ -19,6 +19,7 @@ label+save automatically (see ``record_source`` / ``recorder.buttons``).
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -99,16 +100,22 @@ class Recorder:
         self._episode: List[dict] = []
         self._n_frames = 0
         self._streaming_episode = False
-        # Eval rollout logging records a frame only when the APPLIED action changes -- i.e. on the
-        # ticks the policy actually drove the robot, not the held ticks while it computes the next
-        # chunk (those repeat the last command). Keeps the "waiting for inference" pauses out of the
-        # dataset. This is the last action written; None means the next frame always records.
-        self._last_recorded_action: Optional[np.ndarray] = None
+        # Eval rollout logging records ONE frame per action the policy actually sends to the robot,
+        # driven by the send itself rather than by watching the applied action change: the runner
+        # calls note_action_sent() from its control-rate thread on every set_policy_action, pushing
+        # the sent action here; the record loop drains this queue and writes exactly one frame per
+        # entry. So recorded frames == executed actions, always -- no held "waiting for inference"
+        # ticks, no paused ticks, and no double/missed frames from a value-equality heuristic.
+        # deque.append/popleft are individually atomic in CPython, so no lock is needed across the
+        # runner thread (append) and the record loop (popleft).
+        self._sent_actions: "collections.deque[np.ndarray]" = collections.deque()
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
         # "<side>.<index>" -> outcome (success/fail/discard); see RecorderConfig.button_map
-        self._button_outcome: Dict[str, str] = {str(k).lower(): str(v).lower() for k, v in (cfg.button_map or {}).items()}
+        self._button_outcome: Dict[str, str] = {
+            str(k).lower(): str(v).lower() for k, v in (cfg.button_map or {}).items()
+        }
         if cfg.record_source in ("dagger", "deploy"):
             # Policy-driven modes: the handle buttons drive the robot's own rollout state
             # machine (start/stop, takeover, home), not an episode outcome label.
@@ -200,8 +207,7 @@ class Recorder:
 
     def _open_writer(self) -> AsyncDatasetWriter:
         shapes = {k: self.cameras.shape_of(k) for k in self.cameras.image_keys}
-        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes,
-                                    extra_features=self._extra_features)
+        writer = AsyncDatasetWriter(self.cfg, self.cameras.image_keys, shapes, extra_features=self._extra_features)
         writer.open(self._sample_frame())
         return writer
 
@@ -228,8 +234,7 @@ class Recorder:
             "observation.eef": np.zeros(EEF_DIM, np.float32),
             "observation.control_mode": np.zeros(1, np.float32),
             "action": np.zeros(ACTION_DIM, np.float32),
-            **{name: np.zeros(int(np.prod(shape)), np.float32)
-               for name, shape in self._extra_features.items()},
+            **{name: np.zeros(int(np.prod(shape)), np.float32) for name, shape in self._extra_features.items()},
         }
 
     @staticmethod
@@ -322,8 +327,9 @@ class Recorder:
         self._extra_features = {str(k): tuple(v) for k, v in (features or {}).items()}
         self._extras_fn = values_fn if self._extra_features else None
         if self._extra_features:
-            logger.info("recording extra per-step features: %s", ", ".join(
-                f"{k}{v}" for k, v in self._extra_features.items()))
+            logger.info(
+                "recording extra per-step features: %s", ", ".join(f"{k}{v}" for k, v in self._extra_features.items())
+            )
 
     def _extra_values(self) -> Dict[str, np.ndarray]:
         """This frame's extras, zero-filled when the policy did not send one.
@@ -343,8 +349,9 @@ class Recorder:
         for name, shape in self._extra_features.items():
             size = int(np.prod(shape))
             value = got.get(name)
-            out[name] = (np.zeros(size, np.float32) if value is None
-                         else np.asarray(value, np.float32).reshape(-1)[:size])
+            out[name] = (
+                np.zeros(size, np.float32) if value is None else np.asarray(value, np.float32).reshape(-1)[:size]
+            )
         return out
 
     def _ep_add(self, frame: dict) -> None:
@@ -395,7 +402,7 @@ class Recorder:
         self._episode, self._preview, self._pending = [], [], False
         self._n_frames = 0
         self._streaming_episode = False
-        self._last_recorded_action = None  # first frame of a new episode always records
+        self._sent_actions.clear()  # drop any sends not yet drained; a new episode starts empty
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -462,6 +469,16 @@ class Recorder:
         """Forward a DAgger policy rollout start/stop request."""
         self.robot.set_policy_running(flag)
 
+    def note_action_sent(self, action: np.ndarray) -> None:
+        """The runner calls this from its control-rate thread every time it sends an action to the
+        robot (see DeploymentPolicyRunner.on_action_sent). Each call queues exactly one eval frame:
+        the record loop drains the queue and writes one frame per sent action, so recorded frames
+        == executed actions. A no-op unless armed in eval mode -- pre-arm/idle sends are dropped so
+        they never leak into the next episode."""
+        if not (self._eval and self.gate.armed):
+            return
+        self._sent_actions.append(np.asarray(action, dtype=np.float32).reshape(-1))
+
     def set_intervention(self, flag: bool) -> None:
         """Forward a DAgger human-intervention request."""
         self.robot.set_intervention(flag)
@@ -509,7 +526,6 @@ class Recorder:
         with self._lock:
             return list(self._preview)
 
-
     # ------------------------------------------------------------------ memory guard
     @staticmethod
     def available_ram_gb() -> float:
@@ -551,7 +567,9 @@ class Recorder:
             "episode buffers ~%.1f MB per frame in RAM, and being OOM-killed mid-write "
             "leaves a dataset that will not open. Free some memory, or lower "
             "recorder.min_free_ram_gb if this is too cautious.",
-            free, limit, self._frame_mb(),
+            free,
+            limit,
+            self._frame_mb(),
         )
         with self._lock:
             self._status["low_ram"] = True
@@ -573,19 +591,23 @@ class Recorder:
         free = self.available_ram_gb()
         if self._streaming_episode:
             logger.info(
-                "episode streamed %d frames (~%.1f GB, none of it held in RAM); "
-                "%.1f GB available now",
-                frames, frames * self._frame_mb() / 1000, free,
+                "episode streamed %d frames (~%.1f GB, none of it held in RAM); %.1f GB available now",
+                frames,
+                frames * self._frame_mb() / 1000,
+                free,
             )
         else:
             logger.info(
                 "episode buffered %d frames (~%.1f GB); %.1f GB available now",
-                frames, frames * self._frame_mb() / 1000, free,
+                frames,
+                frames * self._frame_mb() / 1000,
+                free,
             )
         if free < limit * 1.5:
             logger.warning(
-                "memory is getting tight (%.1f GB free, limit %.1f GB) — the next episode "
-                "may be refused", free, limit,
+                "memory is getting tight (%.1f GB free, limit %.1f GB) — the next episode may be refused",
+                free,
+                limit,
             )
 
     def _buffered_gb(self) -> float:
@@ -623,20 +645,22 @@ class Recorder:
             next_t += period
             time.sleep(max(0.0, next_t - time.perf_counter()))
 
-    def _frame(self, images: dict, snap: dict) -> dict:
+    def _frame(self, images: dict, snap: dict, action: Optional[np.ndarray] = None) -> dict:
         # The automatic HOMING return at the episode's tail is recorded but marked as
         # `homing` in observation.control_mode, so it can be filtered out at train time
         # (e.g. treat a failed episode as ending at the failure, not after the return).
         control_mode = snap.get("control_mode", 0)
         if snap.get("teleop_state") == "HOMING" or snap.get("homing"):
             control_mode = CONTROL_MODE["homing"]
+        # `action` overrides the snapshot's when given (eval logging passes the exact action the
+        # runner just sent, so the recorded action == the executed one with no snapshot latency).
         return {
             "images": {k: np.ascontiguousarray(v) for k, v in images.items()},
             "observation.state": self._fit(snap.get("state"), STATE_DIM),
             "observation.leader": self._fit(snap.get("leader"), LEADER_DIM),
             "observation.eef": self._fit(snap.get("eef"), EEF_DIM),
             "observation.control_mode": np.array([control_mode], dtype=np.float32),
-            "action": self._fit(snap.get("action"), ACTION_DIM),
+            "action": self._fit(snap.get("action") if action is None else action, ACTION_DIM),
             **self._extra_values(),
         }
 
@@ -666,22 +690,20 @@ class Recorder:
         recording_paused = bool(snap.get("leader_recentering"))
 
         if self._eval:  # continuous rollout while armed; no engage gate
-            if not self.gate.armed:
-                self._last_recorded_action = None  # a fresh arm records its first frame
-            if (
-                self.gate.armed
-                and not recording_paused
-                and self.cameras.healthy
-                and snap["state"] is not None
-                and snap["action"] is not None
-                # Record only on the ticks the policy actually drove the robot -- when the applied
-                # action changed. While it computes the next chunk the robot holds the last command
-                # (identical action), and those "waiting for inference" frames are skipped.
-                and (self._last_recorded_action is None or not np.array_equal(snap["action"], self._last_recorded_action))
-            ):
-                self._ep_add(self._frame(images, snap))
+            # One frame per action the runner sent this interval (see note_action_sent): the queue
+            # holds exactly the sent actions, so draining it writes exactly as many frames as
+            # actions executed -- held "waiting for inference" ticks and paused ticks send nothing,
+            # so they contribute nothing. Draining in THIS thread keeps all episode-buffer/writer
+            # mutation single-threaded (the runner only appends to the deque).
+            can_record = (
+                self.gate.armed and not recording_paused and self.cameras.healthy and snap["state"] is not None
+            )
+            while self._sent_actions:
+                action = self._sent_actions.popleft()
+                if not can_record:
+                    continue  # drop sends that arrived while paused/unhealthy; don't record them
+                self._ep_add(self._frame(images, snap, action=action))
                 self._buffer_preview(images)
-                self._last_recorded_action = np.asarray(snap["action"]).copy()
             self._set(
                 armed=self.gate.armed,
                 recording=self.gate.armed and not recording_paused,

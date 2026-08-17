@@ -72,6 +72,9 @@ def run_headless(
         # Whatever per-step data the policy declares at handshake becomes dataset columns.
         # Wired before the first frame, which is when the dataset schema is fixed.
         runner.on_connected = lambda: recorder.set_extra_features(runner.extra_features(), runner.get_extras)
+        # One eval frame per action the runner sends to the robot (frames == executed actions);
+        # a no-op unless the recorder is armed in eval mode.
+        runner.on_action_sent = recorder.note_action_sent
         runner.start()
         recorder.set_leader_mirror(mirror)
         logger.info(
