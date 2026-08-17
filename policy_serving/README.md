@@ -210,12 +210,29 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
   when it runs out — so a 30-step chunk means one inference per second at 30 Hz rather than
   thirty. It takes the chunk size from what the policy returns, so a checkpoint trained at 30
   cannot be silently truncated by a client configured for 16.
-- There is no prefetching variant. One existed, starting the next inference two steps early on
-  the observation available then; measured, its freshness came out a wash against the
-  synchronous version — it started early by the same margin it was stale by — and it cost the
-  guarantee that a chunk was computed from the observation the caller actually handed over.
-  The price is a stall at each chunk boundary, which is what openpi's and LeRobot's own
-  brokers do as well.
+- **AsyncChunkBroker** is the overlapped variant: it starts the next inference in the background
+  once the chunk in hand is down to its last few steps, so the control loop keeps sending an
+  action every tick instead of freezing for a full round-trip at each chunk boundary. The reply
+  is spliced in at index `d = steps consumed since the request` — the actions it predicted for
+  ticks already executed are dropped — so nothing is ever executed twice. `d` is the inference
+  delay; it is what RTC calls by that name, and `leftover()` (the unexecuted tail of the chunk in
+  hand) is the prefix RTC's guidance inpaints against, so the client side of RTC is already here
+  and only the server's prefix-guided sampling is missing (hook: `set_prefix_fn`).
+
+  ```python
+  from yam_policy import AsyncChunkBroker
+  policy = AsyncChunkBroker(client, rate_hz=30.0)   # prefetch sized from measured latency
+  ```
+
+  The trade is explicit, not free: synchronous inference guarantees a chunk was computed from the
+  observation the caller just handed over, and async does not — each chunk begins executing `d`
+  ticks after the observation it came from. What it buys is that the robot never physically stops.
+  With a synchronous broker the arm dead-stops for the whole inference at every chunk boundary
+  (the controller holds its last target), which is a real artifact in the motion, not just in the
+  recording. The deploy runner defaults to async for that reason; set `async_inference=False` in
+  `BridgeConfig` to get the synchronous behaviour back, which is what openpi's and LeRobot's own
+  brokers do. If the server is slower than the chunk it predicts, prefetch cannot hide it: the
+  loop blocks as before, and the underrun is counted (`stats()["underruns"]`) rather than hidden.
 - **Metadata-driven config**: declare `action_horizon` (and optionally an
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from

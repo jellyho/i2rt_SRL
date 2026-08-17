@@ -5,7 +5,9 @@ Two sides, both speaking websocket + msgpack-numpy:
 * server (heavy env): wrap a policy implementing :class:`BasePolicy` in
   :class:`WebsocketPolicyServer` and run it (see :mod:`yam_policy.serve`).
 * client (robot/workstation env): :class:`WebsocketClientPolicy` + optional
-  :class:`ActionChunkBroker` to execute action chunks open-loop.
+  :class:`ActionChunkBroker` to execute action chunks open-loop, or
+  :class:`AsyncChunkBroker` to infer the next chunk while the current one is still
+  executing (no per-chunk stall; also the substrate RTC needs).
 
 The wire protocol matches openpi exactly, so real openpi checkpoints served with
 ``openpi`` work against this client, and policies written against
@@ -13,6 +15,7 @@ The wire protocol matches openpi exactly, so real openpi checkpoints served with
 """
 
 from .action_chunk_broker import ActionChunkBroker
+from .async_chunk_broker import AsyncChunkBroker, LatencyTracker
 from .base_policy import BasePolicy
 from .websocket_client import WebsocketClientPolicy
 from .websocket_server import WebsocketPolicyServer
@@ -23,7 +26,9 @@ from .websocket_server import WebsocketPolicyServer
 #:     from yam_policy.viz import WristCameraGeometry, overlay_samples
 __all__ = [
     "ActionChunkBroker",
+    "AsyncChunkBroker",
     "BasePolicy",
+    "LatencyTracker",
     "WebsocketClientPolicy",
     "WebsocketPolicyServer",
 ]

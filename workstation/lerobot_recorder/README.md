@@ -441,11 +441,23 @@ no dataset is created, opened, or resumed and no frames are buffered.
 | dagger | off | `deploy` | practise takeovers, save nothing |
 | dataset | — | (n/a) | replay a recorded episode on the robot (watch-only, §D) |
 
-> **`eval` recording is action-gated.** A frame is written only when the applied action changes —
-> i.e. on the ticks the policy actually drove the arm, not the held ticks while it computes the next
-> chunk. Those "waiting for inference" pauses stay out of the dataset, and since frames are stamped
-> by index/fps the remainder is contiguous (no gaps). Teleop recording is unaffected — it has no
-> inference wait, so every tick is fresh motion.
+> **`eval` recording is send-driven: one frame per action executed.** A frame is captured at the
+> instant the runner sends an action to the robot — images, robot state, that action and the
+> policy's per-step extras all sampled together, right then. So the frame count equals the number
+> of actions the policy actually executed, and each frame is internally consistent. Ticks on which
+> nothing is sent (waiting for inference, a paused replay) contribute nothing, and since frames are
+> stamped by index/fps the remainder is contiguous. Capturing at send time rather than when the
+> record loop next runs is what stops a lagging loop from writing several sends against one stale
+> snapshot — that bug duplicated ~30% of frames and collapsed the first chunk to a single repeated
+> image. Teleop recording is unaffected: it has no inference wait, so every tick is fresh motion.
+>
+> **Every eval frame also carries its provenance** (`policy.chunk_index`, `policy.step_in_chunk`,
+> `policy.infer_ms`, `policy.delay_ticks`, `policy.wall_time`). An action is the k-th step of a
+> chunk inferred from an observation `delay_ticks` earlier, so these columns are what distinguish
+> "the policy reacted to this frame" from "the policy was still executing a plan made a second
+> ago" — and `wall_time` preserves the true send cadence, which the dataset's uniform frame
+> timestamps otherwise erase. They are added by the runner, so they appear whether or not the
+> policy declares extras of its own.
 
 Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
 (it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /

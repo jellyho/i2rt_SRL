@@ -349,8 +349,6 @@ def test_set_replay_source_ignores_a_no_op_reselect():
     assert r._policy is not None  # unchanged: no rebuild forced
 
 
-
-
 def test_replay_pause_is_a_workstation_send_gate():
     """Pause/resume never touches policy_running -- it is a flag the loop reads to stop/continue
     sending actions, so the robot just holds and its start/stop (gripper close) logic never runs."""
@@ -368,3 +366,47 @@ def test_picking_a_new_episode_clears_pause():
     r.set_replay_paused(True)
     r.set_replay_source("d", 5)
     assert r.replay_paused is False
+
+
+def test_every_eval_frame_carries_the_provenance_of_the_action_it_recorded():
+    """A rollout must say where each action came from, not just what it was.
+
+    An action is the k-th step of a chunk inferred from an observation some ticks earlier, so
+    without these columns a dataset cannot distinguish "the policy reacted to this frame" from
+    "the policy was still replaying a plan made a second ago" -- and the send cadence is lost to
+    the dataset's uniform frame timestamps.
+    """
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+
+    class _Broker:
+        def stats(self):
+            return {"chunk_index": 3, "step_in_chunk": 7, "infer_ms": 120.5, "delay_ticks": 4}
+
+    r._policy = _Broker()
+    r._note_timing(1234.5)
+
+    features = r.extra_features()
+    for name in ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time"):
+        assert features["policy." + name] == (1,)
+
+    extras = r.get_extras()
+    assert float(extras["policy.chunk_index"][0]) == 3.0
+    assert float(extras["policy.step_in_chunk"][0]) == 7.0
+    assert float(extras["policy.delay_ticks"][0]) == 4.0
+    assert float(extras["policy.wall_time"][0]) == 1234.5
+    st = r.get_status()
+    assert st["delay_ticks"] == 4 and st["underruns"] == 0
+
+
+def test_provenance_is_present_even_when_the_policy_declares_no_extras():
+    """The columns come from the runner, not the handshake, so a plain policy still gets them."""
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    assert r._extra_features == {}
+    assert set(r.extra_features()) == {
+        "policy.chunk_index",
+        "policy.step_in_chunk",
+        "policy.infer_ms",
+        "policy.delay_ticks",
+        "policy.wall_time",
+    }
+    assert all(v.shape == (1,) for v in r.get_extras().values())

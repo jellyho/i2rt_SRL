@@ -28,6 +28,19 @@ class BridgeConfig:
     # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
     num_samples: int = 0
 
+    # Overlap inference with execution (AsyncChunkBroker): the next chunk is inferred on a
+    # background thread while the current one is still being executed, so the control loop keeps
+    # sending an action every tick instead of freezing for a round-trip at every chunk boundary --
+    # which is what made the arm dead-stop about once a second in every rollout. The reply is
+    # spliced in at the index matching the inference delay, so nothing is executed twice.
+    # Turn off to get the old synchronous behaviour (one stall per chunk) for comparison.
+    async_inference: bool = True
+    # Steps of chunk that must remain before the next inference is started. 0 = derive it from the
+    # measured latency (recommended: it adapts to the server and the network on its own).
+    prefetch_ticks: int = 0
+    # Extra ticks of headroom on top of the measured latency when prefetch_ticks is 0.
+    prefetch_margin_ticks: int = 2
+
     # Replay source: when `replay_mode` is on, the deploy stack drives the robot from a recorded
     # dataset instead of a live policy server -- an in-process DatasetPolicy (no server, no
     # websocket, no subprocess) wrapped exactly like any policy, so every deployment safeguard

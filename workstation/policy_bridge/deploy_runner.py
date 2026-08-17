@@ -73,6 +73,15 @@ def _describe_policy(meta: Dict) -> str:
     return f"{guess} · {name}" if name else guess
 
 
+#: Per-step timing/provenance columns the runner adds to every eval recording, on top of whatever
+#: the policy declares. They answer "where did this action come from?": which chunk and which step
+#: within it, how long that chunk's inference took, how many control ticks passed between the
+#: observation it was computed from and this action being sent (the RTC inference delay), and the
+#: real wall-clock instant of the send. Prefixed so they never collide with a policy's own extras.
+PROVENANCE_PREFIX = "policy."
+PROVENANCE_FIELDS = ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time")
+
+
 def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
     """What extra per-step arrays this policy sends, from its handshake metadata.
 
@@ -125,6 +134,8 @@ class DeploymentPolicyRunner:
         self._extra_features: Dict[str, tuple] = {}
         self._extras: Dict[str, "np.ndarray"] = {}
         self._extra_warned: set = set()
+        #: This step's provenance (see PROVENANCE_FIELDS / _note_timing).
+        self._timing: Dict[str, float] = {name: 0.0 for name in PROVENANCE_FIELDS}
         #: Called once the handshake is in, so the recorder can declare its columns.
         self.on_connected = None
         #: Called with the sent action vector every time an action is pushed to the robot, so the
@@ -159,6 +170,12 @@ class DeploymentPolicyRunner:
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
+            # Inference timing (async broker only): how long the policy takes, how many control
+            # ticks that costs, and how often it was too slow to cover the chunk (each underrun is
+            # a tick the robot had nothing new to execute).
+            "infer_ms": 0.0,
+            "delay_ticks": 0,
+            "underruns": 0,
         }
 
     def start(self) -> None:
@@ -315,12 +332,22 @@ class DeploymentPolicyRunner:
         else:
             if not self._policy_port_open():
                 raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
-            from yam_policy import ActionChunkBroker, WebsocketClientPolicy
+            from yam_policy import ActionChunkBroker, AsyncChunkBroker, WebsocketClientPolicy
 
             client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
             meta = client.get_server_metadata() or {}
             self._policy_client = client
-            policy = ActionChunkBroker(client)
+            if self.cfg.async_inference:
+                # Infer the next chunk while this one is still executing; the reply is spliced in
+                # at the inference delay, so the robot keeps moving through the chunk boundary.
+                policy = AsyncChunkBroker(
+                    client,
+                    rate_hz=self.cfg.rate_hz,
+                    margin_ticks=self.cfg.prefetch_margin_ticks,
+                    prefetch_ticks=self.cfg.prefetch_ticks,
+                )
+            else:
+                policy = ActionChunkBroker(client)
 
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
@@ -387,13 +414,44 @@ class DeploymentPolicyRunner:
             self._extras = values
 
     def get_extras(self) -> Dict[str, "np.ndarray"]:
-        """The declared per-step extras from the most recent step, flattened."""
+        """The declared per-step extras from the most recent step, plus this step's provenance.
+
+        Read on the control thread immediately after the action is sent (see
+        Recorder.note_action_sent), so the values belong to the action being recorded.
+        """
         with self._lock:
-            return {k: v.copy() for k, v in self._extras.items()}
+            out = {k: v.copy() for k, v in self._extras.items()}
+            for name, value in self._timing.items():
+                out[PROVENANCE_PREFIX + name] = np.asarray([value], dtype=np.float32)
+        return out
 
     def extra_features(self) -> Dict[str, tuple]:
-        """``{name: per-step shape}`` the policy declared at handshake, empty until connected."""
-        return dict(self._extra_features)
+        """``{name: per-step shape}``: what the policy declared at handshake, plus provenance."""
+        features = dict(self._extra_features)
+        features.update({PROVENANCE_PREFIX + name: (1,) for name in PROVENANCE_FIELDS})
+        return features
+
+    def _note_timing(self, wall_time: float) -> None:
+        """Record where the action just sent came from, so the dataset can be audited.
+
+        Without this a rollout says what was executed but not when it was decided: an action is
+        the k-th step of a chunk inferred from an observation `delay_ticks` earlier, and only
+        `chunk_index`/`step_in_chunk` distinguish "the policy reacted" from "the policy was still
+        executing a plan made a second ago". `wall_time` is the real send instant, so the true
+        cadence survives the dataset's uniform frame timestamps.
+        """
+        stats = getattr(self._policy, "stats", None)
+        got = stats() if callable(stats) else {}
+        timing = {name: float(got.get(name, 0.0)) for name in PROVENANCE_FIELDS if name != "wall_time"}
+        timing["wall_time"] = float(wall_time)
+        with self._lock:
+            self._timing = timing
+        if got:
+            self._set(
+                infer_ms=round(float(got.get("infer_ms", 0.0)), 1),
+                delay_ticks=int(got.get("delay_ticks", 0)),
+                underruns=int(got.get("underruns", 0)),
+            )
 
     def _image_shape_from_meta(self, meta: Dict) -> tuple[int, int]:
         image_shape = meta.get("image_shape")
@@ -439,6 +497,10 @@ class DeploymentPolicyRunner:
                             self._set_extras(result)
                             action_vec = np.asarray(action, dtype=float).reshape(-1)
                             self._robot.set_policy_action(self._split(action_vec))
+                            # Stamp where this action came from BEFORE the recorder captures the
+                            # frame -- note_action_sent reads get_extras() synchronously, so the
+                            # provenance written with the frame is this action's, not the previous.
+                            self._note_timing(time.time())
                             # Log one eval frame for the action we just executed (1 frame == 1 send).
                             if self.on_action_sent is not None:
                                 self.on_action_sent(action_vec)
