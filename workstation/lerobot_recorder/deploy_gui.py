@@ -181,13 +181,14 @@ class DeployGUI(RecorderGUI):
         self.review_box.setVisible(recording and self.cfg.review_before_save)
         self.collect_btn.setVisible(recording)
         self.save_btn.setVisible(recording)
-        # The past-demonstration panel's playback/refresh controls are only meaningful in REPLAY,
-        # where that panel picks the episode to drive: there you re-list datasets and freeze/play the
-        # ghost. In policy/dagger the panel is just a first-frame alignment overlay, so those buttons
-        # are clutter -- hide them (the overlay still shows the selected episode's first frame).
+        # The past-demonstration panel's playback ("Resume reference") and "Refresh demonstrations"
+        # buttons are not useful in deployment: in policy/dagger the panel is just a first-frame
+        # alignment overlay, and in replay the episode is chosen from the LIST while the ghost
+        # auto-follows the rollout (_sync_replay_overlay) and the dataset list is refreshed on Start.
+        # So hide both in every deploy mode.
         for btn in (getattr(self, "reference_pause_btn", None), getattr(self, "reference_refresh_btn", None)):
             if btn is not None:
-                btn.setVisible(replaying)
+                btn.setVisible(False)
         self.keep_home_btn.setVisible(per_rollout_verdict)
         self.discard_home_btn.setText("Discard + Home" if per_rollout_verdict else "Stop + Home")
         self.dagger_box.setTitle(
@@ -310,6 +311,10 @@ class DeployGUI(RecorderGUI):
         self.source_combo.setCurrentText("deploy" if self.deploy_only else "dagger")
         self.bridge_cfg.prompt = self.task_combo.currentText().strip()
         super()._on_start()
+        # Re-list the past-demonstration datasets from the (now-applied) root, so replay can pick an
+        # episode without a manual "Refresh demonstrations" button (which is hidden -- see _sync_run_mode).
+        if self.recorder is not None:
+            self._refresh_reference_datasets()
         if self.recorder is not None:
             # Push the mirror choice once the link exists; the bridge latches it and
             # re-applies on reconnect, so the robot never silently reverts to its default.
