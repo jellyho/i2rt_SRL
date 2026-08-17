@@ -169,13 +169,15 @@ class DeployGUI(RecorderGUI):
 
         for widget in (
             self.repo_combo,
-            self.root_edit,
             self.resume_check,
             self.rl_check,
             self.reward_combo,
             self.discount_spin,
         ):
             self._set_form_row_visible(widget, recording)
+        # `root` is the datasets folder -- needed when recording AND in dataset-replay (it is where
+        # the run page's reference panel lists episodes from), so keep it visible in both.
+        self._set_form_row_visible(self.root_edit, recording or replaying)
         self.review_box.setVisible(recording and self.cfg.review_before_save)
         self.collect_btn.setVisible(recording)
         self.save_btn.setVisible(recording)

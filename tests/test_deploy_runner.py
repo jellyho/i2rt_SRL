@@ -347,3 +347,23 @@ def test_set_replay_source_ignores_a_no_op_reselect():
     r._policy = object()  # pretend it built
     r.set_replay_source("d", 1)
     assert r._policy is not None  # unchanged: no rebuild forced
+
+
+def test_replay_pause_resume_holds_the_cursor_no_rewind():
+    """In replay the rollout on/off toggle is pause/resume, so a chunk reset must NOT rewind the
+    episode -- otherwise 'resume' would restart from frame 0."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    calls = []
+    r._policy = type("P", (), {"reset": lambda self: calls.append(1)})()
+    r._reset_policy_chunk()
+    assert calls == []  # held, not rewound
+
+
+def test_live_policy_chunk_reset_still_rewinds():
+    """A live policy still resets on every rollout start/stop -- a fresh rollout must re-query a
+    fresh chunk, not replay a stale one."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=False), RecorderConfig(mock=False), lambda: {})
+    calls = []
+    r._policy = type("P", (), {"reset": lambda self: calls.append(1)})()
+    r._reset_policy_chunk()
+    assert calls == [1]

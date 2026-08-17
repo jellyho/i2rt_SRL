@@ -483,6 +483,13 @@ class DeploymentPolicyRunner:
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:
             return
+        # In replay, the rollout on/off toggle is a PAUSE/RESUME: pausing must hold the cursor
+        # where it is so resuming continues the episode, not restart it from frame 0. A genuine
+        # restart is picking the episode again (set_replay_source rebuilds a fresh DatasetPolicy).
+        # For a live policy, resetting on every start/stop is right -- a fresh rollout re-queries a
+        # fresh chunk rather than replaying a stale one.
+        if self.cfg.replay_mode:
+            return
         try:
             self._policy.reset()
         except Exception as e:
