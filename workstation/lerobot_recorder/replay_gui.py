@@ -15,6 +15,8 @@ from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.cameras import CameraManager
 from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.dataset_reader import DatasetReader
+from workstation.lerobot_recorder.dataset_writer import list_datasets
+from workstation.lerobot_recorder.gui import PickerComboBox
 from workstation.lerobot_recorder.replay_controller import ReplayController
 from workstation.lerobot_recorder.views import overlay
 
@@ -56,10 +58,23 @@ class ReplayGUI(QtWidgets.QWidget):
         strip.addWidget(self.estop_btn)
 
         form = QtWidgets.QFormLayout()
-        self.repo_edit = QtWidgets.QLineEdit(self.cfg.repo_id)
+        # Searchable dataset picker (same idea as the deploy GUI's overlay-dataset combo): an
+        # editable PickerComboBox listing every dataset folder under `root`, with a substring
+        # completer so you can type part of a name to filter -- instead of typing the whole
+        # repo_id by hand. Still editable, so a repo_id not under this root can be typed too.
+        self.repo_edit = PickerComboBox(editable=True)
+        self.repo_edit.setToolTip("Dataset folder under root -- type to search, or pick from the list")
+        completer = self.repo_edit.completer()
+        if completer is not None:
+            completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+            completer.setFilterMode(QtCore.Qt.MatchContains)
+            completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
         self.root_edit = QtWidgets.QLineEdit(self.cfg.root)
+        # Re-list datasets whenever the root changes (mirrors deploy's _refresh_reference_datasets).
+        self.root_edit.editingFinished.connect(self._refresh_datasets)
         form.addRow("repo_id", self.repo_edit)
         form.addRow("root", self.root_edit)
+        self._refresh_datasets(preferred=self.cfg.repo_id)
 
         self.load_btn = QtWidgets.QPushButton("Load")
         self.load_btn.clicked.connect(self._on_load)
@@ -120,8 +135,20 @@ class ReplayGUI(QtWidgets.QWidget):
         root.addWidget(self.status)
 
     # ------------------------------------------------------------------ actions
+    def _refresh_datasets(self, *, preferred: str = "") -> None:
+        """List every dataset folder under the current root into the picker, keeping the current
+        (or ``preferred``) selection. The folder name is what DatasetReader resolves against."""
+        want = (preferred or self.repo_edit.currentText()).strip()
+        want = want.strip("/").split("/")[-1]  # a "user/name" repo_id -> its folder name
+        choices = list_datasets(self.root_edit.text().strip())
+        self.repo_edit.blockSignals(True)
+        self.repo_edit.clear()
+        self.repo_edit.addItems(choices)
+        self.repo_edit.setCurrentText(want)  # editable, so this shows even if not in the list
+        self.repo_edit.blockSignals(False)
+
     def _on_load(self) -> None:
-        self.cfg.repo_id = self.repo_edit.text().strip()
+        self.cfg.repo_id = self.repo_edit.currentText().strip()
         self.cfg.root = self.root_edit.text().strip()
         self.reader = DatasetReader(
             self.cfg.repo_id, self.cfg.root, display_cam=self.cfg.review_cam, mock=self.cfg.mock
