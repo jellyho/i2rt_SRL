@@ -339,6 +339,13 @@ class DeployGUI(RecorderGUI):
             return
         st = self.recorder.get_status()
         running = bool(st.get("policy_running"))
+        # In replay, once it is running the toggle is PAUSE/RESUME -- a pure send-gate on the runner
+        # (the robot holds while paused). policy_running is left on, so the robot side never runs its
+        # start/stop logic (no gripper close on resume). Starting/stopping the run is the other
+        # branch below (the first press starts it; homing/e-stop stops it).
+        if self.run_mode == "dataset" and running and self.runner is not None:
+            self.runner.set_replay_paused(not self.runner.replay_paused)
+            return
         if not running and not self.policy_ready:
             err = (self.runner.get_status().get("last_error") if self.runner else "") or "not connected yet"
             if self.run_mode == "dataset":
@@ -359,6 +366,8 @@ class DeployGUI(RecorderGUI):
                 )
             QtWidgets.QMessageBox.warning(self, title, body)
             return
+        if self.run_mode == "dataset" and self.runner is not None:
+            self.runner.set_replay_paused(False)  # (re)starting a replay plays, not paused
         self.recorder.set_policy_running(not running)
 
     def _on_intervention_toggle(self) -> None:
@@ -498,7 +507,12 @@ class DeployGUI(RecorderGUI):
         intervention = bool(st.get("intervention"))
         homing = bool(st.get("homing"))
         blocked = homing or bool(st.get("estop"))
-        self.policy_btn.setText("Stop Policy" if running else "Start Policy")
+        if self.run_mode == "dataset":
+            # In replay the button starts the run, then pauses/resumes it (a send-gate).
+            paused = bool(self.runner is not None and self.runner.replay_paused)
+            self.policy_btn.setText("Start Replay" if not running else ("Resume" if paused else "Pause"))
+        else:
+            self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
         self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")

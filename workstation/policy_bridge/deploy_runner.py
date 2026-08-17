@@ -128,6 +128,12 @@ class DeploymentPolicyRunner:
         #: Called once the handshake is in, so the recorder can declare its columns.
         self.on_connected = None
         self._was_streaming = False
+        # Replay pause: PURELY a send-gate on this (workstation) side. When paused the loop stops
+        # calling infer()/set_policy_action, so the DatasetPolicy cursor freezes and the robot just
+        # holds its last command (the deploy controller's command_timeout hold) -- no policy_running
+        # toggle, so the robot side runs none of its start/stop logic (no gripper close). Resume
+        # continues from the same frame. Only meaningful in replay_mode.
+        self._replay_paused = False
         self._lock = threading.Lock()
         # Seconds between idle reachability probes -- see _probe_policy.
         self._PROBE_PERIOD_S = 2.0
@@ -278,7 +284,18 @@ class DeploymentPolicyRunner:
         self._policy = None
         self._policy_client = None
         self._last_probe = 0.0  # rebuild promptly, don't wait out the probe throttle
+        self._replay_paused = False  # a freshly picked episode plays from the start
         self._set(policy_connected=False)
+
+    def set_replay_paused(self, paused: bool) -> None:
+        """Pause/resume a dataset replay -- a send-gate only (see _replay_paused). Pausing freezes
+        the episode cursor and lets the robot hold; resuming continues from the same frame. No
+        effect on a live policy."""
+        self._replay_paused = bool(paused)
+
+    @property
+    def replay_paused(self) -> bool:
+        return self._replay_paused
 
     def _connect_policy(self) -> None:
         if self.recorder_cfg.mock or self._policy is not None:
@@ -395,7 +412,14 @@ class DeploymentPolicyRunner:
                     should_stream = bool(obs.get("policy_running")) and not (
                         obs.get("intervention") or obs.get("homing") or obs.get("estop")
                     )
-                    if should_stream:
+                    if should_stream and self.cfg.replay_mode and self._replay_paused:
+                        # Paused replay: DON'T infer or send. The cursor stays put and the robot
+                        # holds its last command -- policy_running is untouched, so the robot side
+                        # runs none of its start/stop logic. `_was_streaming` is left as-is so
+                        # resuming does not count as a fresh rollout (no reset).
+                        self._connect_policy()
+                        self._set(streaming=False, last_error="")
+                    elif should_stream:
                         self._connect_policy()
                         if not self._was_streaming:
                             self._reset_policy_chunk()
@@ -482,13 +506,6 @@ class DeploymentPolicyRunner:
 
     def _reset_policy_chunk(self) -> None:
         if self._policy is None:
-            return
-        # In replay, the rollout on/off toggle is a PAUSE/RESUME: pausing must hold the cursor
-        # where it is so resuming continues the episode, not restart it from frame 0. A genuine
-        # restart is picking the episode again (set_replay_source rebuilds a fresh DatasetPolicy).
-        # For a live policy, resetting on every start/stop is right -- a fresh rollout re-queries a
-        # fresh chunk rather than replaying a stale one.
-        if self.cfg.replay_mode:
             return
         try:
             self._policy.reset()

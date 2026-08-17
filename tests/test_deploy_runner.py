@@ -349,21 +349,22 @@ def test_set_replay_source_ignores_a_no_op_reselect():
     assert r._policy is not None  # unchanged: no rebuild forced
 
 
-def test_replay_pause_resume_holds_the_cursor_no_rewind():
-    """In replay the rollout on/off toggle is pause/resume, so a chunk reset must NOT rewind the
-    episode -- otherwise 'resume' would restart from frame 0."""
+
+
+def test_replay_pause_is_a_workstation_send_gate():
+    """Pause/resume never touches policy_running -- it is a flag the loop reads to stop/continue
+    sending actions, so the robot just holds and its start/stop (gripper close) logic never runs."""
     r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
-    calls = []
-    r._policy = type("P", (), {"reset": lambda self: calls.append(1)})()
-    r._reset_policy_chunk()
-    assert calls == []  # held, not rewound
+    assert r.replay_paused is False
+    r.set_replay_paused(True)
+    assert r.replay_paused is True
+    r.set_replay_paused(False)
+    assert r.replay_paused is False
 
 
-def test_live_policy_chunk_reset_still_rewinds():
-    """A live policy still resets on every rollout start/stop -- a fresh rollout must re-query a
-    fresh chunk, not replay a stale one."""
-    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=False), RecorderConfig(mock=False), lambda: {})
-    calls = []
-    r._policy = type("P", (), {"reset": lambda self: calls.append(1)})()
-    r._reset_policy_chunk()
-    assert calls == [1]
+def test_picking_a_new_episode_clears_pause():
+    """A freshly picked episode plays from the start, so selecting one clears any pause."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    r.set_replay_paused(True)
+    r.set_replay_source("d", 5)
+    assert r.replay_paused is False
