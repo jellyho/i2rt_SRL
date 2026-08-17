@@ -4,6 +4,14 @@ Loads a LeRobot **v3.0** dataset and exposes, per episode, the per-frame action
 (14-d, both arms) for driving the robot and an optional image for the GUI. The
 few version-sensitive accessors are isolated here (like ``dataset_writer.py``).
 
+**Only ONE episode's frames are held in memory at a time.** ``load()`` reads just the
+lightweight metadata (episode count, per-episode length, fps, feature schema) -- not the
+frames. The frame accessors then lazily open the *single* episode they are asked for
+(``LeRobotDataset(..., episodes=[e])``) and cache it, replacing whatever episode was open
+before. A 347-episode set costs ~120 MB this way (metadata + one episode) instead of ~1.1 GB
+for the whole thing -- replay/render only ever look at one episode, so there is no reason to
+load the rest.
+
 ``mock=True`` synthesizes a few episodes so the replay UI/logic runs without
 ``lerobot`` or a real dataset.
 """
@@ -15,6 +23,9 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from workstation.lerobot_recorder.config import ACTION_DIM
+
+_MOCK_EPISODES = 3
+_MOCK_LENGTH = 120
 
 
 def _to_uint8_hwc(t: Any) -> Optional[np.ndarray]:
@@ -33,57 +44,87 @@ class DatasetReader:
         self.root = root
         self.display_cam = display_cam
         self.mock = mock
-        self._ds = None
-        self._ep_index: Dict[int, List[int]] = {}  # episode -> global frame indices
+        self._meta = None  # LeRobotDatasetMetadata -- frame-free (episode lengths, fps, features)
+        self._ds = None  # the ONE currently-loaded episode's LeRobotDataset (episodes=[_loaded_ep])
+        self._loaded_ep: Optional[int] = None
         self._fps = 60
+        self._total_eps = 0
+        self._ep_lengths: Dict[int, int] = {}
+        self._features: Dict[str, Any] = {}
 
-    # ------------------------------------------------------------------ load
+    # ------------------------------------------------------------------ load (metadata only)
     def load(self) -> None:
         if self.mock:
             self._fps = 60
-            self._ep_index = {e: list(range(e * 1000, e * 1000 + 120)) for e in range(3)}  # 3 episodes x 120 frames
+            self._total_eps = _MOCK_EPISODES
+            self._ep_lengths = {e: _MOCK_LENGTH for e in range(_MOCK_EPISODES)}
+            return
+        try:
+            from lerobot.datasets import LeRobotDatasetMetadata
+        except ImportError:
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        from workstation.lerobot_recorder.dataset_writer import dataset_dir
+
+        # The dataset lives in <root>/<name> (same rule the recorder writes with). Metadata only --
+        # no frames, no video index for every episode; the frame accessors load one episode lazily.
+        self._root_dir = dataset_dir(self.root, self.repo_id)
+        self._meta = LeRobotDatasetMetadata(self.repo_id, root=self._root_dir)
+        self._fps = int(getattr(self._meta, "fps", 60) or 60)
+        self._total_eps = int(getattr(self._meta, "total_episodes", 0) or 0)
+        self._features = dict(getattr(self._meta, "features", {}) or {})
+        # Per-episode lengths from the metadata's episodes table (small: one row per episode).
+        eps = getattr(self._meta, "episodes", None)
+        self._ep_lengths = {}
+        if eps is not None:
+            try:
+                for e, ln in zip(eps["episode_index"], eps["length"], strict=False):
+                    self._ep_lengths[int(e)] = int(ln)
+            except (KeyError, TypeError):
+                # Older/newer layouts: fall back to indexing rows.
+                for i in range(self._total_eps):
+                    row = eps[i]
+                    self._ep_lengths[int(row.get("episode_index", i))] = int(row.get("length", 0))
+
+    def _ensure_episode(self, episode: int) -> None:
+        """Make ``self._ds`` hold ONLY ``episode``'s frames (0-indexed), loading it if a different
+        episode (or none) is currently open. Replacing ``self._ds`` frees the previous episode."""
+        if self._loaded_ep == episode and self._ds is not None:
             return
         try:
             from lerobot.datasets import LeRobotDataset
         except ImportError:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        from workstation.lerobot_recorder.dataset_writer import dataset_dir
-
-        # The dataset lives in <root>/<name> (same rule the recorder writes with).
-        self._ds = LeRobotDataset(self.repo_id, root=dataset_dir(self.root, self.repo_id))
-        self._fps = int(getattr(self._ds, "fps", getattr(getattr(self._ds, "meta", None), "fps", 60)))
-        # group global frame indices by episode (cheap column read; no video decode)
-        col = self._ds.hf_dataset["episode_index"]
-        self._ep_index = {}
-        for gi, e in enumerate(col):
-            self._ep_index.setdefault(int(e), []).append(gi)
+        self._ds = None  # drop the previous episode before opening the next (halves peak memory)
+        self._ds = LeRobotDataset(self.repo_id, root=self._root_dir, episodes=[episode])
+        self._loaded_ep = episode
 
     # ------------------------------------------------------------------ queries
     @property
     def num_episodes(self) -> int:
-        return len(self._ep_index)
+        return self._total_eps
 
     @property
     def fps(self) -> int:
         return self._fps
 
     def episode_length(self, episode: int) -> int:
-        return len(self._ep_index.get(episode, []))
+        return int(self._ep_lengths.get(episode, 0))
 
     def get_action(self, episode: int, frame: int) -> np.ndarray:
         if self.mock:
             t = frame / 30.0
             return (0.3 * np.sin(t + np.arange(ACTION_DIM))).astype(np.float32)
-        gi = self._ep_index[episode][frame]
-        act = self._ds.hf_dataset[gi]["action"]  # avoids video decode
+        self._ensure_episode(episode)
+        act = self._ds.hf_dataset[frame]["action"]  # avoids video decode
         return np.asarray(act, dtype=np.float32).reshape(-1)
 
     def camera_keys(self) -> List[str]:
         """Camera names available in the dataset (the ``observation.images.<name>`` suffixes)."""
         if self.mock:
             return ["agentview"]
-        feats = getattr(self._ds, "features", None) or getattr(getattr(self._ds, "meta", None), "features", {}) or {}
-        return sorted(k.split("observation.images.", 1)[1] for k in feats if k.startswith("observation.images."))
+        return sorted(
+            k.split("observation.images.", 1)[1] for k in self._features if k.startswith("observation.images.")
+        )
 
     def get_image(self, episode: int, frame: int) -> Optional[np.ndarray]:
         """Return an HxWx3 uint8 image (the configured display camera) for display, or None."""
@@ -96,10 +137,10 @@ class DatasetReader:
             x = (frame * 3) % 160
             img[:, max(0, x - 6) : x + 6, :] = 200
             return {"agentview": img}
-        gi = self._ep_index[episode][frame]
+        self._ensure_episode(episode)
         out: Dict[str, np.ndarray] = {}
         try:
-            row = self._ds[gi]  # decodes video frames
+            row = self._ds[frame]  # decodes video frames
         except Exception:
             return out
         for key, val in row.items():
@@ -114,9 +155,9 @@ class DatasetReader:
         """Return the frame's ``observation.state`` vector (no video decode), or None."""
         if self.mock:
             return None
-        gi = self._ep_index[episode][frame]
+        self._ensure_episode(episode)
         try:
-            st = self._ds.hf_dataset[gi].get("observation.state")
+            st = self._ds.hf_dataset[frame].get("observation.state")
         except Exception:
             return None
         return None if st is None else np.asarray(st, dtype=np.float32).reshape(-1)
@@ -126,9 +167,9 @@ class DatasetReader:
         or None if the feature is absent. No video decode."""
         if self.mock:
             return None
-        gi = self._ep_index[episode][frame]
+        self._ensure_episode(episode)
         try:
-            val = self._ds.hf_dataset[gi].get(key)
+            val = self._ds.hf_dataset[frame].get(key)
         except Exception:
             return None
         if val is None:
@@ -145,9 +186,9 @@ class DatasetReader:
         """
         if self.mock:
             return None
-        gi = self._ep_index[episode][frame]
+        self._ensure_episode(episode)
         try:
-            val = self._ds.hf_dataset[gi].get(key)
+            val = self._ds.hf_dataset[frame].get(key)
         except Exception:
             return None
         return None if val is None else np.asarray(val, dtype=np.float32).reshape(shape)
@@ -155,23 +196,20 @@ class DatasetReader:
     def has_feature(self, key: str) -> bool:
         if self.mock:
             return False
-        feats = getattr(self._ds, "features", None) or getattr(getattr(self._ds, "meta", None), "features", {}) or {}
-        return key in feats
+        return key in self._features
 
     def get_control_mode_series(self, episode: int) -> Optional[np.ndarray]:
         """Return the per-frame ``observation.control_mode`` for a whole episode (1-D int-ish
-        float array), or None if absent. One in-memory column read — no video decode."""
+        float array), or None if absent. One in-memory column read -- no video decode."""
         if self.mock:
             return None
-        gis = self._ep_index.get(episode, [])
-        if not gis:
-            return None
+        self._ensure_episode(episode)
         try:
-            col = self._ds.hf_dataset["observation.control_mode"]
+            col = self._ds.hf_dataset["observation.control_mode"]  # this episode's frames only
         except Exception:
             return None
-        out = np.empty(len(gis), dtype=np.float32)
-        for k, gi in enumerate(gis):
-            v = np.asarray(col[gi], dtype=np.float32).reshape(-1)
-            out[k] = v[0] if v.size else 0.0
+        out = np.empty(len(col), dtype=np.float32)
+        for k, v in enumerate(col):
+            a = np.asarray(v, dtype=np.float32).reshape(-1)
+            out[k] = a[0] if a.size else 0.0
         return out
