@@ -207,6 +207,10 @@ class DeployGUI(RecorderGUI):
                 + ("" if recording else " Nothing is recorded.")
             )
         )
+        # Recording just changed -> refresh the dataset line so a watch-only run stops warning
+        # about overwriting (see _will_record).
+        if hasattr(self, "setup_status"):
+            self._update_setup_status()
 
     def _on_mirror_toggled(self, flag: bool) -> None:
         """Apply live: the operator may want the handles to stop moving mid-session."""
@@ -286,6 +290,12 @@ class DeployGUI(RecorderGUI):
     def deploy_only(self) -> bool:
         """True when this run records nothing — regardless of which mode it is in."""
         return not self.record_check.isChecked()
+
+    def _will_record(self) -> bool:
+        """A deploy run writes a dataset only when 'Record this run' is on (dataset-replay mode
+        forces it off). Drives the setup status so it never warns about overwriting in a
+        watch-only run -- START skips the whole dataset negotiation there anyway."""
+        return bool(getattr(self, "record_check", None) is not None and self.record_check.isChecked())
 
     def _on_start(self) -> None:
         self.source_combo.setCurrentText("deploy" if self.deploy_only else "dagger")

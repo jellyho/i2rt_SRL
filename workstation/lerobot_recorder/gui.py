@@ -505,6 +505,11 @@ class RecorderGUI(QtWidgets.QWidget):
         self._update_setup_status()
 
     # ------------------------------------------------------------------ setup status
+    def _will_record(self) -> bool:
+        """Whether START will write a dataset. The plain recorder always does; the deploy GUI
+        overrides this (a watch-only policy or dataset-replay run records nothing)."""
+        return True
+
     def _update_setup_status(self, rescan: bool = False) -> None:
         """Refresh the camera-detected + dataset-exists line on the setup page."""
         if rescan or not hasattr(self, "_cam_detect"):
@@ -521,6 +526,11 @@ class RecorderGUI(QtWidgets.QWidget):
         ds_dir = dataset_dir(root, repo)
         info = dataset_info(ds_dir)
         where = f' <span style="color:{theme.MUTED};">→ {ds_dir}</span>'
+        if not self._will_record():
+            # A watch-only run (deploy/replay with recording off) writes nothing, so START never
+            # creates/resumes/overwrites a dataset -- saying otherwise here is a false alarm.
+            self.setup_status.setText(cam_txt + '<br><span style="color:%s;">●</span> not recording (watch-only)' % theme.MUTED)
+            return
         if not info["exists"]:
             ds_txt = f'<span style="color:{theme.OK};">●</span> dataset: new (will be created){where}'
         else:
