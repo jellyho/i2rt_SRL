@@ -99,6 +99,11 @@ class Recorder:
         self._episode: List[dict] = []
         self._n_frames = 0
         self._streaming_episode = False
+        # Eval rollout logging records a frame only when the APPLIED action changes -- i.e. on the
+        # ticks the policy actually drove the robot, not the held ticks while it computes the next
+        # chunk (those repeat the last command). Keeps the "waiting for inference" pauses out of the
+        # dataset. This is the last action written; None means the next frame always records.
+        self._last_recorded_action: Optional[np.ndarray] = None
         self._preview: List[np.ndarray] = []  # downsampled review frames
         self._btn_prev: Dict[str, list] = {}
         self._btn_outcome: Optional[str] = None  # outcome chosen via a leader button this episode
@@ -390,6 +395,7 @@ class Recorder:
         self._episode, self._preview, self._pending = [], [], False
         self._n_frames = 0
         self._streaming_episode = False
+        self._last_recorded_action = None  # first frame of a new episode always records
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -660,15 +666,22 @@ class Recorder:
         recording_paused = bool(snap.get("leader_recentering"))
 
         if self._eval:  # continuous rollout while armed; no engage gate
+            if not self.gate.armed:
+                self._last_recorded_action = None  # a fresh arm records its first frame
             if (
                 self.gate.armed
                 and not recording_paused
                 and self.cameras.healthy
                 and snap["state"] is not None
                 and snap["action"] is not None
+                # Record only on the ticks the policy actually drove the robot -- when the applied
+                # action changed. While it computes the next chunk the robot holds the last command
+                # (identical action), and those "waiting for inference" frames are skipped.
+                and (self._last_recorded_action is None or not np.array_equal(snap["action"], self._last_recorded_action))
             ):
                 self._ep_add(self._frame(images, snap))
                 self._buffer_preview(images)
+                self._last_recorded_action = np.asarray(snap["action"]).copy()
             self._set(
                 armed=self.gate.armed,
                 recording=self.gate.armed and not recording_paused,

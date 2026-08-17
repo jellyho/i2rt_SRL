@@ -181,6 +181,13 @@ class DeployGUI(RecorderGUI):
         self.review_box.setVisible(recording and self.cfg.review_before_save)
         self.collect_btn.setVisible(recording)
         self.save_btn.setVisible(recording)
+        # The past-demonstration panel's playback/refresh controls are only meaningful in REPLAY,
+        # where that panel picks the episode to drive: there you re-list datasets and freeze/play the
+        # ghost. In policy/dagger the panel is just a first-frame alignment overlay, so those buttons
+        # are clutter -- hide them (the overlay still shows the selected episode's first frame).
+        for btn in (getattr(self, "reference_pause_btn", None), getattr(self, "reference_refresh_btn", None)):
+            if btn is not None:
+                btn.setVisible(replaying)
         self.keep_home_btn.setVisible(per_rollout_verdict)
         self.discard_home_btn.setText("Discard + Home" if per_rollout_verdict else "Stop + Home")
         self.dagger_box.setTitle(
