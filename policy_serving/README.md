@@ -135,14 +135,55 @@ policy trains beautifully and simply behaves badly on the robot. The deploy clie
 of these columns, so an already-trained checkpoint still runs — it just runs with a leader signal
 that no longer means what it meant during collection.
 
-The inference path deliberately mirrors LeRobot's own `async_inference.policy_server`, whose two
-easy mistakes are silent: the pre/post processors need an explicit device override or the batch
-stays on the CPU while the model sits on the GPU, and the postprocessor unnormalises one
-`(B, action_dim)` step at a time — handing it a whole chunk does not raise, it just unnormalises
-against the wrong axis. `tests/test_lerobot_policy.py` builds a real ACT checkpoint and checks the
-actions against the known stats for exactly that reason.
+The inference path mirrors LeRobot's own `async_inference.policy_server` rather than being
+invented, because two of its steps fail **silently**:
+
+- the pre/post processors need an explicit **device override**, or the batch stays on the CPU
+  while the model sits on the GPU;
+- the postprocessor unnormalises one `(B, action_dim)` step at a time. Handing it a whole chunk
+  does not raise — it broadcasts against the wrong axis and returns plausible wrong numbers.
+
+`tests/test_lerobot_policy.py` therefore checks the actions against known stats, not just shapes.
 
 Nothing in LeRobot is modified or vendored; the adapter is one file on this side.
+
+## Replaying a recorded episode
+
+Replay is deployment with the actions read from a dataset instead of a model, so it runs on the
+deploy stack rather than a parallel one:
+
+```bash
+python -m yam_policy.serve \
+    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
+    --config root=~/lerobot_data/yam_cable_tie_v4 --config episode=3
+
+robot/yam deploy                 # the SAME robot server deployment uses -- not `wrapper`
+workstation/yam-data deploy      # the same UI: live cameras, e-stop, takeover
+```
+
+| `--config` | |
+|---|---|
+| `root` | the dataset directory (the one holding `meta/` and `data/`) |
+| `episode` | which `episode_index` to replay |
+| `speed` | `>1` drops frames, `<1` repeats them — the client ticks at a fixed rate, so changing the stream is what changes the speed |
+| `loop` | start again at frame 0 instead of holding at the end |
+| `chunk` | actions per reply (default 30) |
+
+What that inherits, none of which the old replay had: the follower smoother and joint-speed
+clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle button,
+the network e-stop, the link-loss watchdog, leader mirroring, and the option to record the
+replayed run as a dataset of its own.
+
+**The past-demonstration overlay follows along.** The handshake carries `replay_dataset`,
+`replay_episode` and `replay_fps`, so the deploy GUI selects that episode, plays it at the rate
+it was recorded at, and pauses it whenever the rollout is not streaming — including during a
+human takeover.
+
+**Only the action column is read**, straight from the parquet: no video decoding, no `lerobot`
+dependency, and a 100-episode dataset opens in about a tenth of a second.
+
+At the end the final pose is held rather than the stream stopping — the client is driving a
+robot and needs something to hold — and `replay_done` marks which frames those are.
 
 ## Add your own policy
 
@@ -181,11 +222,13 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
 Deploy shows what is behind the policy port — `LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`,
 `openpi · pi0_fast_droid` — next to the connection dot.
 
-This is worth a field of its own because the failure it catches is invisible otherwise. All three
-stacks speak this wire, none of them reads the others' observations, and every one of them answers
-a mismatched observation with a well-formed chunk of the right shape. Nothing raises; the robot
-just moves wrongly. Naming the server at the handshake moves that from a rollout symptom to
-something readable before starting.
+It earns a field of its own because the failure is otherwise invisible:
+
+- all three stacks speak this wire, and none reads the others' observations;
+- every one of them answers a mismatched observation with a well-formed chunk of the right shape.
+
+Nothing raises. The robot just moves wrongly. Naming the server at the handshake turns that from
+a rollout symptom into something readable before starting.
 
 A policy declares it by exposing `policy_info`, which `serve.py` merges into the metadata:
 

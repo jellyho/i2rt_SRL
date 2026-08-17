@@ -28,3 +28,14 @@ torchcodec>=0.9     # VideoEncoder API used by the workstation recording backend
 pyrealsense2        # RealSense D405 / D455 cameras
 PyQt5               # GUI
 numpy
+
+# `yam-data render-samples` (workstation.lerobot_recorder.render_deploy_samples): writes the
+# candidate-fan mp4. mujoco/mink for the FK it also needs come from the root `i2rt` package (-e
+# .), not from here -- see pyproject.toml's unconditional dependencies.
+imageio[ffmpeg]
+
+# `yam-data calibrate-agentview` (workstation.lerobot_recorder.charuco): ChArUco board detection.
+# >=4.7 specifically -- charuco.py uses the CharucoDetector/CharucoBoard.matchImagePoints API
+# introduced then; it does not fall back to the pre-4.7 detectMarkers+interpolateCornersCharuco
+# calls, which OpenCV removed. contrib, not the plain `opencv-python`, for cv2.aruco itself.
+opencv-contrib-python>=4.7

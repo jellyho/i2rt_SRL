@@ -365,6 +365,7 @@ class DeployGUI(RecorderGUI):
         else:
             super()._update_health(st)
         runner = self.runner.get_status() if self.runner is not None else {}
+        self._sync_replay_overlay(runner)
         pol = theme.dot(bool(runner.get("policy_connected")))
         stream = "streaming" if runner.get("streaming") else "idle"
         err = runner.get("last_error") or ""
@@ -379,6 +380,57 @@ class DeployGUI(RecorderGUI):
         if err:
             extra += f' <span style="color:{theme.WARN};">({err})</span>'
         self.health.setText(self.health.text() + extra)
+
+    # ------------------------------------------------------------- replay overlay
+    def _sync_replay_overlay(self, runner: dict) -> None:
+        """Point the past-demonstration overlay at the episode a replay server is driving.
+
+        Replay is deployment with the actions read from a dataset, so it arrives here as an
+        ordinary policy server — which means the overlay would otherwise sit on whatever the
+        operator last picked, at the low preview rate, while the arm reproduces something else.
+        The handshake already says which dataset and episode, so this selects it and matches
+        the recorded rate; playback then follows the rollout.
+
+        Only touched when the answer changes, so an operator who deliberately picks a different
+        reference keeps it until the replay target itself moves.
+        """
+        if runner.get("policy_framework") != "dataset-replay":
+            self._replay_overlay_key = None
+            return
+
+        dataset, episode = runner.get("replay_dataset") or "", int(runner.get("replay_episode", -1))
+        key = (dataset, episode)
+        if dataset and episode >= 0 and key != getattr(self, "_replay_overlay_key", None):
+            self._replay_overlay_key = key
+            fps = float(runner.get("replay_fps") or 0.0)
+            if fps > 0:
+                self._reference_player.set_rate(fps)
+            self._select_reference_episode(dataset, episode)
+
+        # The reference plays exactly while the arm does, so the two stay together through a
+        # human takeover as well: intervention stops the stream, and the video stops with it.
+        if self._reference_player.episode is not None:
+            self._reference_player.set_paused(not bool(runner.get("streaming")))
+
+    def _select_reference_episode(self, dataset: str, episode: int) -> None:
+        """Choose `dataset`/`episode` in the overlay panel, if it is there to choose."""
+        if self.reference_dataset_combo.currentText().strip() != dataset:
+            if self.reference_dataset_combo.findText(dataset) < 0:
+                self._refresh_reference_datasets(preferred=dataset)
+            if self.reference_dataset_combo.findText(dataset) < 0:
+                self.reference_status.setText(
+                    f"Replaying {dataset} episode {episode}, which is not under this session's root — "
+                    "no overlay for it."
+                )
+                return
+            self.reference_dataset_combo.setCurrentText(dataset)
+            self._refresh_reference_episodes()
+
+        row = next((i for i, ep in enumerate(self._reference_episodes) if ep.episode == episode), None)
+        if row is None:
+            self.reference_status.setText(f"Replaying episode {episode}; it has no completed video to overlay.")
+            return
+        self.reference_list.setCurrentRow(row)
 
     def _update_stats(self, st: dict) -> None:
         if self.deploy_only:

@@ -87,11 +87,13 @@ opened and no frames are buffered. See *C. Deployment*.
 | `action`            | (14,) float32 | both arms × `applied`(7) |
 | task                | string | the language instruction |
 
-Recorded at the rate `config.yaml` sets — **30 fps** as checked in, matched to the camera
-streams (`RecorderConfig`'s own default is 60, but the config pins both to 30 because three
-640x480 streams at 60 overrun a single USB 2.0 bus). Uses the official v3.0 API
-(`create` / `add_frame` with a `task` key / `save_episode` / `clear_episode_buffer`
-/ **`finalize`**); the version-sensitive calls live in `dataset_writer.py`.
+**Rate: 30 fps**, set by `config.yaml` and matched to the camera streams. (`RecorderConfig`
+defaults to 60; the config pins both down because three 640x480 streams at 60 overrun one
+USB 2.0 bus.)
+
+Written through the official v3.0 API — `create`, `add_frame` with a `task` key,
+`save_episode`, `clear_episode_buffer`, **`finalize`**. The version-sensitive calls are all in
+`dataset_writer.py`.
 
 ### Training on one of these: pass `--tolerance_s=1e-3`
 
@@ -102,11 +104,14 @@ lerobot-train --dataset.root=~/lerobot_data/<name> ... --tolerance_s=1e-3
 Without it, training dies partway through with `FrameTimestampError: One or several query
 timestamps unexpectedly violate the tolerance (tensor([0.0001]) > tolerance_s=0.0001)`.
 
-Nothing is wrong with the dataset, and re-recording will not help — it is arithmetic. v3.0
-timestamps are `float32` and v3.0 packs many episodes into one mp4, so the file-relative query
-time climbs into the hundreds of seconds. Past **t = 1024 s** the gap between adjacent `float32`
-values is 1.22e-4 s, which is already larger than the 1e-4 default tolerance: no frame can satisfy
-it, however well the data was collected. Any sufficiently long v3.0 dataset hits this.
+Nothing is wrong with the dataset, and re-recording will not help. It is arithmetic:
+
+- v3.0 timestamps are `float32`, and v3.0 packs many episodes into one mp4 — so the
+  file-relative query time climbs into the hundreds of seconds.
+- Past **t = 1024 s**, adjacent `float32` values are 1.22e-4 s apart, already wider than the
+  1e-4 default tolerance. No frame can satisfy it, however well the data was collected.
+
+Any sufficiently long v3.0 dataset hits this.
 
 `1e-3` is still 3% of a frame at 30 fps, so it rejects a genuinely wrong frame just as well.
 
@@ -284,34 +289,34 @@ The recorder opens on a **Setup page**:
 3. **START** connects the robot, opens cameras + dataset, and — with `auto_arm` —
    arms collection immediately.
 
-The **Past demonstration overlay** panel at the bottom can read any dataset folder
-under the session `root`, not just the dataset currently being recorded. The
-**Overlay dataset** dropdown contains the same sibling folders as the setup-page
-dataset picker; changing it immediately refreshes that folder's LeRobot
-`meta/episodes` table. Each row is one demonstration (`episode_index`), even
-when many demonstrations share one MP4 container. Selecting a demonstration displays
-all three synchronized slices (left wrist,
-agentview, right wrist) over their matching live cameras. **Live camera opacity** is
-`100%` for live-only, `0%` for the past episode only, and any middle value is a
-blend. Selection always starts paused on the first frame; **Resume reference** starts
-playback, and **Pause reference** freezes the current comparison frame. Use **Continue
-collecting** when the recording folder itself must retain past episodes—starting
-fresh removes it after the overwrite confirmations. Other overlay-source folders are
-read-only. The player reads completed MP4s
-directly, so it can safely coexist with an append session, and **Refresh demonstrations**
-finds newly encoded saves. The first saved demonstration is selected automatically; there
-is no separate Off entry because `100%` live-camera opacity fully hides the reference.
+The **Past demonstration overlay** panel plays a recorded episode's three camera views under
+the live ones, so the scene can be matched before a take.
 
-The overlay exists only in the operator display composition. Dataset frames and
-deployment policy observations both use the untouched RealSense arrays. The shared
-panel therefore behaves the same in `yam-data record` and `yam-data deploy` without
-adding video decoding to either robot-side server.
+| Control | Behaviour |
+|---|---|
+| **Overlay dataset** | any sibling folder under the session `root` — the same list as the setup-page picker. Changing it re-reads that folder's `meta/episodes`. |
+| **Live camera opacity** | `100%` live only · `0%` past episode only · anything between blends |
+| **Resume reference** / **Pause reference** | selection always starts paused on frame 1; resume plays, pause freezes the comparison frame |
+| **Refresh demonstrations** | picks up saves encoded since the panel last read the folder |
+
+- One row per demonstration (`episode_index`), even when many share an MP4 container.
+- The first saved demonstration is selected automatically. There is no Off entry —
+  `100%` live opacity already hides the reference.
+- The player reads **completed** MP4s, so it coexists safely with an append session.
+- Overlay-source folders other than the one being recorded are **read-only**. For the
+  recording folder itself, tick **Continue collecting**; starting fresh removes its episodes
+  after the overwrite confirmations.
+
+**It is display only.** Dataset frames and policy observations are the untouched RealSense
+arrays, which is why the same panel serves `yam-data record` and `yam-data deploy` without
+either robot-side server having to decode video.
 
 Then teleoperate: **lift both gellos** → records; **bring both home** → episode ends.
-With `review_before_save: true` it's held in the **review panel** for **Keep** (S/F) /
-**Delete** (D); with `review_before_save: false` it **auto-saves** each engage→idle.
-A **leader handle button** ends + labels in one press (see *Labeling* below). Close
-the window when done — this calls `finalize()` so the dataset is complete.
+
+- `review_before_save: true` — held in the **review panel** for **Keep** (S/F) / **Delete** (D).
+- `review_before_save: false` — **auto-saves** each engage→idle.
+- A **leader handle button** ends + labels in one press (see *Labeling* below).
+- Close the window when done: that calls `finalize()`, which is what completes the dataset.
 
 Quick dry run with no robot/cameras/lerobot:
 
@@ -368,11 +373,12 @@ python -m yam_policy.serve \
     --config device=cuda                                      # a LeRobot checkpoint
 ```
 
-Nothing on the workstation changes: the client reads the camera names, image size and chunk
-length out of the handshake. It also **names what answered** — `LeRobot · act`,
-`ACRFT · pi05_yam_lego_taxi` — next to the connection dot and in `--headless` logs, because
-all of these serve the same wire while reading different observations, and the wrong one
-still returns a well-formed chunk.
+Nothing on the workstation changes — the client reads the camera names, image size and chunk
+length out of the handshake.
+
+It also **names what answered** (`LeRobot · act`, `ACRFT · pi05_yam_lego_taxi`) next to the
+connection dot and in `--headless` logs. That matters because the wrong server still returns a
+well-formed chunk: they share a wire but not an observation format.
 
 The cameras line up on their own: this recorder writes `observation.images.<role>`, so a
 policy trained on its data already names its image features after `wrist_left` /
@@ -490,21 +496,172 @@ where it fails → retrain.
 
 ## D. Replay a dataset onto the robot
 
-```bash
-# 1. [robot]   wrapper server so the followers track an external command
-robot/yam canup
-robot/yam wrapper
+Replay is deployment with the actions read from a dataset, so it runs on **the deploy stack** —
+same robot server, same UI, same safeguards. There is no `wrapper` server and no separate GUI.
 
-# 2. [workstation]   open the replay GUI
-workstation/yam-data replay --robot-host <ROBOT_IP> --repo-id user/yam_pick --root ~/lerobot_data
+```bash
+# 1. [policy]  serve the episode
+python -m yam_policy.serve \
+    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
+    --config root=~/lerobot_data/yam_pick --config episode=3
+
+# 2. [robot]
+robot/yam canup && robot/yam deploy
+
+# 3. [workstation]
+workstation/yam-data deploy --robot-host <ROBOT_IP> --policy-host <POLICY_IP>
 ```
 
-In the replay GUI: **Load** → pick an **episode** → tick **Send to robot** →
-**Play**. It first ramps the robot from its current pose to the first frame (no
-jump), then streams each frame's `action` to the robot via portal. Untick "Send to
-robot" to just preview the video. **Pause** / **Stop** / **speed** as needed.
+- The **past-demonstration overlay** follows the replay automatically: same episode, at the rate
+  it was recorded, paused whenever the rollout is not streaming.
+- Everything deployment has applies — takeover, e-stop, the follower smoother (so there is no
+  separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
+- `--config speed=2` / `speed=0.5` / `loop=true`; see
+  [`policy_serving/README.md`](../../policy_serving/README.md).
 
-Dry run: `workstation/yam-data replay --mock`.
+The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
+robot (`--mock` for no robot at all).
+
+## E. Render the predicted path onto the cameras (offline)
+
+`render-samples` draws the policy's predicted path back onto the recorded frames, across **all
+three cameras at once** — agentview + both wrists, hf-utils' dataset-render look (each camera at
+native 4:3, a translucent-box header + per-panel labels, browser-friendly h264).
+
+```bash
+# deploy fan on all three cameras (needs an action_samples column):
+workstation/yam-data render-samples \
+    --repo-id my_deploy_run --episode 0 --horizon 30 --candidates 8 \
+    --out .scratch/fan.mp4
+
+# any dataset — teleop/demo/replay — using the executed trajectory (no action_samples):
+workstation/yam-data render-samples \
+    --repo-id my_demo --episode 0 --source action --horizon 20 \
+    --out .scratch/path.mp4
+```
+
+- **Two sources** (`--source`): `samples` (default) draws the multi-candidate **fan** from the
+  `action_samples` column — a run recorded with `deploy --num-samples N` against a server started
+  with the same N. `action` draws the single **executed** trajectory from the plain `action`
+  column, so it works on ANY LeRobot recording (no `--candidates` needed).
+- **Every tick is rendered** (not one frame per chunk): the episode is tiled into `--horizon`
+  chunks and every frame is drawn, so you watch the arm **consume** each chunk, then jump to the
+  next (the header shows `chunk X/N  tick Y/H`). The whole trajectory is covered, tail included.
+  `--hold N` repeats each tick for slow motion.
+- **agentview** overlays each arm's path through its **calibrated `base_T_agentview`** (from
+  `config.yaml`, see §F's board-on-gripper mode) — left green, right amber. Each **wrist** shows
+  only its own arm (the wrist rides that arm; the other arm would need the arm offset, which this
+  deliberately avoids, so no shared frame is required). `--wrists`/`--agentview-arms` subset the
+  panels; `--height` sets panel size.
+- **Intrinsics**: the wrist and agentview *extrinsics* come from `config.yaml`, but the *intrinsics*
+  default to rough placeholders — pass the cameras' real numbers (`--fx/fy/cx/cy` wrist,
+  `--agent-fx/…` agentview) for pixel-exact alignment; until then the path's *shape* is meaningful,
+  its exact pixel position is not.
+
+Offline on purpose — a *live* per-tick HUD was built once and dropped (watching the spread at 30
+fps was not worth much); this walks the recorded dataset instead. No extra checkout and no
+`matplotlib`: the drawing is vendored (PIL only), so it needs nothing the recorder env lacks.
+
+## F. Calibrate the camera rig
+
+`render-samples`' fan is drawn on the wrist view because that camera's pose is "known" from FK +
+a **CAD** wrist extrinsic (`T_GRIPPER_CAMERA`) that was never checked against the built hardware;
+agentview's pose is not known at all; and **there is no shared "robot base" frame between the two
+arms either** (each `WristCameraGeometry` loads its arm's MJCF in isolation, with no known
+transform to the other). `calibrate` fixes all of that from ONE ChArUco board left sitting on the
+desk (never moved, never attached to the robot), recovering — per arm where applicable:
+
+1. **each wrist camera's own extrinsic** (`gripper_T_camera`), by eye-in-hand hand-eye
+   calibration — so the mount is *measured*, replacing the unverified CAD constant;
+2. **each agentview extrinsic**, chained through that arm's now-measured wrist extrinsic;
+3. **the left↔right arm offset** (`left_T_right`, with straight-line distance), and a fused,
+   cross-checked shared-frame answer.
+
+```bash
+workstation/yam-data calibrate
+workstation/yam-data calibrate --arms left     # only the left wrist bridges
+workstation/yam-data calibrate --mock          # GUI shell only, no hardware
+```
+
+Set the ChArUco board on the desk in view of agentview. Board geometry comes from
+`config.yaml`'s `calibration.board` (auto-loaded, and written back after each calibration);
+override per-run with `--squares-x/-y`, `--square-length-m`, `--marker-length-m`, `--dictionary`.
+**Measure the printed squares — don't trust the page-fit scale.** Both wrist cameras bridge by
+default (YAM is bimanual — `--arms left` to use only one).
+
+**Capture is hands-free by default**, because both hands are on the leaders: run the robot in
+**teleop**, engage, move an arm so its wrist camera and agentview both see the board, and **hold
+it still for ~1 s — it auto-captures**, then move to the next pose (it re-arms once you move
+away). It only auto-captures while engaged, so the homing/ramp motion is never captured. Tune
+with `--auto-dwell <sec>`, or `--no-auto-capture` to turn it off. **Space** (or the on-screen
+button) always works as a manual fallback. A leader-handle trigger is available too but **off by
+default** — in teleop the robot consumes the handles (outcome buttons home the arm, the fine
+button recenters), so only enable `--capture-button <side>.<index>` against a robot mode that
+leaves them free. Capture at several poses, **varying wrist TILT, not just position**, which
+hand-eye needs (a set all at the same tilt can't resolve the mount's rotation).
+
+**agentview is optional per capture, so you can calibrate the wrists first and link agentview
+later.** A capture only needs a *wrist* to see the board (that feeds hand-eye); if agentview also
+sees it, that same capture additionally feeds the agentview solve — the status line says which.
+So with a board near a wrist (agentview out of view), you still bank wrist hand-eye samples;
+bring the board somewhere agentview can also see it and those captures link agentview on top. A
+pure wrist-only session solves and saves just the wrist extrinsics; agentview simply isn't
+written until it has ≥2 captures where it saw the board.
+
+### Agentview too high for the desk board? `--board-on-gripper` (eye-to-hand)
+
+The desk-board chain above links agentview only at poses where a **wrist camera and agentview see
+the same board at once**. If agentview is mounted too high/far to co-see a desk board with a
+wrist, that never happens — so calibrate agentview the other way round: **grasp the board with the
+gripper** and lift it into agentview's view.
+
+```bash
+workstation/yam-data calibrate --board-on-gripper --arms left    # then again --arms right
+```
+
+This is the **eye-to-hand** dual of the wrist's eye-in-hand solve: the camera is fixed and the
+target rides the hand, so agentview + FK alone recover `base_T_agentview` — **no wrist camera, no
+arm offset, no shared frame**. Grasp the board **rigidly and do not re-grip mid-run** (the solve
+assumes the board's pose in the gripper is constant; a slip corrupts it — the reported
+grip-consistency RMS is the check). Move to **3+ varied-tilt** poses that agentview sees, hold
+still (same auto-capture as above). With both arms available a selector picks which gripper holds
+the board; run one arm, then the other.
+
+Because each arm solves agentview in its own frame, they only agree once bridged through
+`robot.arm_offset` (from a prior desk-board wrist calibration) — if that offset is present, a
+two-arm run reports the **cross-check** (`left vs right`) and writes the fused `unified`. Save
+touches only `cameras.agentview.extrinsic.<arm>` (marked `method: eye_to_hand`) + `unified`; it
+never fabricates a wrist extrinsic or an arm offset. This is what `render-samples`' agentview
+overlay (§E) reads back.
+
+**The solve re-runs after every capture automatically**, no separate step, with a live
+convergence trend (RMS over the last few re-solves) per line so you can watch it settle. Hand-eye
+(step 1) needs **3+ varied captures** per arm; until an arm reaches that, steps 2–3 fall back to
+the CAD wrist extrinsic and say so on screen. Everything is *per arm*, never pooled across arms
+(that would silently average two unrelated frames). The arm-offset sample is banked for free
+whenever a capture catches BOTH wrists seeing the board at once — pose both arms toward it
+together for a couple of captures. When both arms and the offset have solved, the fused answer's
+**cross-check** (bridge the right extrinsic through the offset, compare to the direct left one) is
+an end-to-end confidence number on all three calibrations at once, not a separate step.
+
+**Save writes into `config.yaml` itself** — the file `--config` points at, or the auto-discovered
+one — not a separate output file: that is already THE single source of truth for the rig, so it
+is the one place any tool that calls `load_rig()` would look. A confirmation dialog names the file
+first, a `.bak` of the untouched original is kept, and only the touched blocks change:
+`cameras.wrist_<arm>.extrinsic` (the hand-eye mount, overriding the CAD default a
+`WristCameraGeometry` consumer would otherwise use), `cameras.agentview.extrinsic.<arm>` +
+`.unified` (the fused answer — use this one unless you specifically need a single arm's frame),
+`robot.arm_offset`, and `calibration.board` (which board produced all of the above). It is a
+line-range splice — the same technique `workstation/yam-data tune`'s "write config.yaml" button
+uses — **not** a `yaml.safe_load`/dump round trip, which would strip every comment and reflow the
+whole heavily-commented file. Re-running later replaces just the entries it re-solved, leaving
+the other arm's (and everything else) intact. `unified` is recomputable from its parts but stored
+anyway: every save writes all blocks from the same live solve in one call, so nothing this tool
+writes can disagree with anything else it writes.
+
+Camera intrinsics come from the RealSense devices themselves (factory calibration), not a
+separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
+`CharucoDetector`/`matchImagePoints` API) — see requirements.txt.
 
 ---
 

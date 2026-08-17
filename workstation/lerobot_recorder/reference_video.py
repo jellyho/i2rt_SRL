@@ -176,6 +176,16 @@ class ReferenceVideoPlayer:
         self._error = ""
         self._finished = False
 
+    def set_rate(self, fps: float) -> None:
+        """Play at ``fps`` from the next frame on.
+
+        The default is a low preview rate, which is right when the overlay is a still scene to
+        line up against. Replaying an episode onto the robot is the other case: there the
+        reference has to run at the rate the episode was recorded at, or it drifts against the
+        arm it is supposed to be showing.
+        """
+        self.preview_fps = max(float(fps), 1.0)
+
     @property
     def episode(self) -> Optional[ReferenceEpisode]:
         return self._episode
@@ -303,7 +313,6 @@ class ReferenceVideoPlayer:
 
     def _read_loop(self, process: subprocess.Popen, width: int, height: int, read_first_while_paused: bool) -> None:
         frame_bytes = width * len(self.camera_keys) * height * 3
-        period = 1.0 / self.preview_fps
         next_frame = time.monotonic()
         try:
             while not self._stop.is_set():
@@ -329,7 +338,9 @@ class ReferenceVideoPlayer:
                 with self._lock:
                     self._frames = frames
                 read_first_while_paused = False
-                next_frame += period
+                # Read per frame, not once: replay drives this to the dataset's own rate so
+                # the reference and the arm stay on the same clock (see set_rate).
+                next_frame += 1.0 / self.preview_fps
                 self._stop.wait(max(0.0, next_frame - time.monotonic()))
         except Exception as exc:
             with self._lock:
