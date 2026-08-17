@@ -149,8 +149,13 @@ Nothing in LeRobot is modified or vendored; the adapter is one file on this side
 
 ## Replaying a recorded episode
 
-Replay is deployment with the actions read from a dataset instead of a model, so it runs on the
-deploy stack rather than a parallel one:
+Replay is deployment with the actions read from a dataset instead of a model. The normal way to
+run it is the deploy GUI's **`dataset` mode**, which builds `DatasetPolicy` **in-process** — no
+server to start: set `mode = dataset` in `workstation/yam-data deploy` and pick the episode on the
+run page (see `workstation/lerobot_recorder/README.md` §D).
+
+`DatasetPolicy` is also an ordinary servable policy, if you want to drive a plain deploy client
+from another machine:
 
 ```bash
 python -m yam_policy.serve \
@@ -158,7 +163,7 @@ python -m yam_policy.serve \
     --config root=~/lerobot_data/yam_cable_tie_v4 --config episode=3
 
 robot/yam deploy                 # the SAME robot server deployment uses -- not `wrapper`
-workstation/yam-data deploy      # the same UI: live cameras, e-stop, takeover
+workstation/yam-data deploy      # connect as a live policy
 ```
 
 | `--config` | |
@@ -169,15 +174,13 @@ workstation/yam-data deploy      # the same UI: live cameras, e-stop, takeover
 | `loop` | start again at frame 0 instead of holding at the end |
 | `chunk` | actions per reply (default 30) |
 
-What that inherits, none of which the old replay had: the follower smoother and joint-speed
-clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle button,
-the network e-stop, the link-loss watchdog, leader mirroring, and the option to record the
-replayed run as a dataset of its own.
+What replay inherits, none of which the old standalone replay had: the follower smoother and
+joint-speed clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle
+button, the network e-stop, the link-loss watchdog, and pause/resume as a send-gate.
 
-**The past-demonstration overlay follows along.** The handshake carries `replay_dataset`,
-`replay_episode` and `replay_fps`, so the deploy GUI selects that episode, plays it at the rate
-it was recorded at, and pauses it whenever the rollout is not streaming — including during a
-human takeover.
+The deploy GUI shows the replayed episode's **first frame** as a scene reference (the overlay
+decoder streams forward and can't seek, so it is not run as a moving ghost that would drift against
+the arm's real speed — the arm itself is the moving reference).
 
 **Only the action column is read**, straight from the parquet: no video decoding, no `lerobot`
 dependency, and a 100-episode dataset opens in about a tenth of a second.

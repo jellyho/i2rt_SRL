@@ -422,22 +422,30 @@ workstation/yam-data deploy \
 Everything else is on the setup page, so plain `yam-data deploy` is enough. A run has two
 **independent** axes — recording a deployment is not the same thing as doing DAgger:
 
-**mode** — what you are here to do. This is what decides *leader mirroring*:
+**mode** — the action source, which also decides *leader mirroring*:
 
-* `deploy` — watch the policy work. The leader hangs **free**, so the handles do not fly
-  around while the arm moves.
+* `policy` (default) — watch a live policy work. The leader hangs **free**, so the handles do
+  not fly around while the arm moves.
 * `dagger` — correct the policy. The leader **mirrors** the follower, so grabbing a handle
   to take over starts from the arm's current pose.
+* `dataset` — replay a recorded episode instead of a live policy (§D). Watch-only.
 
 **record** — whether this run lands in a dataset. Off hides the dataset fields entirely;
 no dataset is created, opened, or resumed and no frames are buffered.
 
 | mode | record | source | what it is |
 |---|---|---|---|
-| deploy | off | `deploy` | just run a checkpoint and watch |
-| deploy | on | `eval` | log the run — Start/Stop collection bounds one episode |
+| policy | off | `deploy` | just run a checkpoint and watch |
+| policy | on | `eval` | log the run — Start/Stop collection bounds one episode |
 | dagger | on | `dagger` | one episode per rollout, ended with keep/discard |
 | dagger | off | `deploy` | practise takeovers, save nothing |
+| dataset | — | (n/a) | replay a recorded episode on the robot (watch-only, §D) |
+
+> **`eval` recording is action-gated.** A frame is written only when the applied action changes —
+> i.e. on the ticks the policy actually drove the arm, not the held ticks while it computes the next
+> chunk. Those "waiting for inference" pauses stay out of the dataset, and since frames are stamped
+> by index/fps the remainder is contiguous (no gaps). Teleop recording is unaffected — it has no
+> inference wait, so every tick is fresh motion.
 
 Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
 (it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /
@@ -510,16 +518,23 @@ workstation/yam-data deploy                  # [workstation] set mode = dataset,
 
 - **No policy server, no websocket, no subprocess.** The runner builds an in-process
   `DatasetPolicy` (reads the episode's actions straight from the parquet) and wraps it exactly like
-  any policy, so every safeguard still applies — takeover, e-stop, the follower smoother (so there
-  is no separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
+  any policy, so every safeguard still applies — takeover, e-stop, the follower smoother, the
+  link-loss watchdog. Replay is not a path around them.
 - The **episode is chosen on the run page**, in the same past-demonstration panel that draws the
-  overlay — one place to pick, and switching episodes just re-points the in-process replay. If
-  there is no dataset under the session root, there is nothing to replay and Start says so.
-- `dataset` mode is **watch-only and not recorded** (leader free, no dataset written).
+  overlay — one place to pick, and switching episodes just re-points the in-process replay (from
+  frame 0). If there is no dataset under the session root, there is nothing to replay and Start
+  says so.
+- The rollout button is **Start Replay → Pause / Resume**. Pause/resume is a pure send-gate on the
+  workstation: paused, the runner stops sending actions and the robot just holds its last command
+  (the controller's command-timeout hold); resume continues from the same frame. `policy_running`
+  is never toggled, so the robot side runs none of its start/stop logic (nothing closes the
+  gripper on resume — the recorded actions drive it).
+- The past-demonstration overlay shows the episode's **first frame only** (scene reference), not a
+  running ghost: the streaming decoder can't seek, so a free-running ghost would drift against the
+  arm's real (variable) replay speed. The arm itself is the moving reference.
+- `dataset` mode is **watch-only and not recorded** (leader free, no dataset written). There is no
+  separate replay tool — it lives entirely inside `deploy`.
 - Speed/loop live on `DatasetPolicy` (`policy_serving/yam_policy/policies/dataset_policy.py`).
-
-The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
-robot (`--mock` for no robot at all).
 
 ## E. Render the predicted path onto the cameras (offline)
 
