@@ -17,6 +17,17 @@ robot:
   gripper: linear_4310
   leader_gripper: yam_teaching_handle   # leader handle (rarely changed)
 
+  arm_offset:  # left_T_right -- see workstation/yam-data calibrate
+    matrix:
+      - [0.999798, 0.001689, -0.020042, 0.031513]
+      - [0.000827, 0.992174, 0.124857, -0.531773]
+      - [0.020096, -0.124849, 0.991972, 0.047124]
+      - [0.000000, 0.000000, 0.000000, 1.000000]
+    distance_m: 0.5348
+    n_captures: 101
+    translation_rms_mm: 31.338
+    rotation_rms_deg: 4.3169
+    calibrated_at: "2026-08-16 23:22:47"
 policy:
   host: 127.0.0.1            # websocket policy server (for the bridge)
   port: 8000
@@ -82,6 +93,29 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       gain: 64
       enable_auto_white_balance: 0
       white_balance: 4300
+    extrinsic:  # base_T_agentview per arm's own FK frame (no shared robot-base frame -- see workstation/yam-data calibrate)
+      right:
+        matrix:
+          - [0.124750, -0.846504, 0.517559, -0.055319]
+          - [-0.992124, -0.100494, 0.074773, 0.228083]
+          - [-0.011284, -0.522811, -0.852374, 0.821709]
+          - [0.000000, 0.000000, 0.000000, 1.000000]
+        method: "eye_to_hand"
+        n_captures: 41
+        translation_rms_mm: 21.207
+        rotation_rms_deg: 3.0368
+        calibrated_at: "2026-08-17 00:00:58"
+      left:
+        matrix:
+          - [0.104733, -0.792011, 0.601457, -0.097547]
+          - [-0.994393, -0.092300, 0.051614, -0.234307]
+          - [0.014636, -0.603490, -0.797236, 0.803219]
+          - [0.000000, 0.000000, 0.000000, 1.000000]
+        method: "eye_to_hand"
+        n_captures: 51
+        translation_rms_mm: 15.565
+        rotation_rms_deg: 2.1784
+        calibrated_at: "2026-08-17 00:12:51"
   # Both wrists are D405s, so they share ONE identical block (same units, same ranges).
   # Keep these two in sync — if you change one, change the other.
   wrist_left:  # D405
@@ -93,6 +127,17 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       gain: 16
       enable_auto_white_balance: 0
       white_balance: 4600
+    extrinsic:  # gripper_T_camera, hand-eye solved -- overrides the CAD default in yam_policy.viz.geometry (see workstation/yam-data calibrate)
+      matrix:
+        - [-0.020650, 0.916516, 0.399464, -0.069116]
+        - [0.998663, 0.037851, -0.035219, -0.002783]
+        - [-0.047398, 0.398202, -0.916072, -0.071914]
+        - [0.000000, 0.000000, 0.000000, 1.000000]
+      shared_across_arms: true
+      n_captures: 202
+      translation_rms_mm: 6.674
+      rotation_rms_deg: 3.0331
+      calibrated_at: "2026-08-16 23:22:47"
   wrist_right:  # D405
     serial: "409122274199"
     fps: 30
@@ -102,7 +147,18 @@ cameras:                     # RealSense serials by role (run `yam-data cams` to
       gain: 16
       enable_auto_white_balance: 0
       white_balance: 4600
-      
+
+    extrinsic:  # gripper_T_camera, hand-eye solved -- overrides the CAD default in yam_policy.viz.geometry (see workstation/yam-data calibrate)
+      matrix:
+        - [-0.020650, 0.916516, 0.399464, -0.069116]
+        - [0.998663, 0.037851, -0.035219, -0.002783]
+        - [-0.047398, 0.398202, -0.916072, -0.071914]
+        - [0.000000, 0.000000, 0.000000, 1.000000]
+      shared_across_arms: true
+      n_captures: 202
+      translation_rms_mm: 6.674
+      rotation_rms_deg: 3.0331
+      calibrated_at: "2026-08-16 23:22:47"
 recorder:
   repo_id: jellyho/close_bottle_cap
   root: ~/lerobot_data
@@ -162,12 +218,13 @@ calibration:                 # `workstation/yam-data calibrate` (wrist extrinsic
   # MUST match the PRINTED board -- measure the squares with a ruler; don't trust the printer's
   # fit-to-page scale. `--squares-x/-y --square-length-m --marker-length-m --dictionary` override
   # per run. lengths are edge-to-edge in METRES.
-  board:
-    squares_x: 8
-    squares_y: 6
-    square_length_m: 0.030
-    marker_length_m: 0.022
-    dictionary: DICT_4X4_50   # any cv2.aruco predefined dict, e.g. DICT_4X4_50 / DICT_5X5_100
+  board:  # ChArUco board geometry -- MUST match the printed board
+    squares_x: 14
+    squares_y: 9
+    square_length_m: 0.02
+    marker_length_m: 0.015
+    dictionary: "DICT_5X5_50"
+    calibrated_at: "2026-08-17 00:12:51"
   # calibrate writes its results elsewhere, next to what they belong to (not here):
   #   cameras.wrist_left/right.extrinsic   gripper_T_camera (hand-eye; overrides the CAD default)
   #   cameras.agentview.extrinsic.left/right/.unified   agentview pose (use `unified`)
