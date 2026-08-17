@@ -6,16 +6,18 @@ the live cameras / e-stop / health strip come from the expert recorder GUI.
 A run is described by **two independent choices** on the setup page, because recording a
 deployment is not the same thing as doing DAgger:
 
-* **mode** — what you are here to do, which is what decides *leader mirroring*:
+* **mode** — the action source, which also decides *leader mirroring*:
 
-  - ``Deploy`` — watch the policy work. The leader hangs free, so the handles do not fly
-    around while the arm moves.
-  - ``DAgger`` — correct the policy. The leader mirrors the follower, so grabbing a handle
-    to take over starts from the arm's current pose instead of yanking it somewhere else.
+  - ``policy`` (default) — watch a live policy work. The leader hangs free, so the handles do
+    not fly around while the arm moves.
+  - ``dagger`` — correct the policy. The leader mirrors the follower, so grabbing a handle to
+    take over starts from the arm's current pose instead of yanking it somewhere else.
+  - ``dataset`` — replay a recorded dataset (actions from a chosen episode instead of a live
+    policy). Pick the episode on the run page's past-demonstration panel; watch-only.
 
-* **record** — whether this run lands in a dataset. Independent of mode: you may want the
-  data from a plain deployment (an eval run) and you may want to practise takeovers
-  without saving anything.
+* **record** — whether this run lands in a dataset. Independent of mode (except ``dataset``,
+  which is watch-only): you may want the data from a plain deployment (an eval run) and you
+  may want to practise takeovers without saving anything.
 
 The two combine into the recorder's ``record_source``; all four cells are ordinary,
 already-supported behaviour:
@@ -40,12 +42,10 @@ from __future__ import annotations
 
 import logging
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
 from workstation.lerobot_recorder.config import RecorderConfig
-from workstation.lerobot_recorder.dataset_reader import DatasetReader
-from workstation.lerobot_recorder.dataset_writer import list_datasets
 from workstation.lerobot_recorder.gui import PickerComboBox, RecorderGUI
 from workstation.policy_bridge.config import BridgeConfig
 from workstation.policy_bridge.deploy_runner import DeploymentPolicyRunner
@@ -56,32 +56,36 @@ logger = logging.getLogger(__name__)
 class DeployGUI(RecorderGUI):
     SETTINGS_SCOPE = "deploy"
 
-    #: (mode, record) -> recorder record_source. Deployment never uses "teleop": no engage
-    #: gate is involved when a policy is driving the followers.
+    #: Action source (mode) x record -> the recorder's record_source. The VALUES ("deploy"/"eval"/
+    #: "dagger") are recorder concepts and stay; only the mode KEYS name the action source:
+    #: "policy" (watch a live policy), "dagger" (correct it), "dataset" (replay a recording).
     SOURCES = {
-        ("deploy", False): "deploy",
-        ("deploy", True): "eval",
+        ("policy", False): "deploy",
+        ("policy", True): "eval",
         ("dagger", False): "deploy",
         ("dagger", True): "dagger",
+        # dataset replay is watch-only and never records, so its record source is moot ("deploy").
+        ("dataset", False): "deploy",
+        ("dataset", True): "deploy",
     }
     #: Mirroring is a property of the MODE, not of recording — it exists so a takeover
     #: starts from the arm's pose, which is the point of DAgger and pointless when you are
     #: only watching. Picking a mode re-applies this; the collect-page checkbox overrides
-    #: it until the mode changes again.
-    MIRROR_BY_MODE = {"deploy": False, "dagger": True}
+    #: it until the mode changes again. policy/dataset are watch-only: leader free.
+    MIRROR_BY_MODE = {"policy": False, "dagger": True, "dataset": False}
 
     def __init__(
         self,
         cfg: RecorderConfig,
         bridge_cfg: BridgeConfig,
         *,
-        mode: str = "dagger",
+        mode: str = "policy",
         record: bool = True,
         leader_mirror: bool | None = None,
     ) -> None:
         self.bridge_cfg = bridge_cfg
         self.runner: DeploymentPolicyRunner | None = None
-        mode = mode if mode in self.MIRROR_BY_MODE else "dagger"
+        mode = mode if mode in self.MIRROR_BY_MODE else "policy"
         cfg.record_source = self.SOURCES[(mode, bool(record))]
         super().__init__(cfg)
         self.setWindowTitle("YAM · Policy Deployment")
@@ -94,11 +98,15 @@ class DeployGUI(RecorderGUI):
         self._set_form_row_visible(self.source_combo, False)
 
         self.mode_combo = PickerComboBox()
-        self.mode_combo.addItems(["deploy", "dagger"])
+        # "policy" is the default; "dataset" sources the actions from a recorded dataset instead of
+        # a live policy -- the episode is picked on the run page's reference panel.
+        self.mode_combo.addItems(["policy", "dagger", "dataset"])
         self.mode_combo.setToolTip(
-            "deploy: watch the policy work — the leader hangs free.\n"
+            "policy: watch a live policy work — the leader hangs free.\n"
             "dagger: correct the policy — the leader mirrors the follower so a takeover "
-            "starts from the arm's current pose."
+            "starts from the arm's current pose.\n"
+            "dataset: drive the robot from a recorded dataset (pick the episode on the run page); "
+            "watch-only, nothing recorded."
         )
         self.mode_combo.setCurrentText(mode)
         self.mode_combo.currentTextChanged.connect(lambda *_: self._sync_run_mode())
@@ -116,7 +124,6 @@ class DeployGUI(RecorderGUI):
         if form is not None:
             form.addRow("mode", self.mode_combo)
             form.addRow("", self.record_check)
-            self._build_replay_controls(form)
 
         self._sync_run_mode()  # also applies the mode's mirroring default
         if leader_mirror is not None:  # explicit CLI flag wins over the mode default
@@ -129,100 +136,9 @@ class DeployGUI(RecorderGUI):
                 return box.layout()
         return None
 
-    # ------------------------------------------------------------- replay a dataset
-    def _build_replay_controls(self, form: QtWidgets.QFormLayout) -> None:
-        """A 'replay a recorded dataset' source on the setup page.
-
-        Replay differs from deployment in exactly one thing -- where the actions come from -- so it
-        is not a separate window: tick this, pick a dataset + episode, and Start drives the robot
-        from that episode through the whole deploy stack (live cameras, e-stop, human takeover, the
-        past-demonstration overlay). No policy server: the runner builds an in-process DatasetPolicy
-        (see BridgeConfig.replay_dataset / DeploymentPolicyRunner._build_replay_policy)."""
-        self.replay_check = QtWidgets.QCheckBox("Replay a recorded dataset (instead of a live policy)")
-        self.replay_check.setToolTip(
-            "On: the robot follows a recorded episode's actions -- the same deploy UI/safeguards, "
-            "actions sourced from the dataset instead of a policy server. Nothing is recorded."
-        )
-        self.replay_check.toggled.connect(self._on_replay_toggled)
-
-        # Searchable dataset picker (folders under root) + a substring completer, like the recorder's.
-        self.replay_dataset_combo = PickerComboBox(editable=True)
-        self.replay_dataset_combo.setToolTip("Dataset folder under root -- type to search, or pick from the list")
-        completer = self.replay_dataset_combo.completer()
-        if completer is not None:
-            completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
-            completer.setFilterMode(QtCore.Qt.MatchContains)
-            completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
-        self.replay_dataset_combo.currentTextChanged.connect(lambda *_: self._on_replay_dataset_changed())
-
-        self.replay_episode_spin = QtWidgets.QSpinBox()
-        self.replay_episode_spin.setMinimum(0)
-        self.replay_episode_spin.setMaximum(0)
-        self.replay_episode_label = QtWidgets.QLabel("")
-        self.replay_episode_label.setStyleSheet(f"color:{theme.MUTED};")
-        ep_row = QtWidgets.QHBoxLayout()
-        ep_row.addWidget(self.replay_episode_spin)
-        ep_row.addWidget(self.replay_episode_label, 1)
-        self.replay_episode_row = QtWidgets.QWidget()
-        self.replay_episode_row.setLayout(ep_row)
-        self.replay_loop_check = QtWidgets.QCheckBox("loop")
-
-        form.addRow("", self.replay_check)
-        form.addRow("replay dataset", self.replay_dataset_combo)
-        form.addRow("replay episode", self.replay_episode_row)
-        form.addRow("", self.replay_loop_check)
-        self._refresh_replay_datasets()
-        self._on_replay_toggled(False)  # start hidden until ticked
-
-    def _refresh_replay_datasets(self) -> None:
-        want = self.replay_dataset_combo.currentText().strip()
-        self.replay_dataset_combo.blockSignals(True)
-        self.replay_dataset_combo.clear()
-        self.replay_dataset_combo.addItems(list_datasets(self.cfg.root))
-        if want:
-            self.replay_dataset_combo.setCurrentText(want)
-        self.replay_dataset_combo.blockSignals(False)
-        self._on_replay_dataset_changed()
-
-    def _on_replay_dataset_changed(self) -> None:
-        """Set the episode range from the chosen dataset's metadata (cheap: metadata only)."""
-        name = self.replay_dataset_combo.currentText().strip()
-        n = 0
-        if name:
-            try:
-                reader = DatasetReader(name, self.cfg.root)
-                reader.load()  # metadata only -- no frames
-                n = int(reader.num_episodes)
-            except Exception as e:
-                logger.warning("could not read %s metadata: %s", name, e)
-        self.replay_episode_spin.setMaximum(max(0, n - 1))
-        self.replay_episode_label.setText(f"of {n} episodes" if n else "(dataset not found)")
-
-    def _on_replay_toggled(self, on: bool) -> None:
-        """Show the replay pickers and, while replaying, force watch-only + no recording."""
-        for w in (self.replay_dataset_combo, self.replay_episode_row, self.replay_loop_check):
-            self._set_form_row_visible(w, on)
-        if on:
-            self._refresh_replay_datasets()
-            # Replay is watching, not collecting: leader free (deploy mode), nothing recorded.
-            self.mode_combo.setCurrentText("deploy")
-            self.record_check.setChecked(False)
-        self.mode_combo.setEnabled(not on)
-        self.record_check.setEnabled(not on)
-        self._apply_replay_to_cfg()
-
-    def _apply_replay_to_cfg(self) -> None:
-        """Push the replay selection into bridge_cfg (empty ``replay_dataset`` = live policy)."""
-        if getattr(self, "replay_check", None) is not None and self.replay_check.isChecked():
-            self.bridge_cfg.replay_dataset = self.replay_dataset_combo.currentText().strip()
-            self.bridge_cfg.replay_episode = int(self.replay_episode_spin.value())
-            self.bridge_cfg.replay_loop = self.replay_loop_check.isChecked()
-        else:
-            self.bridge_cfg.replay_dataset = ""
-
     @property
     def run_mode(self) -> str:
-        """ "deploy" (watch) or "dagger" (correct) — the axis that decides mirroring."""
+        """ "policy" (watch), "dagger" (correct), or "dataset" (replay a recording)."""
         return self.mode_combo.currentText()
 
     def _sync_run_mode(self) -> None:
@@ -233,6 +149,15 @@ class DeployGUI(RecorderGUI):
         dagger (in eval the episode is accepted from the review panel after Stop
         collection, not from a handle button)."""
         mode = self.run_mode
+        # Replay is watch-only: no recording is possible, so the record checkbox is forced off and
+        # disabled. `replay_mode` tells the runner to source actions from a dataset (the specific
+        # episode is chosen on the run page's reference panel -> set_replay_source).
+        replaying = mode == "dataset"
+        self.bridge_cfg.replay_mode = replaying
+        self.record_check.setEnabled(not replaying)
+        if replaying and self.record_check.isChecked():
+            self.record_check.setChecked(False)  # re-enters here with recording False
+            return
         recording = self.record_check.isChecked()
         source = self.SOURCES[(mode, recording)]
         self.cfg.record_source = source
@@ -365,7 +290,6 @@ class DeployGUI(RecorderGUI):
     def _on_start(self) -> None:
         self.source_combo.setCurrentText("deploy" if self.deploy_only else "dagger")
         self.bridge_cfg.prompt = self.task_combo.currentText().strip()
-        self._apply_replay_to_cfg()  # in-process dataset replay vs live policy (empty = live)
         super()._on_start()
         if self.recorder is not None:
             # Push the mirror choice once the link exists; the bridge latches it and
@@ -389,6 +313,15 @@ class DeployGUI(RecorderGUI):
         session quietly fills up with episodes in which nothing ever acted."""
         return bool(self.runner is not None and self.runner.get_status().get("policy_connected"))
 
+    def _on_reference_selected(self, row: int) -> None:
+        """Selecting an episode in the past-demonstration panel also points the REPLAY source at it
+        (when in replay mode) -- the overlay dataset+episode IS the action source, so there is one
+        place to pick, not two. In deploy/dagger this just drives the overlay, as before."""
+        super()._on_reference_selected(row)
+        if self.run_mode == "dataset" and self.runner is not None and 0 <= row < len(self._reference_episodes):
+            episode = self._reference_episodes[row]
+            self.runner.set_replay_source(self.reference_dataset_combo.currentText().strip(), episode.episode)
+
     def _on_policy_toggle(self) -> None:
         if self.recorder is None:
             return
@@ -396,15 +329,23 @@ class DeployGUI(RecorderGUI):
         running = bool(st.get("policy_running"))
         if not running and not self.policy_ready:
             err = (self.runner.get_status().get("last_error") if self.runner else "") or "not connected yet"
-            QtWidgets.QMessageBox.warning(
-                self,
-                "No policy",
-                f"The policy server at {self.bridge_cfg.policy_host}:{self.bridge_cfg.policy_port} "
-                f"is not connected ({err}).\n\n"
-                "Starting now would open an episode that no policy ever drives — the arms "
-                "would sit still and the rollout would be recorded anyway.\n\n"
-                "Start the policy server first; this reconnects on its own.",
-            )
+            if self.run_mode == "dataset":
+                title, body = (
+                    "No episode to replay",
+                    "Pick an episode in the past-demonstration panel first — that dataset episode "
+                    "is what drives the robot in replay mode. If the list is empty, there is no "
+                    "dataset under the session root to replay.",
+                )
+            else:
+                title, body = (
+                    "No policy",
+                    f"The policy server at {self.bridge_cfg.policy_host}:{self.bridge_cfg.policy_port} "
+                    f"is not connected ({err}).\n\n"
+                    "Starting now would open an episode that no policy ever drives — the arms "
+                    "would sit still and the rollout would be recorded anyway.\n\n"
+                    "Start the policy server first; this reconnects on its own.",
+                )
+            QtWidgets.QMessageBox.warning(self, title, body)
             return
         self.recorder.set_policy_running(not running)
 

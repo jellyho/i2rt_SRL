@@ -313,3 +313,37 @@ def test_probe_reports_down_when_nothing_is_listening():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     assert _idle_runner(policy_port=port)._policy_port_open() is False
+
+
+# --------------------------------------------------------------------------------------- #
+# Replay source: in-process dataset replay (no server), driven by the run-page episode pick
+# --------------------------------------------------------------------------------------- #
+def test_replay_mode_without_an_episode_is_a_benign_not_connected():
+    """In replay mode the dataset+episode is chosen on the run page; until one is, connecting is a
+    plain 'not connected' (the GUI blocks Start), NOT an attempt to reach a policy server."""
+    import pytest
+
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    with pytest.raises(ConnectionError, match="select an episode"):
+        r._connect_policy()
+
+
+def test_set_replay_source_updates_cfg_and_forces_a_rebuild():
+    """Picking an episode points the in-process replay at it and drops the current policy so the
+    idle probe rebuilds DatasetPolicy for the new episode -- no server to restart."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    r._policy = object()
+    r.set_replay_source("yam_cable_tie_v4", 3)
+    assert r.cfg.replay_dataset == "yam_cable_tie_v4"
+    assert r.cfg.replay_episode == 3
+    assert r._policy is None  # dropped -> the probe rebuilds for the new episode
+
+
+def test_set_replay_source_ignores_a_no_op_reselect():
+    """Re-selecting the SAME episode (same dataset+episode, policy already built) does nothing --
+    so the overlay auto-selecting the current episode cannot thrash the policy."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    r.set_replay_source("d", 1)
+    r._policy = object()  # pretend it built
+    r.set_replay_source("d", 1)
+    assert r._policy is not None  # unchanged: no rebuild forced

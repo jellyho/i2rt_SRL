@@ -6,8 +6,9 @@ policy streaming and (optionally) DAgger recording in one workstation process.
     workstation/yam-data deploy              # everything else is chosen in the UI
     workstation/yam-data deploy --headless   # no GUI (replaces the old `yam-data bridge`)
 
-A run has two independent axes, both on the setup page: **mode** (deploy = watch the
-policy, leader free; dagger = correct it, leader mirrors) and **record** (whether the run
+A run has two independent axes, both on the setup page: **mode** (policy = watch a live
+policy, leader free; dagger = correct it, leader mirrors; dataset = replay a recording) and
+**record** (whether the run
 lands in a dataset). The flags below only set their initial values.
 """
 
@@ -50,10 +51,10 @@ def build_configs(
     p.add_argument("--resume", action="store_true", help="append to an existing dataset at --root")
     p.add_argument(
         "--mode",
-        choices=["deploy", "dagger"],
-        default="dagger",
-        help="deploy = watch the policy (leader free); dagger = correct it (leader mirrors). "
-        "Also selectable on the setup page.",
+        choices=["policy", "dagger"],
+        default="policy",
+        help="policy = watch a live policy (leader free); dagger = correct it (leader mirrors). "
+        "A third source, 'dataset' (replay a recording), is selectable on the setup page.",
     )
     p.add_argument(
         "--no-record",

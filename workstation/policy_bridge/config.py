@@ -28,11 +28,15 @@ class BridgeConfig:
     # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
     num_samples: int = 0
 
-    # Replay source: when `replay_dataset` is set, the deploy stack drives the robot from a
-    # recorded dataset instead of a live policy server -- an in-process DatasetPolicy (no server,
-    # no websocket, no subprocess) wrapped exactly like any policy, so every deployment safeguard
-    # (smoother, e-stop, takeover, overlay) still applies. `replay_dataset` is the folder name
-    # under the recorder root; `replay_episode` which episode; `replay_speed`/`replay_loop` how.
+    # Replay source: when `replay_mode` is on, the deploy stack drives the robot from a recorded
+    # dataset instead of a live policy server -- an in-process DatasetPolicy (no server, no
+    # websocket, no subprocess) wrapped exactly like any policy, so every deployment safeguard
+    # (smoother, e-stop, takeover, overlay) still applies. The specific `replay_dataset` (folder
+    # name under the recorder root) + `replay_episode` are chosen on the run page's reference panel
+    # and pushed in via DeploymentPolicyRunner.set_replay_source; until one is chosen the policy
+    # simply is not connected ("select an episode to replay"). `replay_mode` on with no dataset
+    # yet is the waiting state; `replay_mode` off is a live policy.
+    replay_mode: bool = False
     replay_dataset: str = ""
     replay_episode: int = 0
     replay_speed: float = 1.0

@@ -222,11 +222,11 @@ def test_leader_mirror_checkbox_is_on_the_collect_page(tmp_path, qapp, no_camera
 
 def test_leader_mirror_follows_the_run_mode(tmp_path, qapp, no_camera_scan):
     """Picking a mode must set mirroring by itself: on for dagger (you mean to take over),
-    off for deploy (you are only watching)."""
+    off for policy (you are only watching)."""
     gui = _deploy_gui(True, tmp_path, mode="dagger")
     try:
         assert gui.mirror_check.isChecked() is True
-        gui.mode_combo.setCurrentText("deploy")
+        gui.mode_combo.setCurrentText("policy")
         assert gui.mirror_check.isChecked() is False
         gui.mode_combo.setCurrentText("dagger")
         assert gui.mirror_check.isChecked() is True
@@ -237,7 +237,7 @@ def test_leader_mirror_follows_the_run_mode(tmp_path, qapp, no_camera_scan):
 def test_mode_and_record_are_independent_axes(tmp_path, qapp, no_camera_scan):
     """All four cells must be reachable — including "dagger but do not save" and
     "plain deploy but do save", which a single picker could not express."""
-    gui = _deploy_gui(True, tmp_path, mode="deploy")
+    gui = _deploy_gui(True, tmp_path, mode="policy")
     try:
         expected = {
             ("deploy", False): "deploy",

@@ -498,24 +498,25 @@ where it fails → retrain.
 ## D. Replay a dataset onto the robot
 
 Replay differs from deployment in exactly one thing — where the actions come from — so it is **not
-a separate tool**: it lives inside `yam-data deploy`. Tick **"Replay a recorded dataset"** on the
-setup page, pick a dataset (searchable) + episode, and Start drives the robot from that episode
-through the whole deploy stack.
+a separate tool**: it is a **mode** of `yam-data deploy`. The setup page's `mode` picker has three
+action sources: **policy** (default, a live policy), **dagger** (correct it), and **dataset**
+(replay a recording). Pick `dataset`, Start, then choose the episode on the run page's
+past-demonstration panel — that episode drives the robot.
 
 ```bash
 robot/yam canup && robot/yam deploy          # [robot] the SAME deploy server (no `wrapper`)
-workstation/yam-data deploy                  # [workstation] tick "Replay a recorded dataset"
+workstation/yam-data deploy                  # [workstation] set mode = dataset, pick an episode
 ```
 
 - **No policy server, no websocket, no subprocess.** The runner builds an in-process
   `DatasetPolicy` (reads the episode's actions straight from the parquet) and wraps it exactly like
   any policy, so every safeguard still applies — takeover, e-stop, the follower smoother (so there
   is no separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
-- While replaying, the run is **watch-only and not recorded** (leader free, no dataset written).
-- The **past-demonstration overlay** follows the replay automatically: same episode, at the rate it
-  was recorded, paused whenever the rollout is not streaming.
-- Speed/loop live on `DatasetPolicy` (`policy_serving/yam_policy/policies/dataset_policy.py`); the
-  GUI exposes loop, and `deploy --headless` can be pointed at a dataset via `BridgeConfig`.
+- The **episode is chosen on the run page**, in the same past-demonstration panel that draws the
+  overlay — one place to pick, and switching episodes just re-points the in-process replay. If
+  there is no dataset under the session root, there is nothing to replay and Start says so.
+- `dataset` mode is **watch-only and not recorded** (leader free, no dataset written).
+- Speed/loop live on `DatasetPolicy` (`policy_serving/yam_policy/policies/dataset_policy.py`).
 
 The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
 robot (`--mock` for no robot at all).

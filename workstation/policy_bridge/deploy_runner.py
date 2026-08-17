@@ -265,13 +265,32 @@ class DeploymentPolicyRunner:
         meta = build_metadata(policy, "yam_policy.policies.dataset_policy:DatasetPolicy", {})
         return ActionChunkBroker(policy), meta
 
+    def set_replay_source(self, dataset: str, episode: int) -> None:
+        """Point the in-process replay at a dataset+episode (chosen on the run page's reference
+        panel). Rebuilds the policy on the next probe, so switching episodes just re-points here --
+        no server to restart. A no-op change is ignored so re-selecting the same row does nothing."""
+        dataset, episode = str(dataset or ""), int(episode)
+        if (dataset, episode) == (self.cfg.replay_dataset, self.cfg.replay_episode) and self._policy is not None:
+            return
+        self.cfg.replay_dataset = dataset
+        self.cfg.replay_episode = episode
+        # Drop the current policy so the idle probe rebuilds DatasetPolicy for the new episode.
+        self._policy = None
+        self._policy_client = None
+        self._last_probe = 0.0  # rebuild promptly, don't wait out the probe throttle
+        self._set(policy_connected=False)
+
     def _connect_policy(self) -> None:
         if self.recorder_cfg.mock or self._policy is not None:
             self._set(policy_connected=True)
             return
 
-        if self.cfg.replay_dataset:
+        if self.cfg.replay_mode:
             # In-process dataset replay -- no server to reach, so no port check / websocket client.
+            # The dataset+episode are chosen on the run page (set_replay_source); until one is,
+            # there is nothing to build, which surfaces as an ordinary "not connected" state.
+            if not self.cfg.replay_dataset:
+                raise ConnectionError("select an episode to replay")
             policy, meta = self._build_replay_policy()
         else:
             if not self._policy_port_open():
