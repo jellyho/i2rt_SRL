@@ -318,50 +318,53 @@ class RecorderGUI(QtWidgets.QWidget):
         self.live_lbl.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
         self.live_lbl.setStyleSheet(f"background:#000;border:1px solid #30363d;border-radius:8px;color:{theme.MUTED};")
 
-        # Past demonstrations from any dataset under the selected root can be
-        # overlaid on the three corresponding live views.  This panel sits entirely
-        # in the display path: Recorder and DeploymentPolicyRunner continue to
-        # receive raw images.
-        self.reference_box = QtWidgets.QGroupBox("Past demonstration overlay · preview only")
+        # Past demonstrations from any dataset under the selected root are blended INTO the three
+        # live views above (see _tick -> overlay_camera_views): the ghost belongs on the camera it
+        # corresponds to, at full size, not in a second smaller viewer. So this is a control strip,
+        # not a view -- pick the dataset and episode, set how strongly the live image shows through,
+        # and watch the result in the big view. It sits entirely in the display path: Recorder and
+        # DeploymentPolicyRunner still receive raw images.
+        self.reference_box = QtWidgets.QWidget()
         reference_layout = QtWidgets.QHBoxLayout(self.reference_box)
-        self.reference_list = QtWidgets.QListWidget()
-        self.reference_list.setMaximumHeight(115)
-        self.reference_list.setMinimumWidth(260)
-        self.reference_list.currentRowChanged.connect(self._on_reference_selected)
-        reference_layout.addWidget(self.reference_list, 1)
+        reference_layout.setContentsMargins(0, 0, 0, 0)
 
-        reference_controls = QtWidgets.QVBoxLayout()
         self.reference_dataset_combo = PickerComboBox()
-        self.reference_dataset_combo.setMinimumWidth(220)
+        self.reference_dataset_combo.setMinimumWidth(180)
         self.reference_dataset_combo.setToolTip("Dataset folder under the session root used for the overlay")
         self.reference_dataset_combo.currentTextChanged.connect(self._on_reference_dataset_changed)
-        dataset_row = QtWidgets.QHBoxLayout()
-        dataset_row.addWidget(QtWidgets.QLabel("Overlay dataset:"))
-        dataset_row.addWidget(self.reference_dataset_combo, 1)
-        self.reference_status = QtWidgets.QLabel("Select a saved demonstration to compare all three camera views.")
-        self.reference_status.setWordWrap(True)
-        self.reference_status.setStyleSheet(f"color:{theme.MUTED};")
+        # One row rather than a list box: the episodes are a single choice, and the vertical space a
+        # list took is worth more to the camera view it was sitting under.
+        self.reference_list = PickerComboBox()
+        self.reference_list.setMinimumWidth(260)
+        self.reference_list.setToolTip("Demonstration overlaid on the live views (ghost)")
+        self.reference_list.currentIndexChanged.connect(self._on_reference_selected)
+
         self.reference_opacity_label = QtWidgets.QLabel()
         self.reference_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.reference_opacity.setRange(0, 100)
+        self.reference_opacity.setMaximumWidth(140)
         self.reference_opacity.setValue(round(100 * self.cfg.reference_live_alpha))
         self.reference_opacity.valueChanged.connect(self._on_reference_opacity)
-        opacity_row = QtWidgets.QHBoxLayout()
-        opacity_row.addWidget(self.reference_opacity_label)
-        opacity_row.addWidget(self.reference_opacity, 1)
+
+        self.reference_status = QtWidgets.QLabel("Select a demonstration to ghost onto the live views.")
+        self.reference_status.setStyleSheet(f"color:{theme.MUTED};")
+
+        # Kept for the deploy GUI, which hides both (the panel is a first-frame alignment overlay
+        # there, and in replay the ghost follows the rollout on its own).
         self.reference_pause_btn = QtWidgets.QPushButton("Resume reference")
         self.reference_pause_btn.setEnabled(False)
         self.reference_pause_btn.clicked.connect(self._on_reference_pause)
         self.reference_refresh_btn = QtWidgets.QPushButton("Refresh demonstrations")
         self.reference_refresh_btn.clicked.connect(self._refresh_reference_datasets)
-        button_row = QtWidgets.QHBoxLayout()
-        button_row.addWidget(self.reference_pause_btn)
-        button_row.addWidget(self.reference_refresh_btn)
-        reference_controls.addLayout(dataset_row)
-        reference_controls.addWidget(self.reference_status)
-        reference_controls.addLayout(opacity_row)
-        reference_controls.addLayout(button_row)
-        reference_layout.addLayout(reference_controls, 2)
+
+        reference_layout.addWidget(QtWidgets.QLabel("Overlay:"))
+        reference_layout.addWidget(self.reference_dataset_combo)
+        reference_layout.addWidget(self.reference_list, 1)
+        reference_layout.addWidget(self.reference_opacity_label)
+        reference_layout.addWidget(self.reference_opacity)
+        reference_layout.addWidget(self.reference_pause_btn)
+        reference_layout.addWidget(self.reference_refresh_btn)
+        reference_layout.addWidget(self.reference_status, 1)
         self._on_reference_opacity(self.reference_opacity.value())
 
         # review panel
@@ -529,7 +532,9 @@ class RecorderGUI(QtWidgets.QWidget):
         if not self._will_record():
             # A watch-only run (deploy/replay with recording off) writes nothing, so START never
             # creates/resumes/overwrites a dataset -- saying otherwise here is a false alarm.
-            self.setup_status.setText(cam_txt + '<br><span style="color:%s;">●</span> not recording (watch-only)' % theme.MUTED)
+            self.setup_status.setText(
+                cam_txt + '<br><span style="color:%s;">●</span> not recording (watch-only)' % theme.MUTED
+            )
             return
         if not info["exists"]:
             ds_txt = f'<span style="color:{theme.OK};">●</span> dataset: new (will be created){where}'
@@ -672,7 +677,7 @@ class RecorderGUI(QtWidgets.QWidget):
             if episode.episode == selected_number:
                 selected_row = index
                 kept_selection = True
-        self.reference_list.setCurrentRow(selected_row)
+        self.reference_list.setCurrentIndex(selected_row)
         self.reference_list.blockSignals(False)
 
         if not episodes:
@@ -717,7 +722,8 @@ class RecorderGUI(QtWidgets.QWidget):
 
     def _on_reference_opacity(self, value: int) -> None:
         self.cfg.reference_live_alpha = min(max(value / 100.0, 0.0), 1.0)
-        self.reference_opacity_label.setText(f"Live camera opacity: {value}%")
+        # Short: it shares one row with the pickers now (100% = live only, ghost hidden).
+        self.reference_opacity_label.setText(f"Live {value}%")
 
     def _on_reference_pause(self) -> None:
         paused = not self._reference_player.paused
@@ -914,9 +920,13 @@ class RecorderGUI(QtWidgets.QWidget):
         # rather than letting it turn up as a load error at training time.
         issues = int(w.get("video_issues", 0) or 0)
         video_txt = (
-            f' &nbsp;&nbsp;|&nbsp;&nbsp; <span style="color:{theme.BAD};">⚠ {issues} short '
-            f'encode{"s" if issues != 1 else ""} — check encoder</span>'
-        ) if issues else ""
+            (
+                f' &nbsp;&nbsp;|&nbsp;&nbsp; <span style="color:{theme.BAD};">⚠ {issues} short '
+                f"encode{'s' if issues != 1 else ''} — check encoder</span>"
+            )
+            if issues
+            else ""
+        )
         self.health.setText(
             f"{rob} robot &nbsp;&nbsp; {cam} cameras &nbsp;&nbsp; {disk} disk "
             f"&nbsp;&nbsp;|&nbsp;&nbsp; writer: {workers} worker · {encoder} · saved {saved} · {save_txt}"

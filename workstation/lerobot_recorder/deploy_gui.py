@@ -182,9 +182,22 @@ class DeployGUI(RecorderGUI):
             self.discount_spin,
         ):
             self._set_form_row_visible(widget, recording)
-        # `root` is the datasets folder -- needed when recording AND in dataset-replay (it is where
-        # the run page's reference panel lists episodes from), so keep it visible in both.
-        self._set_form_row_visible(self.root_edit, recording or replaying)
+        # `root` is the datasets folder, and it is needed in EVERY deploy mode -- not just when
+        # recording. It is where the run page's reference panel lists past demonstrations from, and
+        # that panel is the overlay in policy/dagger (and the action source in dataset replay). A
+        # watch-only policy run still overlays a demonstration, so hiding the field there left no
+        # way to point the overlay at the datasets folder holding them.
+        self._set_form_row_visible(self.root_edit, True)
+        self.root_edit.setToolTip(
+            "Folder holding one subfolder per dataset.\n"
+            + (
+                "New episodes are written here, and the run page's past-demonstration "
+                "overlay lists demonstrations from here."
+                if recording
+                else "The run page's past-demonstration panel lists episodes from here — "
+                + ("the one to replay." if replaying else "the one to overlay on the live view.")
+            )
+        )
         self.review_box.setVisible(recording and self.cfg.review_before_save)
         self.collect_btn.setVisible(recording)
         self.save_btn.setVisible(recording)
@@ -514,7 +527,7 @@ class DeployGUI(RecorderGUI):
         if row is None:
             self.reference_status.setText(f"Replaying episode {episode}; it has no completed video to overlay.")
             return
-        self.reference_list.setCurrentRow(row)
+        self.reference_list.setCurrentIndex(row)
 
     def _update_stats(self, st: dict) -> None:
         if self.deploy_only:

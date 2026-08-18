@@ -91,8 +91,7 @@ def _deploy_gui(deploy_only, tmp_path, mode="dagger", leader_mirror=None):
     from workstation.policy_bridge.config import BridgeConfig
 
     cfg = RecorderConfig(mock=True, repo_id="test/deploy", root=str(tmp_path))
-    return DeployGUI(cfg, BridgeConfig(), mode=mode, record=not deploy_only,
-                     leader_mirror=leader_mirror)
+    return DeployGUI(cfg, BridgeConfig(), mode=mode, record=not deploy_only, leader_mirror=leader_mirror)
 
 
 def test_deploy_only_selects_the_non_recording_source(tmp_path, qapp, no_camera_scan):
@@ -114,12 +113,24 @@ def test_deploy_only_hides_every_dataset_control(tmp_path, qapp, no_camera_scan)
     isVisible() is False for every widget and would pass no matter what."""
     gui = _deploy_gui(True, tmp_path)
     try:
-        for widget in (gui.repo_combo, gui.root_edit, gui.resume_check, gui.rl_check,
-                       gui.reward_combo, gui.discount_spin, gui.collect_btn, gui.save_btn,
-                       gui.review_box, gui.keep_home_btn):
+        for widget in (
+            gui.repo_combo,
+            gui.resume_check,
+            gui.rl_check,
+            gui.reward_combo,
+            gui.discount_spin,
+            gui.collect_btn,
+            gui.save_btn,
+            gui.review_box,
+            gui.keep_home_btn,
+        ):
             assert widget.isHidden() is True, f"{widget} should be hidden in deploy-only"
         # the task field stays: it doubles as the policy prompt
         assert gui.task_combo.isHidden() is False
+        # ...and so does the dataset ROOT: a watch-only run still ghosts a past demonstration onto
+        # the live views, and the root is the folder those demonstrations are looked up in. Hiding
+        # it left no way to point the overlay anywhere.
+        assert gui.root_edit.isHidden() is False
         # ...and the rollout controls that make deployment usable stay too
         for widget in (gui.policy_btn, gui.intervention_btn, gui.discard_home_btn, gui.estop_btn):
             assert widget.isHidden() is False
@@ -165,9 +176,9 @@ def test_reference_list_defaults_to_first_demonstration_without_off_row(tmp_path
         gui._refresh_reference_datasets()
 
         assert gui.reference_list.count() == 2
-        assert gui.reference_list.currentRow() == 0
-        assert all("Off" not in gui.reference_list.item(row).text() for row in range(2))
-        assert gui.reference_list.item(0).text().startswith("demonstration 0003")
+        assert gui.reference_list.currentIndex() == 0
+        assert all("Off" not in gui.reference_list.itemText(row) for row in range(2))
+        assert gui.reference_list.itemText(0).startswith("demonstration 0003")
         assert played == [(3, True)]
         assert gui.reference_pause_btn.text() == "Resume reference"
     finally:
@@ -268,6 +279,7 @@ def test_leader_mirror_toggle_is_forwarded_to_the_robot(tmp_path, qapp, no_camer
     sent = []
     gui = _deploy_gui(True, tmp_path)
     try:
+
         class FakeRecorder:
             def set_leader_mirror(self, flag):
                 sent.append(bool(flag))
@@ -293,9 +305,7 @@ def test_runner_status_reports_the_robots_own_mirror_state(tmp_path, qapp, no_ca
         gui.close()
 
 
-def test_reference_dataset_picker_switches_between_root_subfolders(
-    tmp_path, qapp, no_camera_scan, monkeypatch
-):
+def test_reference_dataset_picker_switches_between_root_subfolders(tmp_path, qapp, no_camera_scan, monkeypatch):
     for name in ("current", "older_runs"):
         (tmp_path / name).mkdir()
 
@@ -342,12 +352,12 @@ def test_reference_dataset_picker_switches_between_root_subfolders(
             "older_runs",
         ]
         assert gui.reference_dataset_combo.currentText() == "current"
-        assert gui.reference_list.item(0).text().startswith("demonstration 0002")
+        assert gui.reference_list.itemText(0).startswith("demonstration 0002")
 
         gui.reference_dataset_combo.setCurrentText("older_runs")
 
         assert discovered[-1] == "older_runs"
-        assert gui.reference_list.item(0).text().startswith("demonstration 0009")
+        assert gui.reference_list.itemText(0).startswith("demonstration 0009")
         assert played[-1] == (9, True)
     finally:
         gui.close()
