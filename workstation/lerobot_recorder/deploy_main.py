@@ -45,6 +45,14 @@ def build_configs(
                    help="ask the policy for N action chunks per step instead of one, draw them on "
                         "the wrist views, and log them beside the dataset. Costs one forward pass "
                         "per sample, so 0 (off) is normal deployment")
+    p.add_argument(
+        "--sync-inference",
+        action="store_true",
+        help="infer the next chunk only once the current one runs out, instead of overlapping it "
+        "with execution. The robot then physically stops for a full round-trip at each chunk "
+        "boundary; those ticks send nothing, so they are absent from the dataset rather than "
+        "recorded as a pause. Default is overlapped (async) inference, which removes the stop",
+    )
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
@@ -140,6 +148,7 @@ def build_configs(
         rate_hz=args.rate,
         image_size=args.image_size,
         prompt=task,
+        async_inference=not args.sync_inference,
     )
     return recorder_cfg, bridge_cfg, args
 
