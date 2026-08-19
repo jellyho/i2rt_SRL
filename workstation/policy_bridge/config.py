@@ -22,11 +22,11 @@ class BridgeConfig:
     #
     # The chunk size is deliberately NOT here: the broker takes it from what the policy
     # returns, so there is no number to keep in sync with the checkpoint.
-    # How many action chunks to ask the policy for per observation. 0/1 is normal deployment:
-    # one chunk, one forward pass, today's latency. Above that the server returns the extra
-    # draws under `action_samples` and the viewer can show the spread -- which costs N forward
-    # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
-    num_samples: int = 0
+    # NOTE: how many candidates the policy draws, and whether a critic picks among them, are
+    # SERVER configuration (serve_policy.py --num-samples / --critic, serve_patch_critic.py) --
+    # deliberately not settable here. This client executes the chunk it is given and records the
+    # per-step arrays the handshake declared; it needs no notion of sampling or critics, exactly
+    # as it already takes the chunk LENGTH from the reply rather than from a setting of its own.
 
     # Overlap inference with execution (AsyncChunkBroker): the next chunk is inferred on a
     # background thread while the current one is still being executed, so the control loop keeps

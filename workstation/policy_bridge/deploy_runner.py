@@ -77,10 +77,15 @@ def _describe_policy(meta: Dict) -> str:
 #: Per-step timing/provenance columns the runner adds to every eval recording, on top of whatever
 #: the policy declares. They answer "where did this action come from?": which chunk and which step
 #: within it, how long that chunk's inference took, how many control ticks passed between the
-#: observation it was computed from and this action being sent (the RTC inference delay), and the
-#: real wall-clock instant of the send. Prefixed so they never collide with a policy's own extras.
+#: observation it was computed from and this action being sent (the RTC inference delay), and when
+#: the send happened. Prefixed so they never collide with a policy's own extras.
+#:
+#: `elapsed_s` is seconds since the runner started, NOT a unix timestamp: the columns are recorded
+#: as float32, whose spacing at 1.8e9 is 128 SECONDS, so a wall-clock stamp quantized every frame
+#: of a rollout onto three distinct values and destroyed the cadence it was added to measure. Time
+#: since start stays under a few thousand, where float32 still resolves a quarter of a millisecond.
 PROVENANCE_PREFIX = "policy."
-PROVENANCE_FIELDS = ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time")
+PROVENANCE_FIELDS = ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "elapsed_s")
 
 #: How many recent chunk lengths to keep for the live plot (~2 minutes of replans at a 1 s chunk).
 CHUNK_HISTORY = 120
@@ -140,6 +145,7 @@ class DeploymentPolicyRunner:
         self._extra_warned: set = set()
         #: This step's provenance (see PROVENANCE_FIELDS / _note_timing).
         self._timing: Dict[str, float] = {name: 0.0 for name in PROVENANCE_FIELDS}
+        self._t0: Optional[float] = None  # first send; elapsed_s is measured from it
         #: Length of each chunk the server has answered with, newest last. The chunk is adaptive --
         #: the broker takes the horizon from every reply rather than from a setting -- so a policy
         #: may answer with a different number of steps each replan, and this is the only record of
@@ -461,7 +467,7 @@ class DeploymentPolicyRunner:
         with self._lock:
             self._chunk_lengths.append(horizon)
 
-    def _note_timing(self, wall_time: float) -> None:
+    def _note_timing(self, now: float) -> None:
         """Record where the action just sent came from, so the dataset can be audited.
 
         Without this a rollout says what was executed but not when it was decided: an action is
@@ -472,8 +478,10 @@ class DeploymentPolicyRunner:
         """
         stats = getattr(self._policy, "stats", None)
         got = stats() if callable(stats) else {}
-        timing = {name: float(got.get(name, 0.0)) for name in PROVENANCE_FIELDS if name != "wall_time"}
-        timing["wall_time"] = float(wall_time)
+        timing = {name: float(got.get(name, 0.0)) for name in PROVENANCE_FIELDS if name != "elapsed_s"}
+        if self._t0 is None:
+            self._t0 = now
+        timing["elapsed_s"] = float(now - self._t0)
         with self._lock:
             self._timing = timing
         if got:
@@ -667,10 +675,12 @@ class DeploymentPolicyRunner:
         # The policy is what is driving when this observation is used, so that is what is
         # reported -- the recorder labels those frames the same way.
         obs["observation.control_mode"] = np.array([CONTROL_MODE["policy"]], dtype=np.float32)
-        # Only sent when actually wanted: a server that supports it does N forward passes for
-        # N samples, and an unpatched one ignores an unknown key rather than failing.
-        if self.cfg.num_samples > 1:
-            obs["num_samples"] = int(self.cfg.num_samples)
+        # Nothing here asks the policy HOW to answer -- not how many candidates to draw, not
+        # whether to run a critic. That is the server's configuration, and the reply already
+        # carries everything this side needs: the chunk to execute, its length, and whatever
+        # per-step arrays the handshake declared. A knob that lives on both sides is a knob that
+        # can disagree, which is exactly how `num_samples` used to drop the action_samples column
+        # from every frame of a rollout.
 
         height, width = self._image_shape
         for role, key in self.cfg.image_keys.items():

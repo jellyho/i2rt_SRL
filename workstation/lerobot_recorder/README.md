@@ -568,9 +568,37 @@ workstation/yam-data render-samples \
     --out .scratch/path.mp4
 ```
 
+**A worked example**, for a rollout saved outside the default root:
+
+```bash
+# the dataset lives at ~/lerobot_rollout/yam_s300_rel_200k_n16
+workstation/yam-data render-samples \
+    --repo-id lerobot_rollout/yam_s300_rel_200k_n16 \
+    --root ~/lerobot_rollout \
+    --episode 0 --horizon 30 --candidates 16 \
+    --out ~/rollout_fan.mp4
+# -> wrote ~/rollout_fan.mp4 (3374 frames over 113 chunk(s))
+
+# 106 MB of lossless render is awkward to share; halve the duration and re-encode:
+ffmpeg -i ~/rollout_fan.mp4 -filter:v "setpts=0.5*PTS" -an \
+    -vcodec libx264 -crf 30 -preset veryfast -pix_fmt yuv420p ~/rollout_fan_2x.mp4
+```
+
+Three things that bite, all of them path or count mistakes rather than rendering ones:
+
+- **`--root` is the PARENT** of the dataset folder, not the folder. The dataset is
+  `<root>/<last segment of --repo-id>` (the rule the recorder writes with), so the pair above
+  resolves to `~/lerobot_rollout/yam_s300_rel_200k_n16`. Get it wrong and LeRobot decides the
+  dataset must be on the Hub and fails with a **404**, not a "no such directory".
+- **`--candidates` must equal the N in the dataset**, which is the N the *server* was started with.
+  Read it off the recording rather than remembering it:
+  `python -c "import json;print(json.load(open('<dataset>/meta/info.json'))['features']['action_samples']['shape'])"`.
+- **`--horizon` is the policy's `action_horizon`** (the server logs it at startup, e.g. 30). It only
+  sets how the episode is tiled for the header/fan reassembly; every tick is drawn either way.
+
 - **Two sources** (`--source`): `samples` (default) draws the multi-candidate **fan** from the
-  `action_samples` column — a run recorded with `deploy --num-samples N` against a server started
-  with the same N. `action` draws the single **executed** trajectory from the plain `action`
+  `action_samples` column — any run recorded against a server started with `--num-samples N` (or a
+  critic, which samples its own candidates); the client needs no matching setting. `action` draws the single **executed** trajectory from the plain `action`
   column, so it works on ANY LeRobot recording (no `--candidates` needed).
 - **Every tick is rendered** (not one frame per chunk): the episode is tiled into `--horizon`
   chunks and every frame is drawn, so you watch the arm **consume** each chunk, then jump to the

@@ -268,6 +268,35 @@ the label. A server that declares nothing is described from what it does adverti
 a trailing `?` — an inferred name is marked as inferred rather than asserted, because a confident
 wrong one is worse than none.
 
+## Value-guided deployment (a critic-backed server)
+
+A critic-backed server picks the chunk for you: it samples N candidates, scores them with a
+trained critic, and returns the winner along with `critic_scores` / `critic_choice` per step.
+Selection is server-side because that is the only place it can run — the RLT critic reads a token
+that never leaves the model, and the patch critic needs the base VLA's shared-backbone sampler to
+draw N candidates in one pass.
+
+```bash
+# RLT-token critic (needs proprio_stats.json — see scripts/export_critic_serving.py)
+uv run scripts/serve_policy.py --critic <critic_dir> policy:checkpoint --policy.config ... --policy.dir ...
+# standalone patch critic (config.json + params.msgpack; nothing to export)
+uv run python scripts/serve_patch_critic.py --critic <critic_dir> --config ... --checkpoint ... --mode adaptive
+```
+
+**The client is not configured for any of this.** Start the server with a critic and it selects on
+every request; start it with `--num-samples N` and every reply carries N candidates. `yam-data
+deploy` sends a plain observation either way, executes `actions`, and records whatever the
+handshake declared — the same way it already takes the chunk *length* off the reply instead of
+holding a setting for it. There is no client flag to forget, and no N to keep matched: a count
+living on both sides is a count that can disagree, which is how the declared `action_samples`
+column used to end up the wrong shape and get dropped from every frame.
+
+`serve_patch_critic.py --mode adaptive` returns only the winning candidate's highest-value
+commitment prefix, so the chunk length varies per replan — watch it on the deploy page's chunk
+plot. That needs a critic whose `macro_group_size` divides the horizon into several groups; one
+trained with `macro_group_size == horizon` has a single group and can only ever return the full
+chunk (use `--mode bon` for that one).
+
 ## Extra per-step data (`extra_features`)
 
 A policy can return more than actions — a critic's value for each candidate, the candidate
