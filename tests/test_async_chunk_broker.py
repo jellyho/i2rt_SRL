@@ -201,3 +201,43 @@ def test_stats_carry_the_provenance_the_dataset_records():
     assert st["chunk_index"] >= 1, "a second chunk must have been spliced in by step 7"
     assert 0 <= st["step_in_chunk"] < 5
     assert st["delay_ticks"] >= 0
+
+
+def test_both_brokers_expose_the_chunk_index_a_length_plot_watches():
+    """A caller recording reply lengths must not care which broker it holds."""
+    from yam_policy.action_chunk_broker import ActionChunkBroker
+
+    for broker in (AsyncChunkBroker(_RampPolicy(horizon=4)), ActionChunkBroker(_RampPolicy(horizon=4))):
+        assert broker.chunk_index == -1 and broker.action_horizon == 0
+        _drive(broker, 1)
+        assert broker.chunk_index == 0 and broker.action_horizon == 4
+        _drive(broker, 4)  # exhaust it -> a second chunk
+        assert broker.chunk_index == 1
+        broker.reset()
+        assert broker.chunk_index == -1
+
+
+def test_an_adaptive_policy_reports_each_replans_own_length():
+    """The horizon is read off every reply, so a policy that changes its plan length is followed.
+
+    (A reply shorter than the delay it took to arrive is a different case -- it predicts only steps
+    already executed, so it is discarded as stale; see stale_chunks. Lengths here stay above that.)
+    """
+
+    class _Adaptive(_RampPolicy):
+        lengths = [8, 5, 10]
+
+        def infer(self, obs):
+            self.horizon = self.lengths[min(self.calls, len(self.lengths) - 1)]
+            return super().infer(obs)
+
+    policy = _Adaptive()
+    broker = AsyncChunkBroker(policy, prefetch_ticks=1)
+    seen, last = [], -1
+    for t in range(23):
+        broker.infer({"t": t})
+        if broker.chunk_index != last:
+            last = broker.chunk_index
+            seen.append(broker.action_horizon)
+    assert broker.stale_chunks == 0
+    assert seen[:3] == [8, 5, 10]

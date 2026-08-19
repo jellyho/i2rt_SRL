@@ -418,3 +418,42 @@ def test_inference_is_synchronous_unless_asked_for():
     (continuous motion, chunk starts `delay_ticks` late) is opt-in per run."""
     assert BridgeConfig().async_inference is False
     assert BridgeConfig(async_inference=True).async_inference is True
+
+
+def test_the_length_of_every_reply_is_recorded_for_the_plot():
+    """The horizon comes from each reply, not from a setting, so it can change per replan -- and
+    the reply is the only place that number exists. One entry per NEW chunk, including a repeat of
+    the same length; nothing while the same chunk is being consumed."""
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+
+    class _Broker:
+        chunk_index = -1
+        action_horizon = 0
+
+    broker = _Broker()
+    r._policy = broker
+    r._note_chunk()
+    assert r.chunk_lengths() == []  # nothing inferred yet
+
+    for index, horizon in enumerate([30, 30, 12, 12, 7]):
+        broker.chunk_index, broker.action_horizon = index, horizon
+        r._note_chunk()
+        r._note_chunk()  # same chunk consumed over many ticks -> still one entry
+    assert r.chunk_lengths() == [30, 30, 12, 12, 7]
+
+
+def test_chunk_history_is_bounded():
+    from workstation.policy_bridge.deploy_runner import CHUNK_HISTORY
+
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+
+    class _Broker:
+        chunk_index = -1
+        action_horizon = 16
+
+    broker = _Broker()
+    r._policy = broker
+    for index in range(CHUNK_HISTORY + 25):
+        broker.chunk_index = index
+        r._note_chunk()
+    assert len(r.chunk_lengths()) == CHUNK_HISTORY

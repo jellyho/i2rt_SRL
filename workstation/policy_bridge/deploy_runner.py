@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from typing import Callable, Dict, Optional
 
 import numpy as np
@@ -81,6 +82,9 @@ def _describe_policy(meta: Dict) -> str:
 PROVENANCE_PREFIX = "policy."
 PROVENANCE_FIELDS = ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time")
 
+#: How many recent chunk lengths to keep for the live plot (~2 minutes of replans at a 1 s chunk).
+CHUNK_HISTORY = 120
+
 
 def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
     """What extra per-step arrays this policy sends, from its handshake metadata.
@@ -136,6 +140,12 @@ class DeploymentPolicyRunner:
         self._extra_warned: set = set()
         #: This step's provenance (see PROVENANCE_FIELDS / _note_timing).
         self._timing: Dict[str, float] = {name: 0.0 for name in PROVENANCE_FIELDS}
+        #: Length of each chunk the server has answered with, newest last. The chunk is adaptive --
+        #: the broker takes the horizon from every reply rather than from a setting -- so a policy
+        #: may answer with a different number of steps each replan, and this is the only record of
+        #: what it actually sent. Bounded: it feeds a live plot, not an archive.
+        self._chunk_lengths: "deque[int]" = deque(maxlen=CHUNK_HISTORY)
+        self._last_chunk_index = -1
         #: Called once the handshake is in, so the recorder can declare its columns.
         self.on_connected = None
         #: Called with the sent action vector every time an action is pushed to the robot, so the
@@ -431,6 +441,26 @@ class DeploymentPolicyRunner:
         features.update({PROVENANCE_PREFIX + name: (1,) for name in PROVENANCE_FIELDS})
         return features
 
+    def chunk_lengths(self) -> list:
+        """Length of every chunk the server has answered with recently, oldest first."""
+        with self._lock:
+            return list(self._chunk_lengths)
+
+    def _note_chunk(self) -> None:
+        """Record this reply's length, once per chunk.
+
+        The horizon is read off each reply rather than configured, so it can differ every replan;
+        `chunk_index` is what says a NEW reply arrived (the same length twice in a row is still two
+        entries). Works with either broker -- both expose the same two attributes.
+        """
+        index = getattr(self._policy, "chunk_index", None)
+        horizon = int(getattr(self._policy, "action_horizon", 0) or 0)
+        if index is None or index == self._last_chunk_index or horizon <= 0:
+            return
+        self._last_chunk_index = index
+        with self._lock:
+            self._chunk_lengths.append(horizon)
+
     def _note_timing(self, wall_time: float) -> None:
         """Record where the action just sent came from, so the dataset can be audited.
 
@@ -495,6 +525,7 @@ class DeploymentPolicyRunner:
                             result = self._policy.infer(policy_obs)
                             action = result["actions"]
                             self._set_extras(result)
+                            self._note_chunk()  # a new reply? record how many steps it carried
                             action_vec = np.asarray(action, dtype=float).reshape(-1)
                             self._robot.set_policy_action(self._split(action_vec))
                             # Stamp where this action came from BEFORE the recorder captures the

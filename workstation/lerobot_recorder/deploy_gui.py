@@ -45,6 +45,7 @@ import logging
 from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
+from workstation.lerobot_recorder.chunk_plot import ChunkLengthPlot
 from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.gui import PickerComboBox, RecorderGUI
 from workstation.policy_bridge.config import BridgeConfig
@@ -302,14 +303,20 @@ class DeployGUI(RecorderGUI):
             "border-radius:8px;padding:10px 12px;font-weight:600;"
         )
 
+        # How many steps each reply carried. The horizon is read off every reply rather than
+        # configured, so it can change per replan -- and it decides how often the policy is
+        # re-queried (and, running synchronously, how often the arm stalls).
+        self.chunk_plot = ChunkLengthPlot()
+
         grid.addWidget(self.dagger_state, 0, 0, 1, 4)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
         grid.addWidget(self.keep_home_btn, 1, 2)
         grid.addWidget(self.discard_home_btn, 1, 3)
         grid.addWidget(self.mirror_check, 2, 0, 1, 4)
-        grid.addWidget(self.button_legend, 3, 0, 1, 4)
-        grid.addWidget(self.runner_status, 4, 0, 1, 4)
+        grid.addWidget(self.chunk_plot, 3, 0, 1, 4)
+        grid.addWidget(self.button_legend, 4, 0, 1, 4)
+        grid.addWidget(self.runner_status, 5, 0, 1, 4)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):
@@ -417,6 +424,8 @@ class DeployGUI(RecorderGUI):
 
     def _refresh(self) -> None:
         super()._refresh()
+        if self.runner is not None:
+            self.chunk_plot.set_values(self.runner.chunk_lengths())
         if self.recorder is not None:
             self._update_dagger_controls(self.recorder.get_status())
 

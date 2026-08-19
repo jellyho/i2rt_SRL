@@ -154,6 +154,16 @@ class AsyncChunkBroker(BasePolicy):
         """The chunk size last observed (0 before the first inference)."""
         return self._chunk
 
+    @property
+    def chunk_index(self) -> int:
+        """How many chunks have been spliced in, minus one (-1 before the first).
+
+        Same name and meaning as on :class:`ActionChunkBroker`, so a caller watching for "a new
+        reply arrived, record its length" works against either broker.
+        """
+        with self._lock:
+            return self._chunk_index
+
     def leftover(self) -> Optional[np.ndarray]:
         """The unexecuted tail of the chunk in hand -- RTC's prefix.
 
