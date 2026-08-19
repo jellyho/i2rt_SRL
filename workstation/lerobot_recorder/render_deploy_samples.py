@@ -78,6 +78,43 @@ if TYPE_CHECKING:
     from workstation.lerobot_recorder.dataset_reader import DatasetReader
 
 
+def _recorded_chunk_starts(reader: "DatasetReader", episode: int, n_frames: int) -> Optional[List[int]]:
+    """The REAL replan boundaries, read from the recording's `policy.chunk_index` column.
+
+    A deploy run records which chunk each executed action came from, so the boundaries do not have
+    to be guessed from a horizon the caller types in. That matters for more than convenience:
+
+    * the horizon is adaptive -- a prefix-guided server returns only what is still worth executing,
+      so a fixed grid mis-cuts every chunk after the first one whose length differs;
+    * an intervention or a homing forces an early replan the grid knows nothing about, and every
+      chunk after it is drawn shifted.
+
+    None when the column is absent (any older recording, or a teleop/demo dataset), and the caller
+    falls back to tiling by --horizon.
+    """
+    if not reader.has_feature("policy.chunk_index"):
+        return None
+    starts, previous = [], None
+    for frame in range(n_frames):
+        value = reader.get_scalar(episode, frame, "policy.chunk_index")
+        if value is None:
+            return None
+        if previous is None or value != previous:
+            starts.append(frame)
+            previous = value
+    return starts or None
+
+
+def _recorded_candidates(reader: "DatasetReader") -> Optional[int]:
+    """How many candidates the recording actually carries, from the action_samples feature shape.
+
+    The count is the server's, fixed at handshake and written into the dataset schema; asking the
+    caller to repeat it on the command line is one more number to get wrong (and a wrong one is a
+    reshape error, not a picture)."""
+    shape = reader.feature_shape("action_samples")
+    return int(shape[0]) if shape and len(shape) >= 1 else None
+
+
 def _load_replan_chunk(
     reader: "DatasetReader", episode: int, start: int, horizon: int, n_candidates: int
 ) -> Optional[np.ndarray]:
@@ -371,12 +408,23 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     agent_extrinsics = _load_agentview_extrinsics(args.config, agentview_arms)
     wrists = list(dict.fromkeys(args.wrists))
 
-    # Chunk size defaults to ONE SECOND of frames (the dataset fps) when --horizon is not given --
-    # a legible default; pass --horizon to match a deploy's action_horizon exactly.
+    # Prefer the boundaries the run actually recorded; they are exact, they follow an adaptive
+    # horizon, and they survive an intervention's early replan. Tiling by --horizon is the fallback
+    # for recordings without the column (see _recorded_chunk_starts).
     horizon = args.horizon or int(reader.fps or 30)
-    # Chunks tile the episode on a fixed grid of `horizon` ticks (the last one may be shorter, so
-    # the WHOLE trajectory is covered, tail included -- not just the first n//H*H frames).
-    blocks = list(range(0, n_frames, horizon))
+    recorded = None if args.horizon else _recorded_chunk_starts(reader, args.episode, n_frames)
+    if recorded:
+        blocks = recorded
+        lengths = [b - a for a, b in zip(blocks, blocks[1:] + [n_frames], strict=False)]
+        print(
+            f"chunk boundaries from the recording: {len(blocks)} replans, "
+            f"length min/med/max = {min(lengths)}/{sorted(lengths)[len(lengths) // 2]}/{max(lengths)}",
+            file=sys.stderr,
+        )
+    else:
+        # Chunks tile the episode on a fixed grid of `horizon` ticks (the last one may be shorter,
+        # so the WHOLE trajectory is covered, tail included -- not just the first n//H*H frames).
+        blocks = list(range(0, n_frames, horizon))
     if args.replans:
         blocks = blocks[: args.replans]
     if not blocks:
@@ -384,11 +432,24 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
     # "samples" = the multi-candidate deploy fan (action_samples column); "action" = the single
     # executed trajectory from the plain action column, so it works on ANY LeRobot recording.
+    if args.source == "samples" and args.candidates is None:
+        args.candidates = _recorded_candidates(reader)
+        if args.candidates is None:
+            raise SystemExit(
+                "this dataset declares no action_samples column, so there is no fan to draw. "
+                "Record against a server started with --num-samples N (or a critic), or pass "
+                "--source action to draw the executed trajectory instead."
+            )
+        print(f"candidates from the recording: {args.candidates}", file=sys.stderr)
+
     fan_word = "fan" if args.source == "samples" else "path"
 
     frames = []
     for block_idx, start in enumerate(blocks):
-        block_len = min(horizon, n_frames - start)
+        # Each block runs to the next boundary (or the end), so a recorded chunk is drawn whole
+        # whatever its length.
+        block_end = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else n_frames
+        block_len = (block_end - start) if recorded else min(horizon, n_frames - start)
         if args.source == "samples":
             chunk = _load_replan_chunk(reader, args.episode, start, block_len, args.candidates)
             missing = "no action_samples recorded here"
@@ -500,13 +561,15 @@ def main() -> None:
         type=int,
         default=None,
         help="chunk size: how many future ticks to draw (default: the dataset fps = 1 second; "
-        "for a deploy fan pass the server's action_horizon)",
+        "for a deploy fan pass the server's action_horizon). Omit it and the REAL replan "
+        "boundaries are read from the recording's policy.chunk_index when it has one",
     )
     p.add_argument(
         "--candidates",
         type=int,
         default=None,
-        help="the --num-samples the server was started with (required for --source samples; ignored for action)",
+        help="candidates per step; read from the dataset's action_samples column by default, "
+        "so pass it only to override (ignored for --source action)",
     )
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
     p.add_argument("--hold", type=int, default=1, help="repeat each rendered tick N times (>1 = slow motion)")
@@ -529,8 +592,8 @@ def main() -> None:
     p.add_argument("--agent-cx", type=float, default=320.0)
     p.add_argument("--agent-cy", type=float, default=240.0)
     args = p.parse_args()
-    if args.source == "samples" and args.candidates is None:
-        p.error("--candidates is required with --source samples (the --num-samples the server used)")
+    # --candidates is filled in from the recording when it can be (see _recorded_candidates);
+    # only a dataset whose schema does not declare action_samples still needs it spelled out.
     render(args)
 
 

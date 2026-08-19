@@ -193,6 +193,15 @@ class DatasetReader:
             return None
         return None if val is None else np.asarray(val, dtype=np.float32).reshape(shape)
 
+    def feature_shape(self, key: str) -> Optional[tuple]:
+        """The per-frame shape the dataset declares for `key`, or None if it has no such column.
+
+        Lets a consumer recover what a recording carries -- e.g. how many candidates are in
+        `action_samples` -- instead of being told it on the command line."""
+        feature = self._features.get(key)
+        shape = feature.get("shape") if isinstance(feature, dict) else None
+        return tuple(int(d) for d in shape) if shape else None
+
     def has_feature(self, key: str) -> bool:
         if self.mock:
             return False
