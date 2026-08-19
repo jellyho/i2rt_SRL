@@ -22,29 +22,11 @@ class BridgeConfig:
     #
     # The chunk size is deliberately NOT here: the broker takes it from what the policy
     # returns, so there is no number to keep in sync with the checkpoint.
-    # How many action chunks to ask the policy for per observation. 0/1 is normal deployment:
-    # one chunk, one forward pass, today's latency. Above that the server returns the extra
-    # draws under `action_samples` and the viewer can show the spread -- which costs N forward
-    # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
-    num_samples: int = 0
-
-    # Ask the server to CHOOSE for us: with `critic_select`, a critic-backed server samples N
-    # candidate chunks, scores them with its trained critic and returns the winner (plus
-    # `critic_scores` / `critic_choice` per step, which land in the dataset). Selection has to
-    # happen server-side -- the RLT critic reads a token that never leaves the model, and the patch
-    # critic needs the base VLA's shared-backbone sampler -- so this is only a per-request opt-in
-    # key, not something the client can do itself.
-    #
-    # OFF by default and inert against a server without a critic: the key is simply unknown there.
-    # But the reverse is the trap this exists to close -- a server started with `--critic` (or
-    # serve_patch_critic.py) selects NOTHING unless a request carries this key, so the critic loads,
-    # logs, and is then bypassed on every step in silence.
-    #
-    # Leave `num_samples` at 0 when using this: the server falls back to the N it was started with,
-    # which is the N its handshake declared the `action_samples` column for. Setting a different one
-    # here means the reply no longer matches the declared schema and the extras are dropped
-    # (_set_extras warns); _connect_policy checks the two against each other and says so.
-    critic_select: bool = False
+    # NOTE: how many candidates the policy draws, and whether a critic picks among them, are
+    # SERVER configuration (serve_policy.py --num-samples / --critic, serve_patch_critic.py) --
+    # deliberately not settable here. This client executes the chunk it is given and records the
+    # per-step arrays the handshake declared; it needs no notion of sampling or critics, exactly
+    # as it already takes the chunk LENGTH from the reply rather than from a setting of its own.
 
     # Overlap inference with execution (AsyncChunkBroker): the next chunk is inferred on a
     # background thread while the current one is still being executed, so the control loop keeps

@@ -569,8 +569,8 @@ workstation/yam-data render-samples \
 ```
 
 - **Two sources** (`--source`): `samples` (default) draws the multi-candidate **fan** from the
-  `action_samples` column — a run recorded with `deploy --num-samples N` against a server started
-  with the same N. `action` draws the single **executed** trajectory from the plain `action`
+  `action_samples` column — any run recorded against a server started with `--num-samples N` (or a
+  critic, which samples its own candidates); the client needs no matching setting. `action` draws the single **executed** trajectory from the plain `action`
   column, so it works on ANY LeRobot recording (no `--candidates` needed).
 - **Every tick is rendered** (not one frame per chunk): the episode is tiled into `--horizon`
   chunks and every frame is drawn, so you watch the arm **consume** each chunk, then jump to the

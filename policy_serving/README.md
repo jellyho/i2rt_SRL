@@ -268,7 +268,7 @@ the label. A server that declares nothing is described from what it does adverti
 a trailing `?` — an inferred name is marked as inferred rather than asserted, because a confident
 wrong one is worse than none.
 
-## Value-guided deployment (`critic_select`)
+## Value-guided deployment (a critic-backed server)
 
 A critic-backed server picks the chunk for you: it samples N candidates, scores them with a
 trained critic, and returns the winner along with `critic_scores` / `critic_choice` per step.
@@ -283,18 +283,13 @@ uv run scripts/serve_policy.py --critic <critic_dir> policy:checkpoint --policy.
 uv run python scripts/serve_patch_critic.py --critic <critic_dir> --config ... --checkpoint ... --mode adaptive
 ```
 
-```bash
-workstation/yam-data deploy --critic-select     # the client half
-```
-
-**Both halves are required.** Selection is a per-request opt-in, so a server started with a critic
-serves the plain base policy on every step unless the request carries `critic_select` — the critic
-loads, logs, and is bypassed in silence. The flag is what sends the key; the runner also warns at
-the handshake when it is on against a server that declares no `critic_scores`.
-
-Leave `--num-samples` at 0 with it. The `action_samples` / `critic_scores` columns are fixed at
-handshake to the N the server was started with; a per-request N that disagrees makes every reply
-the wrong shape and the extras are dropped frame by frame (the runner warns about that too).
+**The client is not configured for any of this.** Start the server with a critic and it selects on
+every request; start it with `--num-samples N` and every reply carries N candidates. `yam-data
+deploy` sends a plain observation either way, executes `actions`, and records whatever the
+handshake declared — the same way it already takes the chunk *length* off the reply instead of
+holding a setting for it. There is no client flag to forget, and no N to keep matched: a count
+living on both sides is a count that can disagree, which is how the declared `action_samples`
+column used to end up the wrong shape and get dropped from every frame.
 
 `serve_patch_critic.py --mode adaptive` returns only the winning candidate's highest-value
 commitment prefix, so the chunk length varies per replan — watch it on the deploy page's chunk
