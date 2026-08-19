@@ -256,3 +256,37 @@ def test_no_critic_no_value_curve():
             return False
 
     assert _value_series(_Reader(), 0, 10, 8) is None
+
+
+def test_agentview_sits_between_the_wrists(recorded_run, tmp_path):
+    """Each wrist panel belongs on the side of the arm it rides, so the scene camera goes in the
+    MIDDLE -- not first, where it separates the two wrists it should sit between. The frame is
+    still three panels wide; only the order changes, which is what a reader has to trust."""
+    import imageio.v3 as iio
+
+    frame = iio.imread(render(_args(recorded_run, tmp_path / "layout.mp4")), index=0)
+    height, width = frame.shape[:2]
+    panel_w = height * 640 // 480
+    assert width == 3 * panel_w, "agentview + both wrists, side by side"
+    # No critic in this recording, so no analytics strip is stacked under the cameras.
+    assert height * 640 // 480 * 3 == width
+
+    # Ordering is wrist-left, agentview, wrist-right. With the left wrist dropped there is nothing
+    # for agentview to sit after, and it has to lead rather than vanish.
+    frame = iio.imread(render(_args(recorded_run, tmp_path / "right_only.mp4", wrists=["right"])), index=0)
+    assert frame.shape[1] == 2 * (frame.shape[0] * 640 // 480), "agentview + the one wrist"
+
+
+def test_the_value_strip_keeps_the_frame_encodable():
+    """h264 with yuv420p subsamples chroma 2x2 and refuses an odd frame dimension. The strip sets
+    the frame's height together with the cameras, and 360 + 151 = 511 killed the encode."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _value_panel_base
+
+    chosen = np.array([-3.0, -2.0, -4.0])
+    for panel_h in (360, 240, 300):
+        height = 2 * round(panel_h * 0.42 / 2)
+        assert height % 2 == 0
+        img, *_ = _value_panel_base((chosen, chosen - 1, chosen + 1), 640, height)
+        assert (panel_h + img.size[1]) % 2 == 0, "cameras + strip must stay even"

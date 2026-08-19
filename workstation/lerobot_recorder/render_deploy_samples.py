@@ -459,19 +459,24 @@ def _label(
     ImageDraw.Draw(canvas).text((x, y), text, font=font, fill=fill, anchor="la")
 
 
-def _compose_frame(panels: list, panel_w: int, panel_h: int, *, header: str) -> np.ndarray:
+def _compose_frame(
+    panels: list, panel_w: int, panel_h: int, *, header: str, below: "np.ndarray | None" = None
+) -> np.ndarray:
     """``[(image, label), ...]`` -> one hstacked-flush frame, hf-utils' dataset-render look: each
     camera scaled to a common height and butted together, a translucent-box header top-left and a
     per-panel camera label bottom-left (``drawtext ... box=1:boxcolor=black@0.5`` in hf-utils).
 
     Variable panel count so a run can show agentview + one wrist, or agentview + BOTH wrists, or
-    any subset -- see ``--agentview-arms``/``--wrists``. No analytics column: there is no critic
-    here to explain a decision with, only the spread the overlay already shows (``hud.Dashboard``'s
-    Q-grid/value-trace panels are exactly the part that does not apply -- see the module docstring).
+    any subset -- see ``--agentview-arms``/``--wrists``.
+
+    ``below`` is stacked UNDER the cameras at the full frame width -- that is where an analytics
+    strip belongs. Beside them it would be a fourth camera-sized column, making an already wide
+    frame wider for a plot that reads better long and short.
     """
     from PIL import Image
 
-    canvas = Image.fromarray(np.concatenate([img for img, _ in panels], axis=1))
+    strip = np.concatenate([img for img, _ in panels], axis=1)
+    canvas = Image.fromarray(strip if below is None else np.concatenate([strip, below], axis=0))
     f_sm, f_md = _font(14), _font(16)
     _label(canvas, (8, 8), header, f_md)
     for i, (_, label) in enumerate(panels):
@@ -568,7 +573,9 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
     fan_word = "fan" if args.source == "samples" else "path"
 
-    value_base = _value_panel_base(value_series, panel_w, panel_h) if value_series is not None else None
+    # Sized when the first frame is composed: the strip width depends on how many camera panels
+    # actually render (a wrist can be missing from a recording).
+    value_base = None
 
     frames = []
     for block_idx, start in enumerate(blocks):
@@ -615,7 +622,9 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                 print(f"frame {frame_idx}: no state/images, skipping", file=sys.stderr)
                 continue
 
-            panels = []  # left-to-right: agentview, then each requested wrist
+            # left-to-right: wrist left, agentview, wrist right -- the scene camera in the middle,
+            # each wrist on the side of the arm it rides.
+            panels, agent_panel = [], None
             agent = images.get("agentview")
             if agent is not None and agentview_arms:
                 agent_sq = _to_size(agent, panel_w, panel_h)
@@ -624,7 +633,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                 label = (
                     f"agentview -- {'+'.join(agent_paths)} {fan_word}" if agent_paths else "agentview (no extrinsic)"
                 )
-                panels.append((agent_sq, label))
+                agent_panel = (agent_sq, label)
 
             for arm in wrists:
                 wimg = images.get(f"wrist_{arm}")
@@ -636,13 +645,24 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                     _to_size(wimg, panel_w, panel_h), wpaths, chosen=chosen, colors=_FAN_COLORS[arm], scores=scores
                 )
                 panels.append((wrist_sq, f"wrist {arm} -- {fan_word}"))
+                if arm == "left" and agent_panel is not None:
+                    panels.append(agent_panel)  # agentview sits between the two wrists
+                    agent_panel = None
+            if agent_panel is not None:
+                panels.append(agent_panel)  # no left wrist rendered: agentview still comes first
 
             if not panels:
                 continue
-            if value_base is not None:
-                panels.append(
-                    (_value_panel(value_base, frame_idx, n_frames, float(value_series[0][frame_idx])), "critic value")
-                )
+            below = None
+            if value_series is not None:
+                if value_base is None:
+                    # A wide, short strip under the cameras: a value curve reads along time, so it
+                    # wants width, and giving it a camera's height would make the frame square.
+                    # Even height: h264 with yuv420p subsamples chroma 2x2 and refuses an odd
+                    # frame dimension, and this strip decides the frame's height together with the
+                    # cameras (360 + 151 = 511 killed the encode).
+                    value_base = _value_panel_base(value_series, panel_w * len(panels), 2 * round(panel_h * 0.42 / 2))
+                below = _value_panel(value_base, frame_idx, n_frames, float(value_series[0][frame_idx]))
 
             header = (
                 f"{args.repo_id} · ep {args.episode} · chunk {block_idx + 1}/{len(blocks)}  "
@@ -658,7 +678,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                     f"(best by {float(scores[chosen] - np.median(scores)):+.3g}, "
                     f"spread {float(np.max(scores) - np.min(scores)):.3g})"
                 )
-            composed = _compose_frame(panels, panel_w, panel_h, header=header)
+            composed = _compose_frame(panels, panel_w, panel_h, header=header, below=below)
             for _ in range(max(1, args.hold)):
                 frames.append(composed)
 
