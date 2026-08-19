@@ -29,8 +29,12 @@ class ChunkLengthPlot(QtWidgets.QWidget):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self._values: List[int] = []
-        self.setMinimumHeight(72)
-        self.setMaximumHeight(96)
+        # No sizeHint() is defined and the vertical policy is Fixed, so the layout hands this
+        # widget exactly its *minimum* -- the minimum is the height, and the maximum only guards
+        # against a stray stretch. At 72px the bars were a few pixels apart and a change in plan
+        # length was not readable off them; the room comes from the log pane below.
+        self.setMinimumHeight(160)
+        self.setMaximumHeight(240)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.setToolTip(
             "Length of each action chunk the policy returned, one bar per replan (newest right).\n"
