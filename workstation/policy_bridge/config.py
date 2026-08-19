@@ -28,6 +28,24 @@ class BridgeConfig:
     # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
     num_samples: int = 0
 
+    # Ask the server to CHOOSE for us: with `critic_select`, a critic-backed server samples N
+    # candidate chunks, scores them with its trained critic and returns the winner (plus
+    # `critic_scores` / `critic_choice` per step, which land in the dataset). Selection has to
+    # happen server-side -- the RLT critic reads a token that never leaves the model, and the patch
+    # critic needs the base VLA's shared-backbone sampler -- so this is only a per-request opt-in
+    # key, not something the client can do itself.
+    #
+    # OFF by default and inert against a server without a critic: the key is simply unknown there.
+    # But the reverse is the trap this exists to close -- a server started with `--critic` (or
+    # serve_patch_critic.py) selects NOTHING unless a request carries this key, so the critic loads,
+    # logs, and is then bypassed on every step in silence.
+    #
+    # Leave `num_samples` at 0 when using this: the server falls back to the N it was started with,
+    # which is the N its handshake declared the `action_samples` column for. Setting a different one
+    # here means the reply no longer matches the declared schema and the extras are dropped
+    # (_set_extras warns); _connect_policy checks the two against each other and says so.
+    critic_select: bool = False
+
     # Overlap inference with execution (AsyncChunkBroker): the next chunk is inferred on a
     # background thread while the current one is still being executed, so the control loop keeps
     # sending an action every tick instead of freezing for a round-trip at every chunk boundary --

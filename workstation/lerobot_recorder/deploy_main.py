@@ -50,6 +50,15 @@ def build_configs(
         "per sample, so 0 (off) is normal deployment",
     )
     p.add_argument(
+        "--critic-select",
+        action="store_true",
+        help="ask the server's critic to choose: it samples N candidate chunks, scores them and "
+        "returns its pick, logging critic_scores/critic_choice beside the actions. Requires a "
+        "critic-backed server (serve_policy.py --critic, or serve_patch_critic.py) -- WITHOUT this "
+        "flag such a server selects nothing and quietly serves the base policy. Leave "
+        "--num-samples at 0 so the count matches the N the server declared its columns for",
+    )
+    p.add_argument(
         "--async-inference",
         action="store_true",
         help="infer the next chunk in the background while the current one is still executing, "
@@ -155,6 +164,7 @@ def build_configs(
         image_size=args.image_size,
         prompt=task,
         async_inference=bool(args.async_inference),
+        critic_select=bool(args.critic_select),
     )
     return recorder_cfg, bridge_cfg, args
 

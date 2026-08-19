@@ -362,6 +362,7 @@ class DeploymentPolicyRunner:
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
         self._extra_features = _extra_features_from_meta(meta)
+        self._warn_critic_mismatch()
         if self._extra_features:
             logger.info(
                 "policy also returns per-step %s", ", ".join(f"{k}{tuple(v)}" for k, v in self._extra_features.items())
@@ -440,6 +441,42 @@ class DeploymentPolicyRunner:
         features = dict(self._extra_features)
         features.update({PROVENANCE_PREFIX + name: (1,) for name in PROVENANCE_FIELDS})
         return features
+
+    def _warn_critic_mismatch(self) -> None:
+        """Say so when `critic_select` cannot do what the operator asked of it.
+
+        Two silent failures, both of which look like a working rollout:
+
+        * The server has no critic. `critic_select` is an unknown key there, so it is ignored and
+          every step is served by the plain policy -- the run is a normal rollout wearing the name
+          of a critic run. A critic-backed server always declares `critic_scores`, so its absence
+          is the tell.
+        * N disagrees. The `action_samples` / `critic_scores` columns are fixed at handshake to the
+          N the server was started with; asking for a different one per request makes every reply
+          the wrong shape, and the extras are dropped frame by frame (with the same warning each
+          time). Leaving `num_samples` at 0 always matches.
+        """
+        if not self.cfg.critic_select:
+            return
+        if "critic_scores" not in self._extra_features:
+            logger.warning(
+                "critic selection is ON but the server at %s:%s declares no critic columns — it has "
+                "no critic, so the key is ignored and the base policy drives every step",
+                self.cfg.policy_host,
+                self.cfg.policy_port,
+            )
+            return
+        declared = self._extra_features["critic_scores"][0]
+        if self.cfg.num_samples > 1 and int(self.cfg.num_samples) != int(declared):
+            logger.warning(
+                "num_samples=%d but the server declared its critic columns for N=%d — the reply "
+                "will not match the dataset schema and the critic columns will be dropped every "
+                "frame. Leave num_samples at 0 to use the server's own N",
+                self.cfg.num_samples,
+                declared,
+            )
+        else:
+            logger.info("critic selection ON: the server scores %d candidates and returns its pick", declared)
 
     def chunk_lengths(self) -> list:
         """Length of every chunk the server has answered with recently, oldest first."""
@@ -671,6 +708,13 @@ class DeploymentPolicyRunner:
         # N samples, and an unpatched one ignores an unknown key rather than failing.
         if self.cfg.num_samples > 1:
             obs["num_samples"] = int(self.cfg.num_samples)
+        # Let the server's critic pick the chunk. Per-request by design: selection needs what only
+        # the server has (the RLT token / the base VLA's shared-backbone sampler), and a critic-
+        # backed server does nothing at all unless the request says so. Omitting `num_samples`
+        # above leaves the count at whatever the server was started with, which is the N its
+        # handshake declared the action_samples column for -- see _warn_critic_mismatch.
+        if self.cfg.critic_select:
+            obs["critic_select"] = True
 
         height, width = self._image_shape
         for role, key in self.cfg.image_keys.items():

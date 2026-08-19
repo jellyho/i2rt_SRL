@@ -8,6 +8,8 @@ raises deep inside a transform, or normalizes against the wrong statistics.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from workstation.lerobot_recorder.config import CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
@@ -457,3 +459,49 @@ def test_chunk_history_is_bounded():
         broker.chunk_index = index
         r._note_chunk()
     assert len(r.chunk_lengths()) == CHUNK_HISTORY
+
+
+def test_critic_select_is_only_sent_when_asked_for():
+    """Server-side selection is a per-request opt-in: the RLT critic reads a token that never
+    leaves the model and the patch critic needs the base VLA's sampler, so the client cannot do it
+    -- but a critic-backed server also does NOTHING unless the request carries the key."""
+    plain = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    assert "critic_select" not in plain._build_obs(_robot_obs(), {})
+
+    picky = DeploymentPolicyRunner(BridgeConfig(critic_select=True), RecorderConfig(mock=True), lambda: {})
+    assert picky._build_obs(_robot_obs(), {})["critic_select"] is True
+
+
+def test_a_server_without_a_critic_is_reported_not_silently_obeyed(caplog):
+    """The failure this closes: critic_select against a plain server is an unknown key, so the run
+    looks like a critic run and is not one."""
+    r = DeploymentPolicyRunner(BridgeConfig(critic_select=True), RecorderConfig(mock=True), lambda: {})
+    r._extra_features = {"action_samples": (8, 14)}  # samples but no critic_scores -> no critic
+    with caplog.at_level(logging.WARNING):
+        r._warn_critic_mismatch()
+    assert "no critic" in caplog.text
+
+
+def test_asking_for_a_different_n_than_the_server_declared_is_reported(caplog):
+    """The columns are fixed at handshake, so a per-request N that disagrees makes every reply the
+    wrong shape and the critic columns are dropped frame by frame."""
+    r = DeploymentPolicyRunner(BridgeConfig(critic_select=True, num_samples=16), RecorderConfig(mock=True), lambda: {})
+    r._extra_features = {"critic_scores": (8,), "action_samples": (8, 14)}
+    with caplog.at_level(logging.WARNING):
+        r._warn_critic_mismatch()
+    assert "num_samples=16" in caplog.text and "N=8" in caplog.text
+
+    quiet = DeploymentPolicyRunner(BridgeConfig(critic_select=True), RecorderConfig(mock=True), lambda: {})
+    quiet._extra_features = {"critic_scores": (8,)}
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        quiet._warn_critic_mismatch()
+    assert caplog.text == ""  # num_samples left at 0 uses the server's own N -- nothing to warn about
+
+
+def test_no_critic_warnings_when_the_feature_is_off(caplog):
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    r._extra_features = {}
+    with caplog.at_level(logging.WARNING):
+        r._warn_critic_mismatch()
+    assert caplog.text == ""
