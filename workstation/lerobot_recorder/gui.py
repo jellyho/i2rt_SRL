@@ -188,7 +188,12 @@ class RecorderGUI(QtWidgets.QWidget):
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(2000)  # cap memory; old lines scroll off
-        self.log_view.setMinimumHeight(220)
+        # A tail, not a terminal: it is read a few lines at a time, and at 23px it was eating
+        # the height the live views and the chunk plot above actually need. Bounded top and
+        # bottom, and given no stretch below, so it keeps this size instead of growing into
+        # whatever the window offers.
+        self.log_view.setMinimumHeight(110)
+        self.log_view.setMaximumHeight(170)
         self.log_view.setStyleSheet(
             f"background:#0d1117;border:1px solid #30363d;border-radius:6px;color:{theme.MUTED};"
             "font-family:monospace;font-size:23px;"
@@ -198,8 +203,8 @@ class RecorderGUI(QtWidgets.QWidget):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
         root.addWidget(self.banner)
-        root.addWidget(self.stack, 2)
-        root.addWidget(self.log_view, 1)
+        root.addWidget(self.stack, 1)
+        root.addWidget(self.log_view, 0)   # no stretch: spare height goes to the views above
 
     def _build_setup_page(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -324,9 +329,18 @@ class RecorderGUI(QtWidgets.QWidget):
         # not a view -- pick the dataset and episode, set how strongly the live image shows through,
         # and watch the result in the big view. It sits entirely in the display path: Recorder and
         # DeploymentPolicyRunner still receive raw images.
+        # Two rows, not one. The status line carries whole sentences ("Choose another overlay
+        # dataset or refresh after a save."), and sharing a row with it left every control
+        # fighting one long label for width -- the opacity slider worst of all, since a slider
+        # squeezed to a centimetre cannot be set to a particular value. Controls on top, prose
+        # underneath, where it can be as long as it needs to be.
         self.reference_box = QtWidgets.QWidget()
-        reference_layout = QtWidgets.QHBoxLayout(self.reference_box)
+        reference_outer = QtWidgets.QVBoxLayout(self.reference_box)
+        reference_outer.setContentsMargins(0, 0, 0, 0)
+        reference_outer.setSpacing(4)
+        reference_layout = QtWidgets.QHBoxLayout()
         reference_layout.setContentsMargins(0, 0, 0, 0)
+        reference_layout.setSpacing(8)
 
         self.reference_dataset_combo = PickerComboBox()
         self.reference_dataset_combo.setMinimumWidth(180)
@@ -342,7 +356,7 @@ class RecorderGUI(QtWidgets.QWidget):
         self.reference_opacity_label = QtWidgets.QLabel()
         self.reference_opacity = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.reference_opacity.setRange(0, 100)
-        self.reference_opacity.setMaximumWidth(140)
+        self.reference_opacity.setMinimumWidth(240)
         self.reference_opacity.setValue(round(100 * self.cfg.reference_live_alpha))
         self.reference_opacity.valueChanged.connect(self._on_reference_opacity)
 
@@ -364,7 +378,9 @@ class RecorderGUI(QtWidgets.QWidget):
         reference_layout.addWidget(self.reference_opacity)
         reference_layout.addWidget(self.reference_pause_btn)
         reference_layout.addWidget(self.reference_refresh_btn)
-        reference_layout.addWidget(self.reference_status, 1)
+        reference_layout.addStretch(1)
+        reference_outer.addLayout(reference_layout)
+        reference_outer.addWidget(self.reference_status)
         self._on_reference_opacity(self.reference_opacity.value())
 
         # review panel
