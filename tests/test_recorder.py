@@ -827,3 +827,26 @@ def test_the_recorder_streams_the_active_task_with_every_frame():
         rec._step(images, snap)
 
     assert rec.writer.tasks == ["assemble lego blocks"] * 3
+
+
+def test_a_homing_frame_is_never_captured():
+    """Going home is not part of the rollout, gripper release included.
+
+    The runner stops streaming when the robot reports homing, but the flag can flip between that
+    check and the capture -- which put a single frame of the homing pose (arm travelling, gripper
+    commanded shut) at the end of a recording."""
+    cfg = RecorderConfig(repo_id="test/homing", root="/tmp/x", fps=30, mock=True, record_source="eval")
+    rec = Recorder(cfg)
+    rec.gate.arm()
+    try:
+        real = rec.robot.get_snapshot
+
+        rec.robot.get_snapshot = lambda: {**real(), "homing": True}
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        assert len(rec._sent_frames) == 0, "a homing frame must not be captured"
+
+        rec.robot.get_snapshot = lambda: {**real(), "teleop_state": "HOMING"}
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        assert len(rec._sent_frames) == 0, "teleop HOMING is the same thing by another name"
+    finally:
+        rec.robot.get_snapshot = real

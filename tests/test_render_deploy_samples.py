@@ -163,3 +163,63 @@ def test_source_action_needs_no_action_samples(recorded_run, tmp_path):
     """--source action reads the plain action column, so it renders even with candidates unset."""
     out = render(_args(recorded_run, tmp_path / "act.mp4", source="action", candidates=None))
     assert out.is_file()
+
+
+def test_the_fan_is_coloured_by_the_critic_s_own_ranking():
+    """A value-guided run records what the critic thought of each candidate, so the fan can show
+    the value landscape the decision was made on instead of a spread of look-alike options.
+
+    Normalised per replan: the absolute numbers are arbitrary (cost-to-goal runs to -2777), the
+    useful question is which candidate the critic preferred here."""
+    from workstation.lerobot_recorder.render_deploy_samples import _value_color
+
+    worst, best = _value_color(-20.0, -20.0, -5.0), _value_color(-5.0, -20.0, -5.0)
+    assert worst != best
+    assert best[0] > worst[0], "the preferred candidate should read warmer"
+    assert worst[2] > best[2], "...and the rejected one colder"
+    # A replan the critic saw nothing to choose between must not paint a false gradient.
+    flat = {_value_color(v, -7.0, -7.0) for v in (-7.0, -7.0)}
+    assert len(flat) == 1
+
+
+def test_the_executed_candidate_is_the_one_the_critic_picked():
+    """`critic_choice` is read from the recording: highlighting index 0 would draw the wrong path
+    as executed on any run where the critic picked something else."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _load_critic
+
+    class _Reader:
+        def get_extra(self, ep, frame, key, shape):
+            return np.array([-9.0, -3.0, -7.0]) if key == "critic_scores" else None
+
+        def get_scalar(self, ep, frame, key):
+            return 1.0 if key == "critic_choice" else None
+
+    scores, chosen = _load_critic(_Reader(), 0, 0, 3)
+    assert chosen == 1 and float(scores[chosen]) == -3.0
+
+    class _Plain(_Reader):
+        def get_extra(self, ep, frame, key, shape):
+            return None
+
+    assert _load_critic(_Plain(), 0, 0, 3) == (None, 0)
+
+
+def test_a_constant_chunk_index_is_treated_as_no_information():
+    """Rollouts recorded while the provenance was written as a constant 0 carry the column but
+    nothing in it. Believing it would draw the entire episode as one chunk."""
+    from workstation.lerobot_recorder.render_deploy_samples import _recorded_chunk_starts
+
+    class _Reader:
+        def __init__(self, values):
+            self.values = values
+
+        def has_feature(self, key):
+            return True
+
+        def get_scalar(self, ep, frame, key):
+            return self.values[frame]
+
+    assert _recorded_chunk_starts(_Reader([0.0] * 40), 0, 40) is None
+    assert _recorded_chunk_starts(_Reader([0.0] * 10 + [1.0] * 10), 0, 20) == [0, 10]

@@ -89,8 +89,10 @@ def _recorded_chunk_starts(reader: "DatasetReader", episode: int, n_frames: int)
     * an intervention or a homing forces an early replan the grid knows nothing about, and every
       chunk after it is drawn shifted.
 
-    None when the column is absent (any older recording, or a teleop/demo dataset), and the caller
-    falls back to tiling by --horizon.
+    None when the column is absent (any older recording, or a teleop/demo dataset) OR when it
+    never changes -- a recording made while the provenance was being written as a constant zero
+    has the column but no information in it, and taking it at face value would draw the whole
+    episode as one enormous chunk. Either way the caller falls back to tiling by --horizon.
     """
     if not reader.has_feature("policy.chunk_index"):
         return None
@@ -102,7 +104,7 @@ def _recorded_chunk_starts(reader: "DatasetReader", episode: int, n_frames: int)
         if previous is None or value != previous:
             starts.append(frame)
             previous = value
-    return starts or None
+    return starts if len(starts) > 1 else None
 
 
 def _recorded_candidates(reader: "DatasetReader") -> Optional[int]:
@@ -239,6 +241,38 @@ def _finite_prefix(path: np.ndarray) -> Optional[list]:
 
 # Per-arm fan colours (chosen-candidate gradient start/end). Left keeps the original green; right
 # gets an amber so both arms' fans read apart when drawn on the SAME agentview frame.
+def _load_critic(
+    reader: "DatasetReader", episode: int, start: int, n_candidates: int
+) -> "tuple[Optional[np.ndarray], int]":
+    """This replan's critic scores and the candidate it picked, or (None, 0).
+
+    A value-guided server records a score per candidate and the index it executed
+    (`critic_scores` / `critic_choice`, declared at handshake). With them the fan stops being a
+    spread of equally plausible options and becomes the value landscape the decision was made on:
+    which paths the critic liked, which it rejected, and how far apart it thought they were.
+
+    Read at the chunk's first frame: both columns are per step but constant across a replan (the
+    decision is made once, then executed).
+    """
+    scores = reader.get_extra(episode, start, "critic_scores", (n_candidates,))
+    if scores is None:
+        return None, 0
+    choice = reader.get_scalar(episode, start, "critic_choice")
+    return np.asarray(scores, dtype=float), int(choice or 0)
+
+
+def _value_color(score: float, low: float, high: float) -> tuple:
+    """Rank a candidate's value on a cold-to-warm ramp.
+
+    Normalised against THIS replan's own spread rather than a global scale: the absolute values a
+    critic emits are arbitrary (cost-to-goal here runs to -2777), while the useful question at
+    each decision is which of these candidates the critic preferred over the others.
+    """
+    t = 0.5 if high <= low else float(np.clip((score - low) / (high - low), 0.0, 1.0))
+    cold, warm = (70, 105, 190), (240, 210, 90)  # rejected -> preferred
+    return tuple(int(a + (b - a) * t) for a, b in zip(cold, warm, strict=True))
+
+
 _FAN_COLORS = {
     "left": ((20, 140, 95), (190, 255, 225)),
     "right": ((170, 95, 20), (255, 205, 140)),
@@ -246,7 +280,12 @@ _FAN_COLORS = {
 
 
 def _draw_fan(
-    wrist_rgb: np.ndarray, paths: list, chosen: int = 0, *, colors: tuple = _FAN_COLORS["left"]
+    wrist_rgb: np.ndarray,
+    paths: list,
+    chosen: int = 0,
+    *,
+    colors: tuple = _FAN_COLORS["left"],
+    scores: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Overlay every candidate's projected path onto one frame (wrist OR agentview).
 
@@ -273,8 +312,14 @@ def _draw_fan(
         pts = _finite_prefix(path)
         if pts is None:
             continue
-        d.line(pts, fill=(95, 165, 235, 155), width=3)
-        d.ellipse([pts[-1][0] - 2.5, pts[-1][1] - 2.5, pts[-1][0] + 2.5, pts[-1][1] + 2.5], fill=(95, 165, 235, 200))
+        # Uniform blue when nothing scored them; otherwise the critic's own ranking (see
+        # _value_color), so a rejected path and a near-miss do not look alike.
+        if scores is not None and i < len(scores):
+            col = _value_color(float(scores[i]), float(np.min(scores)), float(np.max(scores)))
+        else:
+            col = (95, 165, 235)
+        d.line(pts, fill=(*col, 155), width=3)
+        d.ellipse([pts[-1][0] - 2.5, pts[-1][1] - 2.5, pts[-1][0] + 2.5, pts[-1][1] + 2.5], fill=(*col, 200))
 
     if 0 <= chosen < len(paths):
         pts = _finite_prefix(paths[chosen])
@@ -460,6 +505,13 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             print(f"chunk at frame {start}: {missing}, skipping", file=sys.stderr)
             continue
 
+        # What the critic thought of these candidates, if the run recorded it. `chosen` is the
+        # candidate actually executed -- candidate 0 for a plain multi-sample reply, but a critic
+        # picks by value, and drawing 0 as the chosen one would then highlight the wrong path.
+        scores, chosen = (None, 0)
+        if args.source == "samples":
+            scores, chosen = _load_critic(reader, args.episode, start, args.candidates)
+
         # The chunk's base-frame paths (FK of the joint targets) are the SAME for every tick in the
         # block -- only the wrist CAMERA moves as the arm executes -- so compute them once here and
         # only re-project per tick below. This is what makes rendering every frame cheap.
@@ -487,7 +539,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             if agent is not None and agentview_arms:
                 agent_sq = _to_size(agent, panel_w, panel_h)
                 for arm, apaths in agent_paths.items():
-                    agent_sq = _draw_fan(agent_sq, apaths, chosen=0, colors=_FAN_COLORS[arm])
+                    agent_sq = _draw_fan(agent_sq, apaths, chosen=chosen, colors=_FAN_COLORS[arm], scores=scores)
                 label = (
                     f"agentview -- {'+'.join(agent_paths)} {fan_word}" if agent_paths else "agentview (no extrinsic)"
                 )
@@ -499,7 +551,9 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                     continue
                 q_now = state[state_slices[arm]]
                 wpaths = [_project_wrist(geometries[arm], bp, q_now, wrist_intr) for bp in base_paths[arm]]
-                wrist_sq = _draw_fan(_to_size(wimg, panel_w, panel_h), wpaths, chosen=0, colors=_FAN_COLORS[arm])
+                wrist_sq = _draw_fan(
+                    _to_size(wimg, panel_w, panel_h), wpaths, chosen=chosen, colors=_FAN_COLORS[arm], scores=scores
+                )
                 panels.append((wrist_sq, f"wrist {arm} -- {fan_word}"))
 
             if not panels:
@@ -508,6 +562,15 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                 f"{args.repo_id} · ep {args.episode} · chunk {block_idx + 1}/{len(blocks)}  "
                 f"tick {offset + 1}/{block_len}"
             )
+            if scores is not None:
+                # The decision, in the numbers it was made on: which candidate won, its value, and
+                # how much better the critic thought it was than the worst on offer. A near-zero
+                # spread means the critic saw nothing to choose between -- worth seeing.
+                header += (
+                    f"  ·  critic: #{chosen} of {len(scores)}  "
+                    f"Q {float(scores[chosen]):.3g}  (spread {float(np.min(scores)):.3g}"
+                    f" .. {float(np.max(scores)):.3g})"
+                )
             composed = _compose_frame(panels, panel_w, panel_h, header=header)
             for _ in range(max(1, args.hold)):
                 frames.append(composed)

@@ -493,6 +493,14 @@ class Recorder:
         snap = self.robot.get_snapshot()
         if snap.get("state") is None or snap.get("leader_recentering"):
             return
+        # Homing is not part of the rollout. The runner already stops streaming once the robot
+        # reports it (which covers the gripper release -- the controller raises `homing` for the
+        # whole release/travel/close sequence), but `homing` can turn true between that check and
+        # this capture, which is how a single frame of the homing pose reached the end of a
+        # recording. Re-checking here closes that window: an episode ends on the last action the
+        # policy drove, not on the arm going home.
+        if snap.get("homing") or snap.get("teleop_state") == "HOMING":
+            return
         images = self.get_last_images()
         if not images:
             return
