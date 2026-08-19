@@ -33,6 +33,7 @@ columns.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, Optional
 
 import numpy as np
@@ -103,6 +104,7 @@ class ActionChunkBroker(BasePolicy):
         self._chunked = True
         self._last_results: Dict | None = None
         self._chunk_index = -1
+        self._last_infer_s = 0.0  # the round-trip the control loop last blocked for
 
     @property
     def action_horizon(self) -> int:
@@ -121,9 +123,32 @@ class ActionChunkBroker(BasePolicy):
         """
         return self._chunk_index
 
+    def stats(self) -> Dict:
+        """Where the action just returned came from -- the same keys AsyncChunkBroker reports.
+
+        Both brokers answer this because the caller records it as dataset provenance and must not
+        care which one it holds. Synchronous inference has no prefetch, so there is no delay to
+        report (the chunk is always executed from the observation just handed over, which is the
+        whole point of running synchronously) and no underrun; `infer_ms` is the round-trip the
+        control loop actually blocked for at the last chunk boundary.
+        """
+        return {
+            "chunk_index": self._chunk_index,
+            "step_in_chunk": max(self._cur_step - 1, 0),
+            "chunk_len": self._chunk,
+            "infer_ms": self._last_infer_s * 1000.0,
+            "delay_ticks": 0,
+            "prefetch_ticks": 0,
+            "underruns": 0,
+            "stale_chunks": 0,
+            "inflight": False,
+        }
+
     def infer(self, obs: Dict) -> Dict:
         if self._last_results is None:
+            t0 = time.monotonic()
             self._last_results = self._policy.infer(obs)
+            self._last_infer_s = time.monotonic() - t0
             self._chunk = chunk_len(self._last_results)
             self._chunked = is_chunked(self._last_results)
             self._cur_step = 0

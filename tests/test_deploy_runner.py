@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import pytest
 
 from workstation.lerobot_recorder.config import CONTROL_MODE, EEF_DIM, LEADER_DIM, RecorderConfig
 from workstation.policy_bridge.config import BridgeConfig
@@ -387,14 +388,14 @@ def test_every_eval_frame_carries_the_provenance_of_the_action_it_recorded():
     r._note_timing(1234.5)
 
     features = r.extra_features()
-    for name in ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time"):
+    for name in ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "elapsed_s"):
         assert features["policy." + name] == (1,)
 
     extras = r.get_extras()
     assert float(extras["policy.chunk_index"][0]) == 3.0
     assert float(extras["policy.step_in_chunk"][0]) == 7.0
     assert float(extras["policy.delay_ticks"][0]) == 4.0
-    assert float(extras["policy.wall_time"][0]) == 1234.5
+    assert float(extras["policy.elapsed_s"][0]) == 0.0  # first send is the origin
     st = r.get_status()
     assert st["delay_ticks"] == 4 and st["underruns"] == 0
 
@@ -408,7 +409,7 @@ def test_provenance_is_present_even_when_the_policy_declares_no_extras():
         "policy.step_in_chunk",
         "policy.infer_ms",
         "policy.delay_ticks",
-        "policy.wall_time",
+        "policy.elapsed_s",
     }
     assert all(v.shape == (1,) for v in r.get_extras().values())
 
@@ -471,3 +472,40 @@ def test_the_client_asks_the_policy_for_nothing_but_an_observation():
     assert "num_samples" not in obs
     assert "critic_select" not in obs
     assert not any(k.startswith("critic") for k in obs)
+
+
+def test_provenance_is_populated_in_synchronous_mode_too():
+    """Sync is the DEFAULT, and its broker has to answer stats() like the async one.
+
+    It did not, so `getattr(policy, "stats", None)` came back None and every provenance column was
+    written as 0.0 for a whole rollout -- schema present, contents empty.
+    """
+    from yam_policy import ActionChunkBroker
+
+    class _Chunked:
+        def infer(self, obs):
+            return {"actions": np.zeros((5, 14), np.float32)}
+
+        def reset(self):
+            pass
+
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    r._policy = ActionChunkBroker(_Chunked())
+    for _ in range(7):  # two chunks of five
+        r._policy.infer({})
+    r._note_timing(100.0)
+
+    extras = r.get_extras()
+    assert float(extras["policy.chunk_index"][0]) == 1.0
+    assert float(extras["policy.step_in_chunk"][0]) == 1.0
+
+
+def test_elapsed_is_relative_because_float32_cannot_hold_a_unix_timestamp():
+    """float32 spacing at 1.8e9 is 128 SECONDS: a wall-clock stamp collapsed a whole rollout onto
+    three distinct values, destroying the very cadence the column was added to measure. Seconds
+    since the run started stay small enough to resolve a fraction of a millisecond."""
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    r._note_timing(1_787_124_096.0)
+    r._note_timing(1_787_124_096.033)
+    first = float(r.get_extras()["policy.elapsed_s"][0])
+    assert first == pytest.approx(0.033, abs=1e-4), "a 33 ms tick must survive the float32 column"
