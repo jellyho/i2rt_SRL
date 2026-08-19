@@ -6,8 +6,9 @@ policy streaming and (optionally) DAgger recording in one workstation process.
     workstation/yam-data deploy              # everything else is chosen in the UI
     workstation/yam-data deploy --headless   # no GUI (replaces the old `yam-data bridge`)
 
-A run has two independent axes, both on the setup page: **mode** (deploy = watch the
-policy, leader free; dagger = correct it, leader mirrors) and **record** (whether the run
+A run has two independent axes, both on the setup page: **mode** (policy = watch a live
+policy, leader free; dagger = correct it, leader mirrors; dataset = replay a recording) and
+**record** (whether the run
 lands in a dataset). The flags below only set their initial values.
 """
 
@@ -40,20 +41,34 @@ def build_configs(
     p.add_argument("--policy-port", type=int, default=8000)
     p.add_argument("--rate", type=float, default=30.0)
     p.add_argument("--image-size", type=int, default=224)
-    p.add_argument("--num-samples", type=int, default=0,
-                   help="ask the policy for N action chunks per step instead of one, draw them on "
-                        "the wrist views, and log them beside the dataset. Costs one forward pass "
-                        "per sample, so 0 (off) is normal deployment")
+    p.add_argument(
+        "--num-samples",
+        type=int,
+        default=0,
+        help="ask the policy for N action chunks per step instead of one, draw them on "
+        "the wrist views, and log them beside the dataset. Costs one forward pass "
+        "per sample, so 0 (off) is normal deployment",
+    )
+    p.add_argument(
+        "--async-inference",
+        action="store_true",
+        help="infer the next chunk in the background while the current one is still executing, "
+        "instead of waiting for it to run out. Removes the dead-stop the robot makes at every "
+        "chunk boundary, at the cost of each chunk starting a few ticks after the observation it "
+        "was computed from. Default is synchronous: the stricter thing to evaluate (every chunk "
+        "comes from the observation just handed over); the stall ticks send nothing, so they are "
+        "absent from the dataset rather than recorded as a pause",
+    )
     p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--no-review", action="store_true", help="auto-save each DAgger segment")
     p.add_argument("--auto-arm", action="store_true", help="arm collection automatically on Start")
     p.add_argument("--resume", action="store_true", help="append to an existing dataset at --root")
     p.add_argument(
         "--mode",
-        choices=["deploy", "dagger"],
-        default="dagger",
-        help="deploy = watch the policy (leader free); dagger = correct it (leader mirrors). "
-        "Also selectable on the setup page.",
+        choices=["policy", "dagger"],
+        default="policy",
+        help="policy = watch a live policy (leader free); dagger = correct it (leader mirrors). "
+        "A third source, 'dataset' (replay a recording), is selectable on the setup page.",
     )
     p.add_argument(
         "--no-record",
@@ -139,6 +154,7 @@ def build_configs(
         rate_hz=args.rate,
         image_size=args.image_size,
         prompt=task,
+        async_inference=bool(args.async_inference),
     )
     return recorder_cfg, bridge_cfg, args
 
@@ -169,7 +185,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(theme.QSS)
     gui = DeployGUI(
-        recorder_cfg, bridge_cfg, mode=args.mode, record=not args.no_record,
+        recorder_cfg,
+        bridge_cfg,
+        mode=args.mode,
+        record=not args.no_record,
         leader_mirror=args.leader_mirror,
     )
     gui.resize(900, 980)

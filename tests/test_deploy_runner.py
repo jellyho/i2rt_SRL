@@ -313,3 +313,147 @@ def test_probe_reports_down_when_nothing_is_listening():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     assert _idle_runner(policy_port=port)._policy_port_open() is False
+
+
+# --------------------------------------------------------------------------------------- #
+# Replay source: in-process dataset replay (no server), driven by the run-page episode pick
+# --------------------------------------------------------------------------------------- #
+def test_replay_mode_without_an_episode_is_a_benign_not_connected():
+    """In replay mode the dataset+episode is chosen on the run page; until one is, connecting is a
+    plain 'not connected' (the GUI blocks Start), NOT an attempt to reach a policy server."""
+    import pytest
+
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    with pytest.raises(ConnectionError, match="select an episode"):
+        r._connect_policy()
+
+
+def test_set_replay_source_updates_cfg_and_forces_a_rebuild():
+    """Picking an episode points the in-process replay at it and drops the current policy so the
+    idle probe rebuilds DatasetPolicy for the new episode -- no server to restart."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    r._policy = object()
+    r.set_replay_source("yam_cable_tie_v4", 3)
+    assert r.cfg.replay_dataset == "yam_cable_tie_v4"
+    assert r.cfg.replay_episode == 3
+    assert r._policy is None  # dropped -> the probe rebuilds for the new episode
+
+
+def test_set_replay_source_ignores_a_no_op_reselect():
+    """Re-selecting the SAME episode (same dataset+episode, policy already built) does nothing --
+    so the overlay auto-selecting the current episode cannot thrash the policy."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    r.set_replay_source("d", 1)
+    r._policy = object()  # pretend it built
+    r.set_replay_source("d", 1)
+    assert r._policy is not None  # unchanged: no rebuild forced
+
+
+def test_replay_pause_is_a_workstation_send_gate():
+    """Pause/resume never touches policy_running -- it is a flag the loop reads to stop/continue
+    sending actions, so the robot just holds and its start/stop (gripper close) logic never runs."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    assert r.replay_paused is False
+    r.set_replay_paused(True)
+    assert r.replay_paused is True
+    r.set_replay_paused(False)
+    assert r.replay_paused is False
+
+
+def test_picking_a_new_episode_clears_pause():
+    """A freshly picked episode plays from the start, so selecting one clears any pause."""
+    r = DeploymentPolicyRunner(BridgeConfig(replay_mode=True), RecorderConfig(mock=False), lambda: {})
+    r.set_replay_paused(True)
+    r.set_replay_source("d", 5)
+    assert r.replay_paused is False
+
+
+def test_every_eval_frame_carries_the_provenance_of_the_action_it_recorded():
+    """A rollout must say where each action came from, not just what it was.
+
+    An action is the k-th step of a chunk inferred from an observation some ticks earlier, so
+    without these columns a dataset cannot distinguish "the policy reacted to this frame" from
+    "the policy was still replaying a plan made a second ago" -- and the send cadence is lost to
+    the dataset's uniform frame timestamps.
+    """
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+
+    class _Broker:
+        def stats(self):
+            return {"chunk_index": 3, "step_in_chunk": 7, "infer_ms": 120.5, "delay_ticks": 4}
+
+    r._policy = _Broker()
+    r._note_timing(1234.5)
+
+    features = r.extra_features()
+    for name in ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time"):
+        assert features["policy." + name] == (1,)
+
+    extras = r.get_extras()
+    assert float(extras["policy.chunk_index"][0]) == 3.0
+    assert float(extras["policy.step_in_chunk"][0]) == 7.0
+    assert float(extras["policy.delay_ticks"][0]) == 4.0
+    assert float(extras["policy.wall_time"][0]) == 1234.5
+    st = r.get_status()
+    assert st["delay_ticks"] == 4 and st["underruns"] == 0
+
+
+def test_provenance_is_present_even_when_the_policy_declares_no_extras():
+    """The columns come from the runner, not the handshake, so a plain policy still gets them."""
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+    assert r._extra_features == {}
+    assert set(r.extra_features()) == {
+        "policy.chunk_index",
+        "policy.step_in_chunk",
+        "policy.infer_ms",
+        "policy.delay_ticks",
+        "policy.wall_time",
+    }
+    assert all(v.shape == (1,) for v in r.get_extras().values())
+
+
+def test_inference_is_synchronous_unless_asked_for():
+    """Eval is the default use, and synchronous is the stricter thing to measure: every chunk is
+    computed from the observation just handed over, so a rollout has no delay confound. Async
+    (continuous motion, chunk starts `delay_ticks` late) is opt-in per run."""
+    assert BridgeConfig().async_inference is False
+    assert BridgeConfig(async_inference=True).async_inference is True
+
+
+def test_the_length_of_every_reply_is_recorded_for_the_plot():
+    """The horizon comes from each reply, not from a setting, so it can change per replan -- and
+    the reply is the only place that number exists. One entry per NEW chunk, including a repeat of
+    the same length; nothing while the same chunk is being consumed."""
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+
+    class _Broker:
+        chunk_index = -1
+        action_horizon = 0
+
+    broker = _Broker()
+    r._policy = broker
+    r._note_chunk()
+    assert r.chunk_lengths() == []  # nothing inferred yet
+
+    for index, horizon in enumerate([30, 30, 12, 12, 7]):
+        broker.chunk_index, broker.action_horizon = index, horizon
+        r._note_chunk()
+        r._note_chunk()  # same chunk consumed over many ticks -> still one entry
+    assert r.chunk_lengths() == [30, 30, 12, 12, 7]
+
+
+def test_chunk_history_is_bounded():
+    from workstation.policy_bridge.deploy_runner import CHUNK_HISTORY
+
+    r = DeploymentPolicyRunner(BridgeConfig(), RecorderConfig(mock=True), lambda: {})
+
+    class _Broker:
+        chunk_index = -1
+        action_horizon = 16
+
+    broker = _Broker()
+    r._policy = broker
+    for index in range(CHUNK_HISTORY + 25):
+        broker.chunk_index = index
+        r._note_chunk()
+    assert len(r.chunk_lengths()) == CHUNK_HISTORY

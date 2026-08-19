@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from typing import Callable, Dict, Optional
 
 import numpy as np
@@ -73,6 +74,18 @@ def _describe_policy(meta: Dict) -> str:
     return f"{guess} · {name}" if name else guess
 
 
+#: Per-step timing/provenance columns the runner adds to every eval recording, on top of whatever
+#: the policy declares. They answer "where did this action come from?": which chunk and which step
+#: within it, how long that chunk's inference took, how many control ticks passed between the
+#: observation it was computed from and this action being sent (the RTC inference delay), and the
+#: real wall-clock instant of the send. Prefixed so they never collide with a policy's own extras.
+PROVENANCE_PREFIX = "policy."
+PROVENANCE_FIELDS = ("chunk_index", "step_in_chunk", "infer_ms", "delay_ticks", "wall_time")
+
+#: How many recent chunk lengths to keep for the live plot (~2 minutes of replans at a 1 s chunk).
+CHUNK_HISTORY = 120
+
+
 def _extra_features_from_meta(meta: Dict) -> Dict[str, tuple]:
     """What extra per-step arrays this policy sends, from its handshake metadata.
 
@@ -125,9 +138,26 @@ class DeploymentPolicyRunner:
         self._extra_features: Dict[str, tuple] = {}
         self._extras: Dict[str, "np.ndarray"] = {}
         self._extra_warned: set = set()
+        #: This step's provenance (see PROVENANCE_FIELDS / _note_timing).
+        self._timing: Dict[str, float] = {name: 0.0 for name in PROVENANCE_FIELDS}
+        #: Length of each chunk the server has answered with, newest last. The chunk is adaptive --
+        #: the broker takes the horizon from every reply rather than from a setting -- so a policy
+        #: may answer with a different number of steps each replan, and this is the only record of
+        #: what it actually sent. Bounded: it feeds a live plot, not an archive.
+        self._chunk_lengths: "deque[int]" = deque(maxlen=CHUNK_HISTORY)
+        self._last_chunk_index = -1
         #: Called once the handshake is in, so the recorder can declare its columns.
         self.on_connected = None
+        #: Called with the sent action vector every time an action is pushed to the robot, so the
+        #: recorder can log exactly one eval frame per executed action (see Recorder.note_action_sent).
+        self.on_action_sent: Callable[[np.ndarray], None] | None = None
         self._was_streaming = False
+        # Replay pause: PURELY a send-gate on this (workstation) side. When paused the loop stops
+        # calling infer()/set_policy_action, so the DatasetPolicy cursor freezes and the robot just
+        # holds its last command (the deploy controller's command_timeout hold) -- no policy_running
+        # toggle, so the robot side runs none of its start/stop logic (no gripper close). Resume
+        # continues from the same frame. Only meaningful in replay_mode.
+        self._replay_paused = False
         self._lock = threading.Lock()
         # Seconds between idle reachability probes -- see _probe_policy.
         self._PROBE_PERIOD_S = 2.0
@@ -150,6 +180,12 @@ class DeploymentPolicyRunner:
             "action_horizon": 0,  # filled in from the first chunk the policy returns
             "image_size": cfg.image_size,
             "image_shape": self._image_shape,
+            # Inference timing (async broker only): how long the policy takes, how many control
+            # ticks that costs, and how often it was too slow to cover the chunk (each underrun is
+            # a tick the robot had nothing new to execute).
+            "infer_ms": 0.0,
+            "delay_ticks": 0,
+            "underruns": 0,
         }
 
     def start(self) -> None:
@@ -239,16 +275,90 @@ class DeploymentPolicyRunner:
         except OSError:
             return False
 
+    def _build_replay_policy(self) -> tuple:
+        """An in-process DatasetPolicy wrapped as the policy, for a dataset replay source.
+
+        Replay differs from deployment in exactly ONE thing -- where the actions come from -- so it
+        reuses the whole deploy stack (smoother, e-stop, takeover, overlay) by building the same
+        ``ActionChunkBroker`` over a local ``DatasetPolicy`` instead of a websocket client. No
+        server, no port, no subprocess: DatasetPolicy reads the episode's actions from the parquet
+        directly. ``build_metadata`` gives the exact handshake meta the websocket path would have
+        received (framework=dataset-replay, replay_dataset/episode/fps, extra_features), so the meta
+        processing below is shared."""
+        from yam_policy import ActionChunkBroker
+        from yam_policy.policies.dataset_policy import DatasetPolicy
+        from yam_policy.serve import build_metadata
+
+        from workstation.lerobot_recorder.dataset_writer import dataset_dir
+
+        root = dataset_dir(self.recorder_cfg.root, self.cfg.replay_dataset)
+        policy = DatasetPolicy(
+            root=root,
+            episode=int(self.cfg.replay_episode),
+            speed=float(self.cfg.replay_speed),
+            loop=bool(self.cfg.replay_loop),
+        )
+        meta = build_metadata(policy, "yam_policy.policies.dataset_policy:DatasetPolicy", {})
+        return ActionChunkBroker(policy), meta
+
+    def set_replay_source(self, dataset: str, episode: int) -> None:
+        """Point the in-process replay at a dataset+episode (chosen on the run page's reference
+        panel). Rebuilds the policy on the next probe, so switching episodes just re-points here --
+        no server to restart. A no-op change is ignored so re-selecting the same row does nothing."""
+        dataset, episode = str(dataset or ""), int(episode)
+        if (dataset, episode) == (self.cfg.replay_dataset, self.cfg.replay_episode) and self._policy is not None:
+            return
+        self.cfg.replay_dataset = dataset
+        self.cfg.replay_episode = episode
+        # Drop the current policy so the idle probe rebuilds DatasetPolicy for the new episode.
+        self._policy = None
+        self._policy_client = None
+        self._last_probe = 0.0  # rebuild promptly, don't wait out the probe throttle
+        self._replay_paused = False  # a freshly picked episode plays from the start
+        self._set(policy_connected=False)
+
+    def set_replay_paused(self, paused: bool) -> None:
+        """Pause/resume a dataset replay -- a send-gate only (see _replay_paused). Pausing freezes
+        the episode cursor and lets the robot hold; resuming continues from the same frame. No
+        effect on a live policy."""
+        self._replay_paused = bool(paused)
+
+    @property
+    def replay_paused(self) -> bool:
+        return self._replay_paused
+
     def _connect_policy(self) -> None:
         if self.recorder_cfg.mock or self._policy is not None:
             self._set(policy_connected=True)
             return
-        if not self._policy_port_open():
-            raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
-        from yam_policy import ActionChunkBroker, WebsocketClientPolicy
 
-        client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
-        meta = client.get_server_metadata() or {}
+        if self.cfg.replay_mode:
+            # In-process dataset replay -- no server to reach, so no port check / websocket client.
+            # The dataset+episode are chosen on the run page (set_replay_source); until one is,
+            # there is nothing to build, which surfaces as an ordinary "not connected" state.
+            if not self.cfg.replay_dataset:
+                raise ConnectionError("select an episode to replay")
+            policy, meta = self._build_replay_policy()
+        else:
+            if not self._policy_port_open():
+                raise ConnectionError(f"policy server offline at {self.cfg.policy_host}:{self.cfg.policy_port}")
+            from yam_policy import ActionChunkBroker, AsyncChunkBroker, WebsocketClientPolicy
+
+            client = WebsocketClientPolicy(host=self.cfg.policy_host, port=self.cfg.policy_port)
+            meta = client.get_server_metadata() or {}
+            self._policy_client = client
+            if self.cfg.async_inference:
+                # Infer the next chunk while this one is still executing; the reply is spliced in
+                # at the inference delay, so the robot keeps moving through the chunk boundary.
+                policy = AsyncChunkBroker(
+                    client,
+                    rate_hz=self.cfg.rate_hz,
+                    margin_ticks=self.cfg.prefetch_margin_ticks,
+                    prefetch_ticks=self.cfg.prefetch_ticks,
+                )
+            else:
+                policy = ActionChunkBroker(client)
+
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
         self._extra_features = _extra_features_from_meta(meta)
@@ -258,8 +368,7 @@ class DeploymentPolicyRunner:
             )
         # No action_horizon here on purpose: the broker reads the chunk size off each
         # response, so a checkpoint's horizon can never disagree with a client setting.
-        self._policy_client = client
-        self._policy = ActionChunkBroker(client)
+        self._policy = policy
         self.cfg.image_keys = image_keys
         self._set(
             policy_connected=True,
@@ -315,13 +424,64 @@ class DeploymentPolicyRunner:
             self._extras = values
 
     def get_extras(self) -> Dict[str, "np.ndarray"]:
-        """The declared per-step extras from the most recent step, flattened."""
+        """The declared per-step extras from the most recent step, plus this step's provenance.
+
+        Read on the control thread immediately after the action is sent (see
+        Recorder.note_action_sent), so the values belong to the action being recorded.
+        """
         with self._lock:
-            return {k: v.copy() for k, v in self._extras.items()}
+            out = {k: v.copy() for k, v in self._extras.items()}
+            for name, value in self._timing.items():
+                out[PROVENANCE_PREFIX + name] = np.asarray([value], dtype=np.float32)
+        return out
 
     def extra_features(self) -> Dict[str, tuple]:
-        """``{name: per-step shape}`` the policy declared at handshake, empty until connected."""
-        return dict(self._extra_features)
+        """``{name: per-step shape}``: what the policy declared at handshake, plus provenance."""
+        features = dict(self._extra_features)
+        features.update({PROVENANCE_PREFIX + name: (1,) for name in PROVENANCE_FIELDS})
+        return features
+
+    def chunk_lengths(self) -> list:
+        """Length of every chunk the server has answered with recently, oldest first."""
+        with self._lock:
+            return list(self._chunk_lengths)
+
+    def _note_chunk(self) -> None:
+        """Record this reply's length, once per chunk.
+
+        The horizon is read off each reply rather than configured, so it can differ every replan;
+        `chunk_index` is what says a NEW reply arrived (the same length twice in a row is still two
+        entries). Works with either broker -- both expose the same two attributes.
+        """
+        index = getattr(self._policy, "chunk_index", None)
+        horizon = int(getattr(self._policy, "action_horizon", 0) or 0)
+        if index is None or index == self._last_chunk_index or horizon <= 0:
+            return
+        self._last_chunk_index = index
+        with self._lock:
+            self._chunk_lengths.append(horizon)
+
+    def _note_timing(self, wall_time: float) -> None:
+        """Record where the action just sent came from, so the dataset can be audited.
+
+        Without this a rollout says what was executed but not when it was decided: an action is
+        the k-th step of a chunk inferred from an observation `delay_ticks` earlier, and only
+        `chunk_index`/`step_in_chunk` distinguish "the policy reacted" from "the policy was still
+        executing a plan made a second ago". `wall_time` is the real send instant, so the true
+        cadence survives the dataset's uniform frame timestamps.
+        """
+        stats = getattr(self._policy, "stats", None)
+        got = stats() if callable(stats) else {}
+        timing = {name: float(got.get(name, 0.0)) for name in PROVENANCE_FIELDS if name != "wall_time"}
+        timing["wall_time"] = float(wall_time)
+        with self._lock:
+            self._timing = timing
+        if got:
+            self._set(
+                infer_ms=round(float(got.get("infer_ms", 0.0)), 1),
+                delay_ticks=int(got.get("delay_ticks", 0)),
+                underruns=int(got.get("underruns", 0)),
+            )
 
     def _image_shape_from_meta(self, meta: Dict) -> tuple[int, int]:
         image_shape = meta.get("image_shape")
@@ -336,14 +496,27 @@ class DeploymentPolicyRunner:
             t0 = time.monotonic()
             try:
                 if self.recorder_cfg.mock:
-                    self._set(robot_connected=True, policy_connected=True, streaming=False, last_error="")
+                    # No robot or policy server: simulate a live policy driving at the control rate,
+                    # so the record path runs end-to-end (headless/GUI wire on_action_sent ->
+                    # Recorder.note_action_sent). One synthetic send per tick == one eval frame,
+                    # exactly as a real rollout would produce -- a no-op unless armed in eval mode.
+                    self._set(robot_connected=True, policy_connected=True, streaming=True, last_error="")
+                    if self.on_action_sent is not None:
+                        self.on_action_sent(np.zeros(1, dtype=float))
                 else:
                     self._connect_robot()
                     obs = self._robot.get_observation()
                     should_stream = bool(obs.get("policy_running")) and not (
                         obs.get("intervention") or obs.get("homing") or obs.get("estop")
                     )
-                    if should_stream:
+                    if should_stream and self.cfg.replay_mode and self._replay_paused:
+                        # Paused replay: DON'T infer or send. The cursor stays put and the robot
+                        # holds its last command -- policy_running is untouched, so the robot side
+                        # runs none of its start/stop logic. `_was_streaming` is left as-is so
+                        # resuming does not count as a fresh rollout (no reset).
+                        self._connect_policy()
+                        self._set(streaming=False, last_error="")
+                    elif should_stream:
                         self._connect_policy()
                         if not self._was_streaming:
                             self._reset_policy_chunk()
@@ -352,7 +525,16 @@ class DeploymentPolicyRunner:
                             result = self._policy.infer(policy_obs)
                             action = result["actions"]
                             self._set_extras(result)
-                            self._robot.set_policy_action(self._split(np.asarray(action, dtype=float)))
+                            self._note_chunk()  # a new reply? record how many steps it carried
+                            action_vec = np.asarray(action, dtype=float).reshape(-1)
+                            self._robot.set_policy_action(self._split(action_vec))
+                            # Stamp where this action came from BEFORE the recorder captures the
+                            # frame -- note_action_sent reads get_extras() synchronously, so the
+                            # provenance written with the frame is this action's, not the previous.
+                            self._note_timing(time.time())
+                            # Log one eval frame for the action we just executed (1 frame == 1 send).
+                            if self.on_action_sent is not None:
+                                self.on_action_sent(action_vec)
                             self._set(
                                 streaming=True,
                                 last_error="",

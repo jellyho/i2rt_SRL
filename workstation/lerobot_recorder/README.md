@@ -12,7 +12,7 @@ Two tools (both have a PyQt GUI):
 | Tool | Module | What it does |
 |------|--------|--------------|
 | **Recorder** | `workstation.lerobot_recorder` | teleop-gated LeRobot capture + review/delete |
-| **Replay**   | `workstation.lerobot_recorder.replay_main` | play a dataset back onto the robot |
+| **Deploy / Replay** | `workstation.lerobot_recorder.deploy_main` | run a policy — or replay a dataset — on the robot (§C/§D) |
 
 ## Recording video backend
 
@@ -394,9 +394,10 @@ A `teleop` server ignores `set_policy_action` entirely, so deployment against it
 nothing — hence the startup check below.
 
 There is a third mode, `wrapper`: the followers track an external command with **no
-leader arms at all**, which is what `yam-data replay` drives. So the robot server has
-three controllers — `teleop`, `deploy`, `wrapper` — plus `robot/yam can` / `canup`,
-which are CAN-bus utilities rather than modes.
+leader arms at all**. Replay no longer needs it — replay now runs on the **deploy**
+controller (§D, an in-process `DatasetPolicy`) rather than a separate wrapper path. So the
+robot server has three controllers — `teleop`, `deploy`, `wrapper` — plus `robot/yam can` /
+`canup`, which are CAN-bus utilities rather than modes.
 
 ```bash
 # 1. [robot]    dagger server (policy drives followers; handle button = takeover)
@@ -421,22 +422,42 @@ workstation/yam-data deploy \
 Everything else is on the setup page, so plain `yam-data deploy` is enough. A run has two
 **independent** axes — recording a deployment is not the same thing as doing DAgger:
 
-**mode** — what you are here to do. This is what decides *leader mirroring*:
+**mode** — the action source, which also decides *leader mirroring*:
 
-* `deploy` — watch the policy work. The leader hangs **free**, so the handles do not fly
-  around while the arm moves.
+* `policy` (default) — watch a live policy work. The leader hangs **free**, so the handles do
+  not fly around while the arm moves.
 * `dagger` — correct the policy. The leader **mirrors** the follower, so grabbing a handle
   to take over starts from the arm's current pose.
+* `dataset` — replay a recorded episode instead of a live policy (§D). Watch-only.
 
 **record** — whether this run lands in a dataset. Off hides the dataset fields entirely;
 no dataset is created, opened, or resumed and no frames are buffered.
 
 | mode | record | source | what it is |
 |---|---|---|---|
-| deploy | off | `deploy` | just run a checkpoint and watch |
-| deploy | on | `eval` | log the run — Start/Stop collection bounds one episode |
+| policy | off | `deploy` | just run a checkpoint and watch |
+| policy | on | `eval` | log the run — Start/Stop collection bounds one episode |
 | dagger | on | `dagger` | one episode per rollout, ended with keep/discard |
 | dagger | off | `deploy` | practise takeovers, save nothing |
+| dataset | — | (n/a) | replay a recorded episode on the robot (watch-only, §D) |
+
+> **`eval` recording is send-driven: one frame per action executed.** A frame is captured at the
+> instant the runner sends an action to the robot — images, robot state, that action and the
+> policy's per-step extras all sampled together, right then. So the frame count equals the number
+> of actions the policy actually executed, and each frame is internally consistent. Ticks on which
+> nothing is sent (waiting for inference, a paused replay) contribute nothing, and since frames are
+> stamped by index/fps the remainder is contiguous. Capturing at send time rather than when the
+> record loop next runs is what stops a lagging loop from writing several sends against one stale
+> snapshot — that bug duplicated ~30% of frames and collapsed the first chunk to a single repeated
+> image. Teleop recording is unaffected: it has no inference wait, so every tick is fresh motion.
+>
+> **Every eval frame also carries its provenance** (`policy.chunk_index`, `policy.step_in_chunk`,
+> `policy.infer_ms`, `policy.delay_ticks`, `policy.wall_time`). An action is the k-th step of a
+> chunk inferred from an observation `delay_ticks` earlier, so these columns are what distinguish
+> "the policy reacted to this frame" from "the policy was still executing a plan made a second
+> ago" — and `wall_time` preserves the true send cadence, which the dataset's uniform frame
+> timestamps otherwise erase. They are added by the runner, so they appear whether or not the
+> policy declares extras of its own.
 
 Mirroring follows the mode automatically, and the collect-page checkbox overrides it live
 (it is the one setting worth changing mid-rollout). `--mode` / `--no-record` /
@@ -496,31 +517,38 @@ where it fails → retrain.
 
 ## D. Replay a dataset onto the robot
 
-Replay is deployment with the actions read from a dataset, so it runs on **the deploy stack** —
-same robot server, same UI, same safeguards. There is no `wrapper` server and no separate GUI.
+Replay differs from deployment in exactly one thing — where the actions come from — so it is **not
+a separate tool**: it is a **mode** of `yam-data deploy`. The setup page's `mode` picker has three
+action sources: **policy** (default, a live policy), **dagger** (correct it), and **dataset**
+(replay a recording). Pick `dataset`, Start, then choose the episode on the run page's
+past-demonstration panel — that episode drives the robot.
 
 ```bash
-# 1. [policy]  serve the episode
-python -m yam_policy.serve \
-    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
-    --config root=~/lerobot_data/yam_pick --config episode=3
-
-# 2. [robot]
-robot/yam canup && robot/yam deploy
-
-# 3. [workstation]
-workstation/yam-data deploy --robot-host <ROBOT_IP> --policy-host <POLICY_IP>
+robot/yam canup && robot/yam deploy          # [robot] the SAME deploy server (no `wrapper`)
+workstation/yam-data deploy                  # [workstation] set mode = dataset, pick an episode
 ```
 
-- The **past-demonstration overlay** follows the replay automatically: same episode, at the rate
-  it was recorded, paused whenever the rollout is not streaming.
-- Everything deployment has applies — takeover, e-stop, the follower smoother (so there is no
-  separate ramp to the first frame), the link-loss watchdog. Replay is not a path around them.
-- `--config speed=2` / `speed=0.5` / `loop=true`; see
-  [`policy_serving/README.md`](../../policy_serving/README.md).
-
-The standalone `workstation/yam-data replay` GUI is still there for scrubbing a dataset with no
-robot (`--mock` for no robot at all).
+- **No policy server, no websocket, no subprocess.** The runner builds an in-process
+  `DatasetPolicy` (reads the episode's actions straight from the parquet) and wraps it exactly like
+  any policy, so every safeguard still applies — takeover, e-stop, the follower smoother, the
+  link-loss watchdog. Replay is not a path around them.
+- The **episode is chosen on the run page**, in the same past-demonstration panel that draws the
+  overlay — one place to pick, and switching episodes just re-points the in-process replay (from
+  frame 0). If there is no dataset under the session root, there is nothing to replay and Start
+  says so.
+- The rollout button is **Start Replay → Pause / Resume**. Pause/resume is a pure send-gate on the
+  workstation: paused, the runner stops sending actions and the robot just holds its last command
+  (the controller's command-timeout hold); resume continues from the same frame. `policy_running`
+  is never toggled, so the robot side runs none of its start/stop logic (nothing closes the
+  gripper on resume — the recorded actions drive it).
+- The past-demonstration overlay **plays in lock-step with the rollout**: it runs at the arm's
+  frame rate (one recorded frame per control tick), freezes when you pause, and rewinds to the
+  first frame when you stop/home (rather than freezing mid-trajectory). The decoder can't seek, so
+  this is a rate match, not a per-frame lock — over a long episode the two can drift if the control
+  loop can't sustain the rate.
+- `dataset` mode is **watch-only and not recorded** (leader free, no dataset written). There is no
+  separate replay tool — it lives entirely inside `deploy`.
+- Speed/loop live on `DatasetPolicy` (`policy_serving/yam_policy/policies/dataset_policy.py`).
 
 ## E. Render the predicted path onto the cameras (offline)
 

@@ -6,16 +6,18 @@ the live cameras / e-stop / health strip come from the expert recorder GUI.
 A run is described by **two independent choices** on the setup page, because recording a
 deployment is not the same thing as doing DAgger:
 
-* **mode** — what you are here to do, which is what decides *leader mirroring*:
+* **mode** — the action source, which also decides *leader mirroring*:
 
-  - ``Deploy`` — watch the policy work. The leader hangs free, so the handles do not fly
-    around while the arm moves.
-  - ``DAgger`` — correct the policy. The leader mirrors the follower, so grabbing a handle
-    to take over starts from the arm's current pose instead of yanking it somewhere else.
+  - ``policy`` (default) — watch a live policy work. The leader hangs free, so the handles do
+    not fly around while the arm moves.
+  - ``dagger`` — correct the policy. The leader mirrors the follower, so grabbing a handle to
+    take over starts from the arm's current pose instead of yanking it somewhere else.
+  - ``dataset`` — replay a recorded dataset (actions from a chosen episode instead of a live
+    policy). Pick the episode on the run page's past-demonstration panel; watch-only.
 
-* **record** — whether this run lands in a dataset. Independent of mode: you may want the
-  data from a plain deployment (an eval run) and you may want to practise takeovers
-  without saving anything.
+* **record** — whether this run lands in a dataset. Independent of mode (except ``dataset``,
+  which is watch-only): you may want the data from a plain deployment (an eval run) and you
+  may want to practise takeovers without saving anything.
 
 The two combine into the recorder's ``record_source``; all four cells are ordinary,
 already-supported behaviour:
@@ -43,6 +45,7 @@ import logging
 from PyQt5 import QtGui, QtWidgets
 
 from workstation.lerobot_recorder import theme
+from workstation.lerobot_recorder.chunk_plot import ChunkLengthPlot
 from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.gui import PickerComboBox, RecorderGUI
 from workstation.policy_bridge.config import BridgeConfig
@@ -54,33 +57,44 @@ logger = logging.getLogger(__name__)
 class DeployGUI(RecorderGUI):
     SETTINGS_SCOPE = "deploy"
 
-    #: (mode, record) -> recorder record_source. Deployment never uses "teleop": no engage
-    #: gate is involved when a policy is driving the followers.
+    #: Action source (mode) x record -> the recorder's record_source. The VALUES ("deploy"/"eval"/
+    #: "dagger") are recorder concepts and stay; only the mode KEYS name the action source:
+    #: "policy" (watch a live policy), "dagger" (correct it), "dataset" (replay a recording).
     SOURCES = {
-        ("deploy", False): "deploy",
-        ("deploy", True): "eval",
+        ("policy", False): "deploy",
+        ("policy", True): "eval",
         ("dagger", False): "deploy",
         ("dagger", True): "dagger",
+        # dataset replay is watch-only and never records, so its record source is moot ("deploy").
+        ("dataset", False): "deploy",
+        ("dataset", True): "deploy",
     }
     #: Mirroring is a property of the MODE, not of recording — it exists so a takeover
     #: starts from the arm's pose, which is the point of DAgger and pointless when you are
     #: only watching. Picking a mode re-applies this; the collect-page checkbox overrides
-    #: it until the mode changes again.
-    MIRROR_BY_MODE = {"deploy": False, "dagger": True}
+    #: it until the mode changes again. policy/dataset are watch-only: leader free.
+    MIRROR_BY_MODE = {"policy": False, "dagger": True, "dataset": False}
 
     def __init__(
         self,
         cfg: RecorderConfig,
         bridge_cfg: BridgeConfig,
         *,
-        mode: str = "dagger",
+        mode: str = "policy",
         record: bool = True,
         leader_mirror: bool | None = None,
     ) -> None:
         self.bridge_cfg = bridge_cfg
         self.runner: DeploymentPolicyRunner | None = None
-        mode = mode if mode in self.MIRROR_BY_MODE else "dagger"
+        mode = mode if mode in self.MIRROR_BY_MODE else "policy"
         cfg.record_source = self.SOURCES[(mode, bool(record))]
+        # Eval recording is send-driven: one frame per action the runner pushes to the robot, at the
+        # bridge control rate. The dataset fps must be that send rate, NOT the 60 Hz camera loop --
+        # otherwise ~30 Hz frames get 60 fps timestamps and the recording plays back at ~2x. (The
+        # record loop drains the whole send queue each tick, so 1 frame == 1 action holds regardless
+        # of the loop rate; this only fixes the timestamps.)
+        if cfg.record_source == "eval":
+            cfg.fps = max(1, round(bridge_cfg.rate_hz))
         super().__init__(cfg)
         self.setWindowTitle("YAM · Policy Deployment")
 
@@ -92,11 +106,15 @@ class DeployGUI(RecorderGUI):
         self._set_form_row_visible(self.source_combo, False)
 
         self.mode_combo = PickerComboBox()
-        self.mode_combo.addItems(["deploy", "dagger"])
+        # "policy" is the default; "dataset" sources the actions from a recorded dataset instead of
+        # a live policy -- the episode is picked on the run page's reference panel.
+        self.mode_combo.addItems(["policy", "dagger", "dataset"])
         self.mode_combo.setToolTip(
-            "deploy: watch the policy work — the leader hangs free.\n"
+            "policy: watch a live policy work — the leader hangs free.\n"
             "dagger: correct the policy — the leader mirrors the follower so a takeover "
-            "starts from the arm's current pose."
+            "starts from the arm's current pose.\n"
+            "dataset: drive the robot from a recorded dataset (pick the episode on the run page); "
+            "watch-only, nothing recorded."
         )
         self.mode_combo.setCurrentText(mode)
         self.mode_combo.currentTextChanged.connect(lambda *_: self._sync_run_mode())
@@ -128,7 +146,7 @@ class DeployGUI(RecorderGUI):
 
     @property
     def run_mode(self) -> str:
-        """ "deploy" (watch) or "dagger" (correct) — the axis that decides mirroring."""
+        """ "policy" (watch), "dagger" (correct), or "dataset" (replay a recording)."""
         return self.mode_combo.currentText()
 
     def _sync_run_mode(self) -> None:
@@ -139,6 +157,15 @@ class DeployGUI(RecorderGUI):
         dagger (in eval the episode is accepted from the review panel after Stop
         collection, not from a handle button)."""
         mode = self.run_mode
+        # Replay is watch-only: no recording is possible, so the record checkbox is forced off and
+        # disabled. `replay_mode` tells the runner to source actions from a dataset (the specific
+        # episode is chosen on the run page's reference panel -> set_replay_source).
+        replaying = mode == "dataset"
+        self.bridge_cfg.replay_mode = replaying
+        self.record_check.setEnabled(not replaying)
+        if replaying and self.record_check.isChecked():
+            self.record_check.setChecked(False)  # re-enters here with recording False
+            return
         recording = self.record_check.isChecked()
         source = self.SOURCES[(mode, recording)]
         self.cfg.record_source = source
@@ -150,16 +177,39 @@ class DeployGUI(RecorderGUI):
 
         for widget in (
             self.repo_combo,
-            self.root_edit,
             self.resume_check,
             self.rl_check,
             self.reward_combo,
             self.discount_spin,
         ):
             self._set_form_row_visible(widget, recording)
+        # `root` is the datasets folder, and it is needed in EVERY deploy mode -- not just when
+        # recording. It is where the run page's reference panel lists past demonstrations from, and
+        # that panel is the overlay in policy/dagger (and the action source in dataset replay). A
+        # watch-only policy run still overlays a demonstration, so hiding the field there left no
+        # way to point the overlay at the datasets folder holding them.
+        self._set_form_row_visible(self.root_edit, True)
+        self.root_edit.setToolTip(
+            "Folder holding one subfolder per dataset.\n"
+            + (
+                "New episodes are written here, and the run page's past-demonstration "
+                "overlay lists demonstrations from here."
+                if recording
+                else "The run page's past-demonstration panel lists episodes from here — "
+                + ("the one to replay." if replaying else "the one to overlay on the live view.")
+            )
+        )
         self.review_box.setVisible(recording and self.cfg.review_before_save)
         self.collect_btn.setVisible(recording)
         self.save_btn.setVisible(recording)
+        # The past-demonstration panel's playback ("Resume reference") and "Refresh demonstrations"
+        # buttons are not useful in deployment: in policy/dagger the panel is just a first-frame
+        # alignment overlay, and in replay the episode is chosen from the LIST while the ghost
+        # auto-follows the rollout (_sync_replay_overlay) and the dataset list is refreshed on Start.
+        # So hide both in every deploy mode.
+        for btn in (getattr(self, "reference_pause_btn", None), getattr(self, "reference_refresh_btn", None)):
+            if btn is not None:
+                btn.setVisible(False)
         self.keep_home_btn.setVisible(per_rollout_verdict)
         self.discard_home_btn.setText("Discard + Home" if per_rollout_verdict else "Stop + Home")
         self.dagger_box.setTitle(
@@ -188,6 +238,10 @@ class DeployGUI(RecorderGUI):
                 + ("" if recording else " Nothing is recorded.")
             )
         )
+        # Recording just changed -> refresh the dataset line so a watch-only run stops warning
+        # about overwriting (see _will_record).
+        if hasattr(self, "setup_status"):
+            self._update_setup_status()
 
     def _on_mirror_toggled(self, flag: bool) -> None:
         """Apply live: the operator may want the handles to stop moving mid-session."""
@@ -249,14 +303,20 @@ class DeployGUI(RecorderGUI):
             "border-radius:8px;padding:10px 12px;font-weight:600;"
         )
 
+        # How many steps each reply carried. The horizon is read off every reply rather than
+        # configured, so it can change per replan -- and it decides how often the policy is
+        # re-queried (and, running synchronously, how often the arm stalls).
+        self.chunk_plot = ChunkLengthPlot()
+
         grid.addWidget(self.dagger_state, 0, 0, 1, 4)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
         grid.addWidget(self.keep_home_btn, 1, 2)
         grid.addWidget(self.discard_home_btn, 1, 3)
         grid.addWidget(self.mirror_check, 2, 0, 1, 4)
-        grid.addWidget(self.button_legend, 3, 0, 1, 4)
-        grid.addWidget(self.runner_status, 4, 0, 1, 4)
+        grid.addWidget(self.chunk_plot, 3, 0, 1, 4)
+        grid.addWidget(self.button_legend, 4, 0, 1, 4)
+        grid.addWidget(self.runner_status, 5, 0, 1, 4)
 
         lay = page.layout()
         if isinstance(lay, QtWidgets.QVBoxLayout):
@@ -268,10 +328,20 @@ class DeployGUI(RecorderGUI):
         """True when this run records nothing — regardless of which mode it is in."""
         return not self.record_check.isChecked()
 
+    def _will_record(self) -> bool:
+        """A deploy run writes a dataset only when 'Record this run' is on (dataset-replay mode
+        forces it off). Drives the setup status so it never warns about overwriting in a
+        watch-only run -- START skips the whole dataset negotiation there anyway."""
+        return bool(getattr(self, "record_check", None) is not None and self.record_check.isChecked())
+
     def _on_start(self) -> None:
         self.source_combo.setCurrentText("deploy" if self.deploy_only else "dagger")
         self.bridge_cfg.prompt = self.task_combo.currentText().strip()
         super()._on_start()
+        # Re-list the past-demonstration datasets from the (now-applied) root, so replay can pick an
+        # episode without a manual "Refresh demonstrations" button (which is hidden -- see _sync_run_mode).
+        if self.recorder is not None:
+            self._refresh_reference_datasets()
         if self.recorder is not None:
             # Push the mirror choice once the link exists; the bridge latches it and
             # re-applies on reconnect, so the robot never silently reverts to its default.
@@ -283,6 +353,9 @@ class DeployGUI(RecorderGUI):
             self.runner.on_connected = lambda: self.recorder.set_extra_features(
                 self.runner.extra_features(), self.runner.get_extras
             )
+            # Record exactly one eval frame per action the runner sends (frames == executed actions).
+            # A no-op unless armed in eval mode, so it is harmless in policy-watch / dagger / dataset.
+            self.runner.on_action_sent = self.recorder.note_action_sent
             self.runner.start()
 
     @property
@@ -294,23 +367,49 @@ class DeployGUI(RecorderGUI):
         session quietly fills up with episodes in which nothing ever acted."""
         return bool(self.runner is not None and self.runner.get_status().get("policy_connected"))
 
+    def _on_reference_selected(self, row: int) -> None:
+        """Selecting an episode in the past-demonstration panel also points the REPLAY source at it
+        (when in replay mode) -- the overlay dataset+episode IS the action source, so there is one
+        place to pick, not two. In deploy/dagger this just drives the overlay, as before."""
+        super()._on_reference_selected(row)
+        if self.run_mode == "dataset" and self.runner is not None and 0 <= row < len(self._reference_episodes):
+            episode = self._reference_episodes[row]
+            self.runner.set_replay_source(self.reference_dataset_combo.currentText().strip(), episode.episode)
+
     def _on_policy_toggle(self) -> None:
         if self.recorder is None:
             return
         st = self.recorder.get_status()
         running = bool(st.get("policy_running"))
+        # In replay, once it is running the toggle is PAUSE/RESUME -- a pure send-gate on the runner
+        # (the robot holds while paused). policy_running is left on, so the robot side never runs its
+        # start/stop logic (no gripper close on resume). Starting/stopping the run is the other
+        # branch below (the first press starts it; homing/e-stop stops it).
+        if self.run_mode == "dataset" and running and self.runner is not None:
+            self.runner.set_replay_paused(not self.runner.replay_paused)
+            return
         if not running and not self.policy_ready:
             err = (self.runner.get_status().get("last_error") if self.runner else "") or "not connected yet"
-            QtWidgets.QMessageBox.warning(
-                self,
-                "No policy",
-                f"The policy server at {self.bridge_cfg.policy_host}:{self.bridge_cfg.policy_port} "
-                f"is not connected ({err}).\n\n"
-                "Starting now would open an episode that no policy ever drives — the arms "
-                "would sit still and the rollout would be recorded anyway.\n\n"
-                "Start the policy server first; this reconnects on its own.",
-            )
+            if self.run_mode == "dataset":
+                title, body = (
+                    "No episode to replay",
+                    "Pick an episode in the past-demonstration panel first — that dataset episode "
+                    "is what drives the robot in replay mode. If the list is empty, there is no "
+                    "dataset under the session root to replay.",
+                )
+            else:
+                title, body = (
+                    "No policy",
+                    f"The policy server at {self.bridge_cfg.policy_host}:{self.bridge_cfg.policy_port} "
+                    f"is not connected ({err}).\n\n"
+                    "Starting now would open an episode that no policy ever drives — the arms "
+                    "would sit still and the rollout would be recorded anyway.\n\n"
+                    "Start the policy server first; this reconnects on its own.",
+                )
+            QtWidgets.QMessageBox.warning(self, title, body)
             return
+        if self.run_mode == "dataset" and self.runner is not None:
+            self.runner.set_replay_paused(False)  # (re)starting a replay plays, not paused
         self.recorder.set_policy_running(not running)
 
     def _on_intervention_toggle(self) -> None:
@@ -325,6 +424,8 @@ class DeployGUI(RecorderGUI):
 
     def _refresh(self) -> None:
         super()._refresh()
+        if self.runner is not None:
+            self.chunk_plot.set_values(self.runner.chunk_lengths())
         if self.recorder is not None:
             self._update_dagger_controls(self.recorder.get_status())
 
@@ -365,7 +466,7 @@ class DeployGUI(RecorderGUI):
         else:
             super()._update_health(st)
         runner = self.runner.get_status() if self.runner is not None else {}
-        self._sync_replay_overlay(runner)
+        self._sync_replay_overlay(runner, st)
         pol = theme.dot(bool(runner.get("policy_connected")))
         stream = "streaming" if runner.get("streaming") else "idle"
         err = runner.get("last_error") or ""
@@ -382,35 +483,40 @@ class DeployGUI(RecorderGUI):
         self.health.setText(self.health.text() + extra)
 
     # ------------------------------------------------------------- replay overlay
-    def _sync_replay_overlay(self, runner: dict) -> None:
-        """Point the past-demonstration overlay at the episode a replay server is driving.
+    def _sync_replay_overlay(self, runner: dict, st: dict) -> None:
+        """Play the past-demonstration overlay in lock-step with the replayed rollout.
 
-        Replay is deployment with the actions read from a dataset, so it arrives here as an
-        ordinary policy server — which means the overlay would otherwise sit on whatever the
-        operator last picked, at the low preview rate, while the arm reproduces something else.
-        The handshake already says which dataset and episode, so this selects it and matches
-        the recorded rate; playback then follows the rollout.
-
-        Only touched when the answer changes, so an operator who deliberately picks a different
-        reference keeps it until the replay target itself moves.
+        The ghost plays at the ARM's frame rate -- one recorded frame per control tick
+        (``bridge_cfg.rate_hz``), NOT the recording's raw fps, which would run ahead of the arm.
+        It follows the rollout: playing while streaming, frozen while paused (matching the arm's
+        hold), and rewound to the first frame when the rollout is stopped/homed instead of left
+        frozen mid-trajectory. The decoder can't seek, so this is a rate match, not a per-frame
+        lock; if the control loop can't sustain rate_hz the two can still drift over a long episode.
+        Only in replay -- for a live policy there is nothing to line the ghost up to.
         """
         if runner.get("policy_framework") != "dataset-replay":
             self._replay_overlay_key = None
+            self._replay_overlay_running = False
             return
 
         dataset, episode = runner.get("replay_dataset") or "", int(runner.get("replay_episode", -1))
         key = (dataset, episode)
         if dataset and episode >= 0 and key != getattr(self, "_replay_overlay_key", None):
             self._replay_overlay_key = key
-            fps = float(runner.get("replay_fps") or 0.0)
-            if fps > 0:
-                self._reference_player.set_rate(fps)
-            self._select_reference_episode(dataset, episode)
+            self._reference_player.set_rate(max(1.0, float(self.bridge_cfg.rate_hz)))
+            self._select_reference_episode(dataset, episode)  # (re)start at the first frame, paused
+            self._replay_overlay_running = False
+        if self._reference_player.episode is None:
+            return
 
-        # The reference plays exactly while the arm does, so the two stay together through a
-        # human takeover as well: intervention stops the stream, and the video stops with it.
-        if self._reference_player.episode is not None:
+        if bool(st.get("policy_running")):
+            # Playing or send-gate-paused: follow the arm -- run while streaming, freeze otherwise.
             self._reference_player.set_paused(not bool(runner.get("streaming")))
+            self._replay_overlay_running = True
+        elif getattr(self, "_replay_overlay_running", False):
+            # Stopped/homed: rewind the ghost to the first frame rather than leave it mid-trajectory.
+            self._replay_overlay_running = False
+            self._select_reference_episode(dataset, episode)
 
     def _select_reference_episode(self, dataset: str, episode: int) -> None:
         """Choose `dataset`/`episode` in the overlay panel, if it is there to choose."""
@@ -430,7 +536,7 @@ class DeployGUI(RecorderGUI):
         if row is None:
             self.reference_status.setText(f"Replaying episode {episode}; it has no completed video to overlay.")
             return
-        self.reference_list.setCurrentRow(row)
+        self.reference_list.setCurrentIndex(row)
 
     def _update_stats(self, st: dict) -> None:
         if self.deploy_only:
@@ -450,7 +556,12 @@ class DeployGUI(RecorderGUI):
         intervention = bool(st.get("intervention"))
         homing = bool(st.get("homing"))
         blocked = homing or bool(st.get("estop"))
-        self.policy_btn.setText("Stop Policy" if running else "Start Policy")
+        if self.run_mode == "dataset":
+            # In replay the button starts the run, then pauses/resumes it (a send-gate).
+            paused = bool(self.runner is not None and self.runner.replay_paused)
+            self.policy_btn.setText("Start Replay" if not running else ("Resume" if paused else "Pause"))
+        else:
+            self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
         self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")

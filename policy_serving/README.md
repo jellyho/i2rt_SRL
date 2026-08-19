@@ -149,8 +149,13 @@ Nothing in LeRobot is modified or vendored; the adapter is one file on this side
 
 ## Replaying a recorded episode
 
-Replay is deployment with the actions read from a dataset instead of a model, so it runs on the
-deploy stack rather than a parallel one:
+Replay is deployment with the actions read from a dataset instead of a model. The normal way to
+run it is the deploy GUI's **`dataset` mode**, which builds `DatasetPolicy` **in-process** — no
+server to start: set `mode = dataset` in `workstation/yam-data deploy` and pick the episode on the
+run page (see `workstation/lerobot_recorder/README.md` §D).
+
+`DatasetPolicy` is also an ordinary servable policy, if you want to drive a plain deploy client
+from another machine:
 
 ```bash
 python -m yam_policy.serve \
@@ -158,7 +163,7 @@ python -m yam_policy.serve \
     --config root=~/lerobot_data/yam_cable_tie_v4 --config episode=3
 
 robot/yam deploy                 # the SAME robot server deployment uses -- not `wrapper`
-workstation/yam-data deploy      # the same UI: live cameras, e-stop, takeover
+workstation/yam-data deploy      # connect as a live policy
 ```
 
 | `--config` | |
@@ -169,15 +174,14 @@ workstation/yam-data deploy      # the same UI: live cameras, e-stop, takeover
 | `loop` | start again at frame 0 instead of holding at the end |
 | `chunk` | actions per reply (default 30) |
 
-What that inherits, none of which the old replay had: the follower smoother and joint-speed
-clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle button,
-the network e-stop, the link-loss watchdog, leader mirroring, and the option to record the
-replayed run as a dataset of its own.
+What replay inherits, none of which the old standalone replay had: the follower smoother and
+joint-speed clamp (so there is no hand-rolled ramp to the first frame), human takeover on a handle
+button, the network e-stop, the link-loss watchdog, and pause/resume as a send-gate.
 
-**The past-demonstration overlay follows along.** The handshake carries `replay_dataset`,
-`replay_episode` and `replay_fps`, so the deploy GUI selects that episode, plays it at the rate
-it was recorded at, and pauses it whenever the rollout is not streaming — including during a
-human takeover.
+The deploy GUI plays the replayed episode's video as an overlay in lock-step with the rollout
+(at the arm's frame rate; freezes on pause, rewinds on stop). The decoder can't seek, so it is a
+rate match rather than a per-frame lock — over a long episode the ghost and the arm can drift if
+the control loop can't sustain the rate.
 
 **Only the action column is read**, straight from the parquet: no video decoding, no `lerobot`
 dependency, and a 100-episode dataset opens in about a tenth of a second.
@@ -206,12 +210,35 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
   when it runs out — so a 30-step chunk means one inference per second at 30 Hz rather than
   thirty. It takes the chunk size from what the policy returns, so a checkpoint trained at 30
   cannot be silently truncated by a client configured for 16.
-- There is no prefetching variant. One existed, starting the next inference two steps early on
-  the observation available then; measured, its freshness came out a wash against the
-  synchronous version — it started early by the same margin it was stale by — and it cost the
-  guarantee that a chunk was computed from the observation the caller actually handed over.
-  The price is a stall at each chunk boundary, which is what openpi's and LeRobot's own
-  brokers do as well.
+- **AsyncChunkBroker** is the overlapped variant: it starts the next inference in the background
+  once the chunk in hand is down to its last few steps, so the control loop keeps sending an
+  action every tick instead of freezing for a full round-trip at each chunk boundary. The reply
+  is spliced in at index `d = steps consumed since the request` — the actions it predicted for
+  ticks already executed are dropped — so nothing is ever executed twice. `d` is the inference
+  delay; it is what RTC calls by that name, and `leftover()` (the unexecuted tail of the chunk in
+  hand) is the prefix RTC's guidance inpaints against, so the client side of RTC is already here
+  and only the server's prefix-guided sampling is missing (hook: `set_prefix_fn`).
+
+  ```python
+  from yam_policy import AsyncChunkBroker
+  policy = AsyncChunkBroker(client, rate_hz=30.0)   # prefetch sized from measured latency
+  ```
+
+  The trade is explicit, not free: synchronous inference guarantees a chunk was computed from the
+  observation the caller just handed over, and async does not — each chunk begins executing `d`
+  ticks after the observation it came from. What it buys is that the robot never physically stops.
+  With a synchronous broker the arm dead-stops for the whole inference at every chunk boundary
+  (the controller holds its last target), which is a real artifact in the motion, not just in the
+  recording.
+
+  **Synchronous is the default** (`ActionChunkBroker`, what openpi's and LeRobot's own brokers do),
+  because evaluation is the default use and it is the stricter thing to measure: the rollout says
+  exactly what the policy did with what it saw, with no delay confound. Opt into async per run with
+  `yam-data deploy --async-inference`, or `async_inference=True` in `BridgeConfig`. Note the stall
+  ticks are not recorded either way — the loop is blocked inside `infer()`, so no action is sent
+  and (recording being send-driven) no frame is captured; the stop is in the robot's motion, not in
+  the dataset. If the server is slower than the chunk it predicts, prefetch cannot hide it either:
+  the loop blocks as before and the underrun is counted (`stats()["underruns"]`) rather than hidden.
 - **Metadata-driven config**: declare `action_horizon` (and optionally an
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from

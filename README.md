@@ -149,30 +149,23 @@ python -m yam_policy.serve \
 
 ### D · Replay a dataset onto the robot
 
-Replay is deployment with the actions read from a dataset, so it runs on the same three
-processes — **no `wrapper` server, no separate GUI**:
-
-```bash
-# 🧠 serve the episode as a policy
-python -m yam_policy.serve \
-    --policy yam_policy.policies.dataset_policy:DatasetPolicy \
-    --config root=~/lerobot_data/yam_pick --config episode=3
-```
+Replay is deployment with the actions read from a dataset, so it is **not a separate tool** — it
+is the `dataset` **mode** of `yam-data deploy` (no `wrapper` server, no policy server, no separate
+GUI):
 
 ```bash
 robot/yam canup && robot/yam deploy   # 🤖 robot — the deploy server, as usual
-workstation/yam-data deploy           # 💻 workstation — the deploy UI, as usual
+workstation/yam-data deploy           # 💻 workstation — set mode = dataset, pick an episode
 ```
 
-- The **past-demonstration overlay** follows the replay: same episode, played at the rate it
-  was recorded at, paused whenever the rollout is not streaming.
-- Takeover, e-stop, the follower smoother and the link-loss watchdog all apply — replay is not
-  a path around them.
-- `--config speed=2` / `speed=0.5` / `loop=true` change playback; see
-  [`policy_serving/README.md`](policy_serving/README.md).
-
-The standalone `workstation/yam-data replay` GUI still exists for scrubbing a dataset without a
-robot.
+- Set `mode = dataset`, Start, then pick the episode on the run page's past-demonstration panel —
+  the runner builds an **in-process `DatasetPolicy`** (reads the actions from the parquet) so
+  takeover, e-stop, the follower smoother and the link-loss watchdog all apply.
+- The rollout button is **Start Replay → Pause / Resume**: pause is a send-gate (the robot holds,
+  nothing on the robot side toggles, so the gripper is never snapped shut on resume).
+- The past-demonstration overlay **plays along with the rollout** (at the arm's frame rate),
+  freezes on pause, and rewinds to the first frame on stop/home. Watch-only; nothing is recorded.
+- `speed` / `loop` live on `DatasetPolicy`; see [`policy_serving/README.md`](policy_serving/README.md).
 
 > Full hardware bring-up checklist: [`docs/hardware-checklist.md`](docs/hardware-checklist.md).
 

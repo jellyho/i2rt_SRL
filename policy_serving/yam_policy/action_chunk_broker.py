@@ -102,11 +102,24 @@ class ActionChunkBroker(BasePolicy):
         self._chunk = 0  # length of the chunk in hand; 0 = nothing cached
         self._chunked = True
         self._last_results: Dict | None = None
+        self._chunk_index = -1
 
     @property
     def action_horizon(self) -> int:
         """The chunk size last observed (0 before the first inference)."""
         return self._chunk
+
+    @property
+    def chunk_index(self) -> int:
+        """How many chunks have been served, minus one (-1 before the first).
+
+        Together with :attr:`action_horizon` this is what a caller watches to record the length of
+        every reply: the chunk is adaptive, so a policy may answer with a different number of steps
+        each replan, and the only place that length exists is the reply itself. Same name and
+        meaning on :class:`~yam_policy.async_chunk_broker.AsyncChunkBroker`, so a caller does not
+        care which broker it holds.
+        """
+        return self._chunk_index
 
     def infer(self, obs: Dict) -> Dict:
         if self._last_results is None:
@@ -114,6 +127,7 @@ class ActionChunkBroker(BasePolicy):
             self._chunk = chunk_len(self._last_results)
             self._chunked = is_chunked(self._last_results)
             self._cur_step = 0
+            self._chunk_index += 1
 
         results = _slice_step(self._last_results, self._cur_step) if self._chunked else self._last_results
 
@@ -126,4 +140,5 @@ class ActionChunkBroker(BasePolicy):
     def reset(self) -> None:
         self._last_results = None
         self._cur_step = 0
+        self._chunk_index = -1  # same as AsyncChunkBroker: a new rollout numbers its chunks afresh
         self._policy.reset()

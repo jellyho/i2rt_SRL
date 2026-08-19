@@ -27,6 +27,39 @@ class BridgeConfig:
     # draws under `action_samples` and the viewer can show the spread -- which costs N forward
     # passes, so it is a deliberate inspection mode rather than something a rollout leaves on.
     num_samples: int = 0
+
+    # Overlap inference with execution (AsyncChunkBroker): the next chunk is inferred on a
+    # background thread while the current one is still being executed, so the control loop keeps
+    # sending an action every tick instead of freezing for a round-trip at every chunk boundary --
+    # which is what makes the arm dead-stop about once a second. The reply is spliced in at the
+    # index matching the inference delay, so nothing is executed twice.
+    #
+    # OFF by default, because evaluation is the default use and synchronous inference is the
+    # stricter thing to measure: every chunk is computed from the observation the runner just
+    # handed over, so a rollout says exactly what the policy did with what it saw. Async trades
+    # that for continuous motion -- a chunk starts executing `delay_ticks` after the observation
+    # it came from -- which is the better deployment behaviour but a confound in an eval.
+    async_inference: bool = False
+    # Steps of chunk that must remain before the next inference is started. 0 = derive it from the
+    # measured latency (recommended: it adapts to the server and the network on its own).
+    prefetch_ticks: int = 0
+    # Extra ticks of headroom on top of the measured latency when prefetch_ticks is 0.
+    prefetch_margin_ticks: int = 2
+
+    # Replay source: when `replay_mode` is on, the deploy stack drives the robot from a recorded
+    # dataset instead of a live policy server -- an in-process DatasetPolicy (no server, no
+    # websocket, no subprocess) wrapped exactly like any policy, so every deployment safeguard
+    # (smoother, e-stop, takeover, overlay) still applies. The specific `replay_dataset` (folder
+    # name under the recorder root) + `replay_episode` are chosen on the run page's reference panel
+    # and pushed in via DeploymentPolicyRunner.set_replay_source; until one is chosen the policy
+    # simply is not connected ("select an episode to replay"). `replay_mode` on with no dataset
+    # yet is the waiting state; `replay_mode` off is a live policy.
+    replay_mode: bool = False
+    replay_dataset: str = ""
+    replay_episode: int = 0
+    replay_speed: float = 1.0
+    replay_loop: bool = False
+
     image_keys: Dict[str, str] = field(
         default_factory=lambda: {
             "agentview": "observation/image",
