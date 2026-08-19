@@ -31,10 +31,15 @@ class BridgeConfig:
     # Overlap inference with execution (AsyncChunkBroker): the next chunk is inferred on a
     # background thread while the current one is still being executed, so the control loop keeps
     # sending an action every tick instead of freezing for a round-trip at every chunk boundary --
-    # which is what made the arm dead-stop about once a second in every rollout. The reply is
-    # spliced in at the index matching the inference delay, so nothing is executed twice.
-    # Turn off to get the old synchronous behaviour (one stall per chunk) for comparison.
-    async_inference: bool = True
+    # which is what makes the arm dead-stop about once a second. The reply is spliced in at the
+    # index matching the inference delay, so nothing is executed twice.
+    #
+    # OFF by default, because evaluation is the default use and synchronous inference is the
+    # stricter thing to measure: every chunk is computed from the observation the runner just
+    # handed over, so a rollout says exactly what the policy did with what it saw. Async trades
+    # that for continuous motion -- a chunk starts executing `delay_ticks` after the observation
+    # it came from -- which is the better deployment behaviour but a confound in an eval.
+    async_inference: bool = False
     # Steps of chunk that must remain before the next inference is started. 0 = derive it from the
     # measured latency (recommended: it adapts to the server and the network on its own).
     prefetch_ticks: int = 0

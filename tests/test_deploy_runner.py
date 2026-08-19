@@ -410,3 +410,11 @@ def test_provenance_is_present_even_when_the_policy_declares_no_extras():
         "policy.wall_time",
     }
     assert all(v.shape == (1,) for v in r.get_extras().values())
+
+
+def test_inference_is_synchronous_unless_asked_for():
+    """Eval is the default use, and synchronous is the stricter thing to measure: every chunk is
+    computed from the observation just handed over, so a rollout has no delay confound. Async
+    (continuous motion, chunk starts `delay_ticks` late) is opt-in per run."""
+    assert BridgeConfig().async_inference is False
+    assert BridgeConfig(async_inference=True).async_inference is True

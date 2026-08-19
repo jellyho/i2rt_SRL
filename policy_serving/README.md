@@ -229,10 +229,16 @@ action = policy.infer(obs)["actions"]   # one (action_dim,) step per call
   ticks after the observation it came from. What it buys is that the robot never physically stops.
   With a synchronous broker the arm dead-stops for the whole inference at every chunk boundary
   (the controller holds its last target), which is a real artifact in the motion, not just in the
-  recording. The deploy runner defaults to async for that reason; set `async_inference=False` in
-  `BridgeConfig` to get the synchronous behaviour back, which is what openpi's and LeRobot's own
-  brokers do. If the server is slower than the chunk it predicts, prefetch cannot hide it: the
-  loop blocks as before, and the underrun is counted (`stats()["underruns"]`) rather than hidden.
+  recording.
+
+  **Synchronous is the default** (`ActionChunkBroker`, what openpi's and LeRobot's own brokers do),
+  because evaluation is the default use and it is the stricter thing to measure: the rollout says
+  exactly what the policy did with what it saw, with no delay confound. Opt into async per run with
+  `yam-data deploy --async-inference`, or `async_inference=True` in `BridgeConfig`. Note the stall
+  ticks are not recorded either way — the loop is blocked inside `infer()`, so no action is sent
+  and (recording being send-driven) no frame is captured; the stop is in the robot's motion, not in
+  the dataset. If the server is slower than the chunk it predicts, prefetch cannot hide it either:
+  the loop blocks as before and the underrun is counted (`stats()["underruns"]`) rather than hidden.
 - **Metadata-driven config**: declare `action_horizon` (and optionally an
   `obs_spec` dict with `image_keys` / `image_size`) on your policy; `serve.py`
   puts them in the server metadata and the bridge auto-configures from
