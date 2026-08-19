@@ -499,3 +499,26 @@ def test_num_samples_is_a_recording_setting_not_a_view(tmp_path, qapp, no_camera
         assert bridge_cfg.num_samples == 6
     finally:
         gui.close()
+
+
+def test_start_keeps_the_source_the_mode_chose(tmp_path, qapp, no_camera_scan, monkeypatch):
+    """START must not re-derive the record source.
+
+    It used to force "dagger" for any recording run, whatever mode was selected. A `policy` +
+    record run therefore started as `dagger`: recording came from the teleop gate at the loop rate
+    instead of one frame per action sent, so every inference stall landed in the dataset as a
+    frozen command, and the entire send-driven path was dead code in practice. Three rollouts were
+    collected that way before the outcomes sidecar (`"source": "dagger"`) gave it away.
+    """
+    from workstation.lerobot_recorder import deploy_gui as dg
+
+    for mode, record, expected in [("policy", True, "eval"), ("dagger", True, "dagger"), ("policy", False, "deploy")]:
+        gui = _deploy_gui(not record, tmp_path, mode=mode)
+        try:
+            assert gui.cfg.record_source == expected, f"{mode}/{record} before START"
+            # Everything START does past the source is hardware; stop after the config is applied.
+            monkeypatch.setattr(dg.RecorderGUI, "_on_start", lambda self: None)
+            gui._on_start()
+            assert gui.source_combo.currentText() == expected, f"{mode}/{record} after START"
+        finally:
+            gui.close()
