@@ -85,6 +85,9 @@ def _args(dataset: Path, out: Path, **over) -> argparse.Namespace:
         agentview_arms=["left", "right"],
         horizon=HORIZON,
         candidates=CANDIDATES,
+        # The fixtures record no critic_scores, so the panel is absent either way; the field has to
+        # exist because render() consults it.
+        no_value_plot=False,
         replans=0,
         hold=2,
         height=180,
@@ -223,3 +226,33 @@ def test_a_constant_chunk_index_is_treated_as_no_information():
 
     assert _recorded_chunk_starts(_Reader([0.0] * 40), 0, 40) is None
     assert _recorded_chunk_starts(_Reader([0.0] * 10 + [1.0] * 10), 0, 20) == [0, 10]
+
+
+def test_the_value_curve_is_painted_once_and_only_the_cursor_moves(qapp_free=None):
+    """The curve is the same picture at every frame of a 9000-frame render; repainting it per
+    frame would multiply the cost by the length of the episode for nothing."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _value_panel, _value_panel_base
+
+    chosen = np.array([-10.0, -9.0, -9.0, -6.0])
+    series = (chosen, chosen - 2.0, chosen + 2.0)
+    base = _value_panel_base(series, 320, 180)
+    first = _value_panel(base, 0, len(chosen), float(chosen[0]))
+    last = _value_panel(base, 3, len(chosen), float(chosen[3]))
+    assert first.shape == last.shape == (180, 320, 3)
+    assert not np.array_equal(first, last), "the cursor must move"
+    # The base image is untouched by drawing a cursor on a copy.
+    again = _value_panel(base, 0, len(chosen), float(chosen[0]))
+    assert np.array_equal(first, again)
+
+
+def test_no_critic_no_value_curve():
+    """A plain rollout has no critic_scores; asking for the panel must not invent one."""
+    from workstation.lerobot_recorder.render_deploy_samples import _value_series
+
+    class _Reader:
+        def has_feature(self, key):
+            return False
+
+    assert _value_series(_Reader(), 0, 10, 8) is None

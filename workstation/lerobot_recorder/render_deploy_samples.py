@@ -241,6 +241,77 @@ def _finite_prefix(path: np.ndarray) -> Optional[list]:
 
 # Per-arm fan colours (chosen-candidate gradient start/end). Left keeps the original green; right
 # gets an amber so both arms' fans read apart when drawn on the SAME agentview frame.
+def _value_series(reader: "DatasetReader", episode: int, n_frames: int, n_candidates: int) -> "Optional[tuple]":
+    """The critic value at every frame: what it gave the candidate it picked, and the spread.
+
+    Read once for the whole episode rather than per chunk -- the curve is the point, and it only
+    reads as a decision record when you can see where the current frame sits on it. Returns
+    (chosen, low, high) or None when the run recorded no critic.
+    """
+    if not reader.has_feature("critic_scores"):
+        return None
+    chosen, low, high = [], [], []
+    for frame in range(n_frames):
+        scores = reader.get_extra(episode, frame, "critic_scores", (n_candidates,))
+        if scores is None:
+            return None
+        scores = np.asarray(scores, dtype=float)
+        pick = reader.get_scalar(episode, frame, "critic_choice")
+        chosen.append(float(scores[int(pick or 0)]))
+        low.append(float(scores.min()))
+        high.append(float(scores.max()))
+    return np.array(chosen), np.array(low), np.array(high)
+
+
+def _value_panel_base(series: tuple, width: int, height: int) -> tuple:
+    """Paint the whole value curve once; each frame only adds its cursor to a copy.
+
+    Redrawing the curve per frame would multiply the cost of a 9000-frame render by the length of
+    the episode for a picture that never changes.
+    """
+    from PIL import Image, ImageDraw
+
+    chosen, low, high = series
+    img = Image.new("RGB", (width, height), (13, 17, 23))
+    d = ImageDraw.Draw(img)
+    pad_l, pad_r, pad_t, pad_b = 52, 10, 34, 26
+    plot = (pad_l, pad_t, width - pad_r, height - pad_b)
+    w, h = plot[2] - plot[0], plot[3] - plot[1]
+    lo, hi = float(min(low.min(), chosen.min())), float(max(high.max(), chosen.max()))
+    span = (hi - lo) or 1.0
+    n = len(chosen)
+
+    def xy(i: int, v: float) -> tuple:
+        return (plot[0] + w * i / max(n - 1, 1), plot[3] - h * (v - lo) / span)
+
+    # The spread across candidates: how much the critic thought was at stake at each decision.
+    band = [xy(i, high[i]) for i in range(n)] + [xy(i, low[i]) for i in range(n - 1, -1, -1)]
+    d.polygon(band, fill=(35, 55, 95))
+    d.line([xy(i, chosen[i]) for i in range(n)], fill=(240, 210, 90), width=2)
+    d.line([plot[0], plot[3], plot[2], plot[3]], fill=(48, 54, 61))
+    f = _font(12)
+    d.text((6, plot[1] - 6), f"{hi:.4g}", font=f, fill=(139, 148, 158))
+    d.text((6, plot[3] - 6), f"{lo:.4g}", font=f, fill=(139, 148, 158))
+    d.text((pad_l, 4), "critic value -- picked (line) vs candidate spread (band)", font=f, fill=(139, 148, 158))
+    return img, plot, lo, span
+
+
+def _value_panel(base: tuple, frame: int, n_frames: int, chosen_value: float) -> np.ndarray:
+    """The precomputed curve plus a cursor at this frame."""
+    from PIL import ImageDraw
+
+    img, plot, lo, span = base
+    out = img.copy()
+    d = ImageDraw.Draw(out)
+    w, h = plot[2] - plot[0], plot[3] - plot[1]
+    x = plot[0] + w * frame / max(n_frames - 1, 1)
+    y = plot[3] - h * (chosen_value - lo) / span
+    d.line([x, plot[1], x, plot[3]], fill=(90, 100, 115), width=1)
+    d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(240, 210, 90))
+    d.text((plot[0] + 4, plot[1] + 2), f"Q {chosen_value:.6g}", font=_font(12), fill=(240, 210, 90))
+    return np.asarray(out)
+
+
 def _load_critic(
     reader: "DatasetReader", episode: int, start: int, n_candidates: int
 ) -> "tuple[Optional[np.ndarray], int]":
@@ -487,7 +558,17 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             )
         print(f"candidates from the recording: {args.candidates}", file=sys.stderr)
 
+    # The critic's value over the whole episode, if it recorded one: drawn as its own panel so the
+    # decision is legible as a time series, not just as colour on the fan.
+    value_series = None
+    if args.source == "samples" and not args.no_value_plot:
+        value_series = _value_series(reader, args.episode, n_frames, args.candidates)
+        if value_series is not None:
+            print(f"critic value curve: {n_frames} frames", file=sys.stderr)
+
     fan_word = "fan" if args.source == "samples" else "path"
+
+    value_base = _value_panel_base(value_series, panel_w, panel_h) if value_series is not None else None
 
     frames = []
     for block_idx, start in enumerate(blocks):
@@ -558,6 +639,11 @@ def render(args: argparse.Namespace) -> pathlib.Path:
 
             if not panels:
                 continue
+            if value_base is not None:
+                panels.append(
+                    (_value_panel(value_base, frame_idx, n_frames, float(value_series[0][frame_idx])), "critic value")
+                )
+
             header = (
                 f"{args.repo_id} · ep {args.episode} · chunk {block_idx + 1}/{len(blocks)}  "
                 f"tick {offset + 1}/{block_len}"
@@ -568,8 +654,9 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                 # spread means the critic saw nothing to choose between -- worth seeing.
                 header += (
                     f"  ·  critic: #{chosen} of {len(scores)}  "
-                    f"Q {float(scores[chosen]):.3g}  (spread {float(np.min(scores)):.3g}"
-                    f" .. {float(np.max(scores)):.3g})"
+                    f"Q {float(scores[chosen]):.6g}  "
+                    f"(best by {float(scores[chosen] - np.median(scores)):+.3g}, "
+                    f"spread {float(np.max(scores) - np.min(scores)):.3g})"
                 )
             composed = _compose_frame(panels, panel_w, panel_h, header=header)
             for _ in range(max(1, args.hold)):
@@ -633,6 +720,11 @@ def main() -> None:
         default=None,
         help="candidates per step; read from the dataset's action_samples column by default, "
         "so pass it only to override (ignored for --source action)",
+    )
+    p.add_argument(
+        "--no-value-plot",
+        action="store_true",
+        help="omit the critic-value panel (drawn automatically when the recording has critic_scores)",
     )
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
     p.add_argument("--hold", type=int, default=1, help="repeat each rendered tick N times (>1 = slow motion)")
