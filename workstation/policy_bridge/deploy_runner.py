@@ -157,6 +157,11 @@ class DeploymentPolicyRunner:
         #: Called with the sent action vector every time an action is pushed to the robot, so the
         #: recorder can log exactly one eval frame per executed action (see Recorder.note_action_sent).
         self.on_action_sent: Callable[[np.ndarray], None] | None = None
+        #: Called when the policy stops driving -- the operator stopping it, an intervention, or
+        #: the arm going home. This runner is the authority on that: it is what decides to send or
+        #: not, and it already resets the chunk here. A recorder uses it to end the episode, so one
+        #: eval episode is one ROLLOUT rather than everything between arming and disarming.
+        self.on_rollout_end: Callable[[], None] | None = None
         self._was_streaming = False
         # Replay pause: PURELY a send-gate on this (workstation) side. When paused the loop stops
         # calling infer()/set_policy_action, so the DatasetPolicy cursor freezes and the robot just
@@ -550,11 +555,15 @@ class DeploymentPolicyRunner:
                             )
                             self._was_streaming = True
                         else:
+                            if self._was_streaming and self.on_rollout_end is not None:
+                                self.on_rollout_end()
                             self._set(streaming=False)
                             self._was_streaming = False
                     else:
                         if self._was_streaming:
                             self._reset_policy_chunk()
+                            if self.on_rollout_end is not None:
+                                self.on_rollout_end()
                         self._set(streaming=False)
                         self._was_streaming = False
                         self._probe_policy()

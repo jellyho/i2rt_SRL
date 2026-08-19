@@ -128,6 +128,16 @@ class Recorder:
         # "eval": record a continuous rollout (policy / intervention) from arm to disarm,
         # instead of gating on the teleop engage signal.
         self._eval = cfg.record_source == "eval"
+        # Set by end_rollout() and acted on by the record loop. An eval EPISODE is one ROLLOUT,
+        # not one arming session: the operator arms once and runs several, and between them the
+        # robot goes home -- correctly unrecorded, since nothing is sent while homing. Concatenated,
+        # they became one episode in which the arm teleports ~2 rad back to home mid-trajectory
+        # (measured: 7 rollouts inside one 9052-frame episode, 6 jumps of 1.7-2.1 rad).
+        #
+        # The signal comes from the runner, which is the authority: it decides whether to send, so
+        # it knows when the rollout ended. Reading `policy_running` out of the robot snapshot would
+        # be a second, laggier source of the same fact -- and the two can disagree.
+        self._rollout_ended = False
         # "deploy": run the policy and watch it, but record NOTHING — no dataset is opened
         # and no frames are buffered. Cameras, robot link, live view, e-stop and human
         # takeover are unchanged, so this is the recorder minus the dataset.
@@ -262,7 +272,8 @@ class Recorder:
         if not self._ram_ok_to_start():
             return
         self.gate.arm()
-        if self._eval:  # eval: arm starts one continuous rollout
+        self._rollout_ended = False
+        if self._eval:  # eval: each rollout between arm and disarm is its own episode
             self._reset_episode()
             self._btn_outcome = None
             logger.info("collection armed (eval) — recording rollout until you stop")
@@ -471,6 +482,31 @@ class Recorder:
     def set_policy_running(self, flag: bool) -> None:
         """Forward a DAgger policy rollout start/stop request."""
         self.robot.set_policy_running(flag)
+
+    def end_rollout(self) -> None:
+        """The policy stopped driving; this rollout's episode is finished.
+
+        Called from the runner's control thread (DeploymentPolicyRunner.on_rollout_end). It only
+        raises a flag -- the record loop does the closing, keeping every episode-buffer and writer
+        mutation on that one thread."""
+        if self._eval and self.gate.armed:
+            self._rollout_ended = True
+
+    def _end_eval_rollout(self) -> None:
+        """Hand the finished rollout over, keeping the gate armed for the next one.
+
+        The same outcome rules disarm() uses -- a leader discard button wins, an empty rollout is
+        dropped, review_before_save holds it pending, otherwise it is submitted."""
+        if self._btn_outcome == "discard":
+            self._discard_episode(counted=True)
+        elif self._ep_empty():
+            self._discard_episode()
+        elif self.cfg.review_before_save and self._btn_outcome is None:
+            self._pending = True
+        else:
+            self._submit(self._btn_outcome)
+        self._btn_outcome = None
+        logger.info("eval rollout ended — episode closed (still armed for the next one)")
 
     def note_action_sent(self, action: np.ndarray) -> None:
         """The runner calls this from its control-rate thread the instant it sends an action to the
@@ -717,7 +753,16 @@ class Recorder:
         # append neither sensors nor actions until physical alignment completes.
         recording_paused = bool(snap.get("leader_recentering"))
 
-        if self._eval:  # continuous rollout while armed; no engage gate
+        if self._eval:  # one episode per rollout while armed; no engage gate
+            # Close the episode where the runner says the rollout ended (see end_rollout), so the
+            # next one is its own rather than spliced onto this across an unrecorded homing.
+            # Drained here, on the record loop, because that is the only thread that touches the
+            # episode buffer and the writer.
+            if self._rollout_ended:
+                self._rollout_ended = False
+                if not self._ep_empty():
+                    self._end_eval_rollout()
+
             # Drain the frames note_action_sent already captured (one per action the runner sent).
             # They are complete, self-consistent snapshots taken at send time -- held "waiting for
             # inference" ticks and paused ticks send nothing, so they contribute nothing. Writing

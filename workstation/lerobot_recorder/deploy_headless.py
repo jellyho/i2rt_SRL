@@ -75,6 +75,8 @@ def run_headless(
         # One eval frame per action the runner sends to the robot (frames == executed actions);
         # a no-op unless the recorder is armed in eval mode.
         runner.on_action_sent = recorder.note_action_sent
+        # One eval episode per rollout: the runner knows when it stopped driving.
+        runner.on_rollout_end = recorder.end_rollout
         runner.start()
         recorder.set_leader_mirror(mirror)
         logger.info(
