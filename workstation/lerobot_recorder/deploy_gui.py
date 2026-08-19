@@ -335,7 +335,12 @@ class DeployGUI(RecorderGUI):
         return bool(getattr(self, "record_check", None) is not None and self.record_check.isChecked())
 
     def _on_start(self) -> None:
-        self.source_combo.setCurrentText("deploy" if self.deploy_only else "dagger")
+        # The source is derived from mode + record by _sync_run_mode, which has already put it in
+        # the combo that RecorderGUI._on_start reads. Re-deriving it here (this used to force
+        # "dagger" for any recording run) silently overrode the mode: a `policy` + record run was
+        # started as `dagger`, so it recorded from the teleop gate at the loop rate instead of one
+        # frame per action sent -- which put every inference stall into the dataset as a frozen
+        # command, and left the whole send-driven path dead.
         self.bridge_cfg.prompt = self.task_combo.currentText().strip()
         super()._on_start()
         # Re-list the past-demonstration datasets from the (now-applied) root, so replay can pick an
