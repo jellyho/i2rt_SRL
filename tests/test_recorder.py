@@ -827,3 +827,86 @@ def test_the_recorder_streams_the_active_task_with_every_frame():
         rec._step(images, snap)
 
     assert rec.writer.tasks == ["assemble lego blocks"] * 3
+
+
+def test_a_homing_frame_is_never_captured():
+    """Going home is not part of the rollout, gripper release included.
+
+    The runner stops streaming when the robot reports homing, but the flag can flip between that
+    check and the capture -- which put a single frame of the homing pose (arm travelling, gripper
+    commanded shut) at the end of a recording."""
+    cfg = RecorderConfig(repo_id="test/homing", root="/tmp/x", fps=30, mock=True, record_source="eval")
+    rec = Recorder(cfg)
+    rec.gate.arm()
+    try:
+        real = rec.robot.get_snapshot
+
+        rec.robot.get_snapshot = lambda: {**real(), "homing": True}
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        assert len(rec._sent_frames) == 0, "a homing frame must not be captured"
+
+        rec.robot.get_snapshot = lambda: {**real(), "teleop_state": "HOMING"}
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        assert len(rec._sent_frames) == 0, "teleop HOMING is the same thing by another name"
+    finally:
+        rec.robot.get_snapshot = real
+
+
+def test_each_eval_rollout_is_its_own_episode(tmp_path):
+    """An eval episode is one ROLLOUT, not one arming session.
+
+    The operator arms once and runs several rollouts; between them the robot goes home, which is
+    correctly not recorded (nothing is sent while homing). Concatenated, they became a single
+    episode in which the arm teleports back to home mid-trajectory -- measured on a real recording
+    as 7 rollouts inside one 9052-frame episode, with 6 jumps of 1.7-2.1 rad.
+
+    The boundary comes from the runner (`on_rollout_end` -> `end_rollout`), which is the component
+    that decides whether to send and therefore knows when the rollout ended. Polling the robot
+    snapshot for `policy_running` would be a second, laggier source of the same fact.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/evalseg", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    # Cameras and one cached frame, but no record loop: _step is driven by hand so the rollout
+    # boundary is exercised deterministically instead of raced against the loop.
+    rec.cameras.start()
+    rec.robot.start()
+    rec._last_images = rec.cameras.read()
+    rec.writer = rec._open_writer()
+    rec.gate.arm()
+    try:
+        for rollout in range(2):
+            for i in range(4):
+                rec.note_action_sent(np.full(ACTION_DIM, float(rollout * 10 + i), dtype=np.float32))
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+            assert rec.get_status()["frames"] == 4, "this rollout's own frames"
+
+            rec.end_rollout()  # the runner: the policy stopped driving
+            rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+            assert rec.get_status()["frames"] == 0, "a finished rollout must not carry into the next"
+            assert rec.get_status()["kept"] == rollout + 1, "each rollout is handed over as it ends"
+        assert rec.gate.armed is True, "the gate stays armed for the next rollout"
+    finally:
+        rec.shutdown()  # drains the async writer
+    # ...and both really reached the dataset, as two episodes rather than one.
+    rows = [json.loads(line) for line in (tmp_path / "evalseg" / "outcomes.jsonl").read_text().splitlines()]
+    assert [r["episode"] for r in rows] == [0, 1]
+    assert all(r["frames"] == 4 for r in rows), rows
+
+
+def test_end_rollout_is_ignored_when_there_is_no_rollout_to_end(tmp_path):
+    """It arrives on every stop, including ones with nothing recorded (a rollout that never
+    streamed, or a non-eval source), and must not open or close anything then."""
+    cfg = RecorderConfig(repo_id="test/evalidle", root=str(tmp_path), fps=30, mock=True, record_source="eval")
+    rec = Recorder(cfg)
+    rec.end_rollout()  # not armed
+    assert rec._rollout_ended is False
+    rec.gate.arm()
+    rec.end_rollout()
+    assert rec._rollout_ended is True
+
+    dag = Recorder(RecorderConfig(repo_id="test/dag", root=str(tmp_path), fps=30, mock=True, record_source="dagger"))
+    dag.gate.arm()
+    dag.end_rollout()
+    assert dag._rollout_ended is False, "dagger has its own episode boundary"

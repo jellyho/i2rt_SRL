@@ -3,6 +3,10 @@
 The failure being guarded against is specific and nasty: a half-written data parquet has no
 footer, and LeRobot globs `data/` rather than reading the file list from the metadata, so
 one truncated file stops the whole dataset opening -- every good episode included.
+
+Its quieter twin leaves no stray files at all: LeRobot rewrites `meta/info.json` every
+episode but flushes the episode parquets in batches, so Ctrl-C leaves the counters ahead of
+what is on disk and the next open detours to the Hub for the "missing" episodes.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ import pytest
 
 from workstation.lerobot_recorder.crash_recovery import (
     find_crash_leftovers,
+    find_uncommitted_metadata,
     recover,
+    truncate_to_committed,
 )
 
 pytest.importorskip("pandas")
@@ -167,3 +173,69 @@ def test_a_referenced_but_unreadable_file_is_reported_not_moved(tmp_path, caplog
         found = find_crash_leftovers(str(root))
     assert not any("file-000" in p for v in found.values() for p in v)
     assert "REFERENCED" in caplog.text
+
+
+def _uncommitted(root, *, episodes=2, frames=20):
+    """What Ctrl-C mid-batch leaves: info.json counting episodes meta/episodes never got."""
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["total_episodes"] += episodes
+    info["total_frames"] += frames
+    info["splits"] = {"train": f"0:{info['total_episodes']}"}
+    info_path.write_text(json.dumps(info))
+    (root / "outcomes.jsonl").write_text("".join(
+        json.dumps({"episode": ep, "outcome": "success", "frames": 10}) + "\n"
+        for ep in range(info["total_episodes"])
+    ))
+    return info
+
+
+def test_counters_ahead_of_the_metadata_are_reported(tmp_path):
+    root = _dataset(tmp_path, episodes=3, per_ep=10)
+    _uncommitted(root)
+
+    drift = find_uncommitted_metadata(str(root))
+    assert drift["info_episodes"] == 5 and drift["committed_episodes"] == 3
+    assert drift["lost_episodes"] == 2 and drift["lost_frames"] == 20
+    # and it is invisible to the file-based check, which is the whole point
+    assert find_crash_leftovers(str(root)) == {}
+
+
+def test_counters_matching_the_metadata_report_nothing(tmp_path):
+    assert find_uncommitted_metadata(str(_dataset(tmp_path))) is None
+
+
+def test_truncate_rolls_info_and_the_sidecar_back(tmp_path):
+    root = _dataset(tmp_path, episodes=3, per_ep=10)
+    _uncommitted(root)
+    q = tmp_path / "q"
+
+    drift = truncate_to_committed(str(root), quarantine=str(q))
+
+    info = json.loads((root / "meta" / "info.json").read_text())
+    assert (info["total_episodes"], info["total_frames"]) == (3, 30)
+    assert info["splits"] == {"train": "0:3"}
+    assert drift["lost_episodes"] == 2
+    outcomes = [json.loads(line) for line in (root / "outcomes.jsonl").read_text().splitlines()]
+    assert [o["episode"] for o in outcomes] == [0, 1, 2]
+    # the pre-repair counters stay readable rather than being overwritten in place
+    assert json.loads((q / "meta__info.json").read_text())["total_episodes"] == 5
+
+
+def test_truncate_is_idempotent(tmp_path):
+    root = _dataset(tmp_path, episodes=3, per_ep=10)
+    _uncommitted(root)
+    truncate_to_committed(str(root), quarantine=str(tmp_path / "q"))
+    assert truncate_to_committed(str(root), quarantine=str(tmp_path / "q2")) is None
+
+
+def test_recover_fixes_files_and_counters_together(tmp_path):
+    root = _dataset(tmp_path, episodes=3, per_ep=10)
+    _crash(root)
+    _uncommitted(root)
+
+    result = recover(str(root))
+
+    assert result["moved"] and result["uncommitted"]["lost_episodes"] == 2
+    assert json.loads((root / "meta" / "info.json").read_text())["total_episodes"] == 3
+    assert find_uncommitted_metadata(str(root)) is None

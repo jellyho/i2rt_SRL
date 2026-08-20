@@ -558,12 +558,12 @@ native 4:3, a translucent-box header + per-panel labels, browser-friendly h264).
 
 ```bash
 # deploy fan on all three cameras (needs an action_samples column):
-workstation/yam-data render-samples \
+misc/yam-misc render-samples \
     --repo-id my_deploy_run --episode 0 --horizon 30 --candidates 8 \
     --out .scratch/fan.mp4
 
 # any dataset — teleop/demo/replay — using the executed trajectory (no action_samples):
-workstation/yam-data render-samples \
+misc/yam-misc render-samples \
     --repo-id my_demo --episode 0 --source action --horizon 20 \
     --out .scratch/path.mp4
 ```
@@ -572,7 +572,7 @@ workstation/yam-data render-samples \
 
 ```bash
 # the dataset lives at ~/lerobot_rollout/yam_s300_rel_200k_n16
-workstation/yam-data render-samples \
+misc/yam-misc render-samples \
     --repo-id lerobot_rollout/yam_s300_rel_200k_n16 \
     --root ~/lerobot_rollout \
     --episode 0 --horizon 30 --candidates 16 \
@@ -595,6 +595,11 @@ Three things that bite, all of them path or count mistakes rather than rendering
   `python -c "import json;print(json.load(open('<dataset>/meta/info.json'))['features']['action_samples']['shape'])"`.
 - **`--horizon` is the policy's `action_horizon`** (the server logs it at startup, e.g. 30). It only
   sets how the episode is tiled for the header/fan reassembly; every tick is drawn either way.
+
+> Rendering lives in **`misc/`**, not `yam-data`: it reads a finished dataset and draws a
+> picture, while every `yam-data` subcommand touches hardware or a live recording. The GUI
+> (`misc/yam-misc render-gui`) is the same renderer with the dataset and episode picked from
+> a list, and the recorded numbers read off the dataset rather than typed in.
 
 - **Two sources** (`--source`): `samples` (default) draws the multi-candidate **fan** from the
   `action_samples` column — any run recorded against a server started with `--num-samples N` (or a

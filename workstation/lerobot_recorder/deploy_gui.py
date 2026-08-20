@@ -361,6 +361,8 @@ class DeployGUI(RecorderGUI):
             # Record exactly one eval frame per action the runner sends (frames == executed actions).
             # A no-op unless armed in eval mode, so it is harmless in policy-watch / dagger / dataset.
             self.runner.on_action_sent = self.recorder.note_action_sent
+            # One eval episode per rollout: the runner knows when it stopped driving.
+            self.runner.on_rollout_end = self.recorder.end_rollout
             self.runner.start()
 
     @property
