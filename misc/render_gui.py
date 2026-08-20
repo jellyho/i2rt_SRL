@@ -45,7 +45,7 @@ class _RenderWorker(QtCore.QThread):
         self._args = args
 
     def run(self) -> None:
-        from workstation.lerobot_recorder.render_deploy_samples import render
+        from misc.render_deploy_samples import render
 
         try:
             out = render(self._args)

@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO / "policy_serving"))
 
 from workstation.lerobot_recorder.config import ACTION_DIM, STATE_DIM, RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
-from workstation.lerobot_recorder.render_deploy_samples import render
+from misc.render_deploy_samples import render
 
 CAMERAS = ("wrist_left", "wrist_right", "agentview")
 IMG = (64, 64, 3)
@@ -175,7 +175,7 @@ def test_the_fan_is_coloured_by_the_critic_s_own_ranking():
 
     Normalised per replan: the absolute numbers are arbitrary (cost-to-goal runs to -2777), the
     useful question is which candidate the critic preferred here."""
-    from workstation.lerobot_recorder.render_deploy_samples import _value_color
+    from misc.render_deploy_samples import _value_color
 
     worst, best = _value_color(-20.0, -20.0, -5.0), _value_color(-5.0, -20.0, -5.0)
     assert worst != best
@@ -191,7 +191,7 @@ def test_the_executed_candidate_is_the_one_the_critic_picked():
     as executed on any run where the critic picked something else."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _load_critic
+    from misc.render_deploy_samples import _load_critic
 
     class _Reader:
         def get_extra(self, ep, frame, key, shape):
@@ -213,7 +213,7 @@ def test_the_executed_candidate_is_the_one_the_critic_picked():
 def test_a_constant_chunk_index_is_treated_as_no_information():
     """Rollouts recorded while the provenance was written as a constant 0 carry the column but
     nothing in it. Believing it would draw the entire episode as one chunk."""
-    from workstation.lerobot_recorder.render_deploy_samples import _recorded_chunk_starts
+    from misc.render_deploy_samples import _recorded_chunk_starts
 
     class _Reader:
         def __init__(self, values):
@@ -234,7 +234,7 @@ def test_the_value_curve_is_painted_once_and_only_the_cursor_moves(qapp_free=Non
     frame would multiply the cost by the length of the episode for nothing."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _value_panel, _value_panel_base
+    from misc.render_deploy_samples import _value_panel, _value_panel_base
 
     chosen = np.array([-10.0, -9.0, -9.0, -6.0])
     series = (chosen, chosen - 2.0, chosen + 2.0)
@@ -250,7 +250,7 @@ def test_the_value_curve_is_painted_once_and_only_the_cursor_moves(qapp_free=Non
 
 def test_no_critic_no_value_curve():
     """A plain rollout has no critic_scores; asking for the panel must not invent one."""
-    from workstation.lerobot_recorder.render_deploy_samples import _value_series
+    from misc.render_deploy_samples import _value_series
 
     class _Reader:
         def has_feature(self, key):
@@ -283,7 +283,7 @@ def test_the_value_strip_keeps_the_frame_encodable():
     the frame's height together with the cameras, and 360 + 151 = 511 killed the encode."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _value_panel_base
+    from misc.render_deploy_samples import _value_panel_base
 
     chosen = np.array([-3.0, -2.0, -4.0])
     for panel_h in (360, 240, 300):
@@ -299,7 +299,7 @@ def test_chunk_lengths_come_from_the_whole_run_not_the_rendered_part():
     reply plotted as 237."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _chunk_series
+    from misc.render_deploy_samples import _chunk_series
 
     lengths = _chunk_series([0, 30, 60, 90], 120)
     assert list(np.unique(lengths)) == [30.0]
@@ -313,7 +313,7 @@ def test_a_strip_without_a_band_is_still_drawn():
     fall back to shading the line against itself."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _value_panel, _value_panel_base
+    from misc.render_deploy_samples import _value_panel, _value_panel_base
 
     line = np.array([30.0, 30.0, 12.0, 12.0])
     base = _value_panel_base((line, None, None), 320, 96, title="chunk length", fmt=".0f")
@@ -335,7 +335,7 @@ def test_macro_group_boundaries_are_marked_on_the_chosen_path():
     every candidate would bury the one decision the picture is about."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _draw_fan
+    from misc.render_deploy_samples import _draw_fan
 
     blank = np.zeros((120, 320, 3), np.uint8)
     plain = _draw_fan(blank, _straight_paths(), chosen=0)
@@ -350,7 +350,7 @@ def test_the_uncommitted_tail_is_drawn_faint():
     claim the arm went somewhere it never did."""
     import numpy as np
 
-    from workstation.lerobot_recorder.render_deploy_samples import _draw_fan
+    from misc.render_deploy_samples import _draw_fan
 
     blank = np.zeros((120, 320, 3), np.uint8)
     whole = _draw_fan(blank, _straight_paths(), chosen=0)
@@ -362,7 +362,7 @@ def test_the_uncommitted_tail_is_drawn_faint():
 
 def test_a_recording_without_the_commitment_columns_draws_as_before():
     """bon runs and every older recording: no macro, nothing to dim."""
-    from workstation.lerobot_recorder.render_deploy_samples import _load_commitment
+    from misc.render_deploy_samples import _load_commitment
 
     class _Reader:
         def get_scalar(self, ep, frame, key):

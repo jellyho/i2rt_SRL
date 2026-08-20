@@ -12,7 +12,7 @@ pytest.importorskip("PyQt5")
 
 from PyQt5 import QtWidgets
 
-from workstation.lerobot_recorder.render_gui import RenderGUI
+from misc.render_gui import RenderGUI
 
 
 @pytest.fixture(scope="module")
