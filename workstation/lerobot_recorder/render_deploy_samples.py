@@ -241,6 +241,20 @@ def _finite_prefix(path: np.ndarray) -> Optional[list]:
 
 # Per-arm fan colours (chosen-candidate gradient start/end). Left keeps the original green; right
 # gets an amber so both arms' fans read apart when drawn on the SAME agentview frame.
+def _chunk_series(blocks: list, n_frames: int) -> np.ndarray:
+    """How many steps the reply that owns each frame carried, one value per frame.
+
+    The horizon is adaptive -- a prefix-guided server returns only what is still worth executing,
+    and an intervention forces an early replan -- so the length is a signal in its own right, and
+    it decides how often the policy is re-queried. Plotted on the same x axis as the value strip,
+    the two read together: what the critic was choosing between, and how far ahead it committed.
+    """
+    lengths = np.zeros(n_frames, dtype=float)
+    for start, end in zip(blocks, blocks[1:] + [n_frames], strict=False):
+        lengths[start:end] = end - start
+    return lengths
+
+
 def _value_series(reader: "DatasetReader", episode: int, n_frames: int, n_candidates: int) -> "Optional[tuple]":
     """The critic value at every frame: what it gave the candidate it picked, and the spread.
 
@@ -263,15 +277,22 @@ def _value_series(reader: "DatasetReader", episode: int, n_frames: int, n_candid
     return np.array(chosen), np.array(low), np.array(high)
 
 
-def _value_panel_base(series: tuple, width: int, height: int) -> tuple:
-    """Paint the whole value curve once; each frame only adds its cursor to a copy.
+def _value_panel_base(series: tuple, width: int, height: int, *, title: str = "", fmt: str = ".6g") -> tuple:
+    """Paint a whole strip once; each frame only adds its cursor to a copy.
 
     Redrawing the curve per frame would multiply the cost of a 9000-frame render by the length of
     the episode for a picture that never changes.
+
+    ``series`` is ``(line, low, high)``; pass ``low is high is None`` for a plain line with no
+    band. Every strip shares the x axis (frame index) with the cameras above, so stacked strips
+    read against each other and against the footage.
     """
     from PIL import Image, ImageDraw
 
     chosen, low, high = series
+    banded = low is not None and high is not None
+    if not banded:
+        low = high = chosen
     img = Image.new("RGB", (width, height), (13, 17, 23))
     d = ImageDraw.Draw(img)
     pad_l, pad_r, pad_t, pad_b = 52, 10, 34, 26
@@ -285,22 +306,23 @@ def _value_panel_base(series: tuple, width: int, height: int) -> tuple:
         return (plot[0] + w * i / max(n - 1, 1), plot[3] - h * (v - lo) / span)
 
     # The spread across candidates: how much the critic thought was at stake at each decision.
-    band = [xy(i, high[i]) for i in range(n)] + [xy(i, low[i]) for i in range(n - 1, -1, -1)]
-    d.polygon(band, fill=(35, 55, 95))
+    if banded:
+        band = [xy(i, high[i]) for i in range(n)] + [xy(i, low[i]) for i in range(n - 1, -1, -1)]
+        d.polygon(band, fill=(35, 55, 95))
     d.line([xy(i, chosen[i]) for i in range(n)], fill=(240, 210, 90), width=2)
     d.line([plot[0], plot[3], plot[2], plot[3]], fill=(48, 54, 61))
     f = _font(12)
     d.text((6, plot[1] - 6), f"{hi:.4g}", font=f, fill=(139, 148, 158))
     d.text((6, plot[3] - 6), f"{lo:.4g}", font=f, fill=(139, 148, 158))
-    d.text((pad_l, 4), "critic value -- picked (line) vs candidate spread (band)", font=f, fill=(139, 148, 158))
-    return img, plot, lo, span
+    d.text((pad_l, 4), title, font=f, fill=(139, 148, 158))
+    return img, plot, lo, span, fmt
 
 
 def _value_panel(base: tuple, frame: int, n_frames: int, chosen_value: float) -> np.ndarray:
-    """The precomputed curve plus a cursor at this frame."""
+    """The precomputed strip plus a cursor at this frame."""
     from PIL import ImageDraw
 
-    img, plot, lo, span = base
+    img, plot, lo, span, fmt = base
     out = img.copy()
     d = ImageDraw.Draw(out)
     w, h = plot[2] - plot[0], plot[3] - plot[1]
@@ -308,7 +330,7 @@ def _value_panel(base: tuple, frame: int, n_frames: int, chosen_value: float) ->
     y = plot[3] - h * (chosen_value - lo) / span
     d.line([x, plot[1], x, plot[3]], fill=(90, 100, 115), width=1)
     d.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(240, 210, 90))
-    d.text((plot[0] + 4, plot[1] + 2), f"Q {chosen_value:.6g}", font=_font(12), fill=(240, 210, 90))
+    d.text((plot[0] + 4, plot[1] + 2), format(chosen_value, fmt), font=_font(12), fill=(240, 210, 90))
     return np.asarray(out)
 
 
@@ -546,6 +568,7 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         # Chunks tile the episode on a fixed grid of `horizon` ticks (the last one may be shorter,
         # so the WHOLE trajectory is covered, tail included -- not just the first n//H*H frames).
         blocks = list(range(0, n_frames, horizon))
+    all_blocks = list(blocks)
     if args.replans:
         blocks = blocks[: args.replans]
     if not blocks:
@@ -576,6 +599,11 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     # Sized when the first frame is composed: the strip width depends on how many camera panels
     # actually render (a wrist can be missing from a recording).
     value_base = None
+    # One value per frame: the length of the reply that frame came from (see _chunk_series). Only
+    # when the boundaries are the RUN's own -- tiling by --horizon would plot the number the caller
+    # typed in, held flat across the episode, which says nothing about the policy.
+    chunk_lengths = _chunk_series(all_blocks, n_frames) if (recorded and not args.no_chunk_plot) else None
+    chunk_base = None
 
     frames = []
     for block_idx, start in enumerate(blocks):
@@ -661,8 +689,24 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                     # Even height: h264 with yuv420p subsamples chroma 2x2 and refuses an odd
                     # frame dimension, and this strip decides the frame's height together with the
                     # cameras (360 + 151 = 511 killed the encode).
-                    value_base = _value_panel_base(value_series, panel_w * len(panels), 2 * round(panel_h * 0.42 / 2))
+                    value_base = _value_panel_base(
+                        value_series,
+                        panel_w * len(panels),
+                        2 * round(panel_h * 0.42 / 2),
+                        title="critic value -- picked (line) vs candidate spread (band)",
+                    )
                 below = _value_panel(value_base, frame_idx, n_frames, float(value_series[0][frame_idx]))
+            if chunk_lengths is not None:
+                if chunk_base is None:
+                    chunk_base = _value_panel_base(
+                        (chunk_lengths, None, None),
+                        panel_w * len(panels),
+                        2 * round(panel_h * 0.26 / 2),
+                        title="chunk length -- steps the reply carried",
+                        fmt=".0f",
+                    )
+                strip = _value_panel(chunk_base, frame_idx, n_frames, float(chunk_lengths[frame_idx]))
+                below = strip if below is None else np.concatenate([below, strip], axis=0)
 
             header = (
                 f"{args.repo_id} · ep {args.episode} · chunk {block_idx + 1}/{len(blocks)}  "
@@ -745,6 +789,11 @@ def main() -> None:
         "--no-value-plot",
         action="store_true",
         help="omit the critic-value panel (drawn automatically when the recording has critic_scores)",
+    )
+    p.add_argument(
+        "--no-chunk-plot",
+        action="store_true",
+        help="omit the chunk-length strip (drawn under the cameras, sharing their time axis)",
     )
     p.add_argument("--replans", type=int, default=0, help="max replans to render (0 = the whole episode)")
     p.add_argument("--hold", type=int, default=1, help="repeat each rendered tick N times (>1 = slow motion)")

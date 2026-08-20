@@ -88,6 +88,7 @@ def _args(dataset: Path, out: Path, **over) -> argparse.Namespace:
         # The fixtures record no critic_scores, so the panel is absent either way; the field has to
         # exist because render() consults it.
         no_value_plot=False,
+        no_chunk_plot=False,
         replans=0,
         hold=2,
         height=180,
@@ -290,3 +291,31 @@ def test_the_value_strip_keeps_the_frame_encodable():
         assert height % 2 == 0
         img, *_ = _value_panel_base((chosen, chosen - 1, chosen + 1), 640, height)
         assert (panel_h + img.size[1]) % 2 == 0, "cameras + strip must stay even"
+
+
+def test_chunk_lengths_come_from_the_whole_run_not_the_rendered_part():
+    """--replans limits what is DRAWN, not what the run did. Deriving the lengths from the
+    truncated list makes the last kept chunk absorb the entire remaining episode -- a 30-step
+    reply plotted as 237."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _chunk_series
+
+    lengths = _chunk_series([0, 30, 60, 90], 120)
+    assert list(np.unique(lengths)) == [30.0]
+    # An adaptive run: each reply's own length, held across the frames it owns.
+    lengths = _chunk_series([0, 5, 20], 30)
+    assert lengths[0] == 5 and lengths[5] == 15 and lengths[-1] == 10
+
+
+def test_a_strip_without_a_band_is_still_drawn():
+    """The chunk strip is a plain line -- no spread to shade. Passing None for the band must not
+    fall back to shading the line against itself."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _value_panel, _value_panel_base
+
+    line = np.array([30.0, 30.0, 12.0, 12.0])
+    base = _value_panel_base((line, None, None), 320, 96, title="chunk length", fmt=".0f")
+    img = _value_panel(base, 2, len(line), float(line[2]))
+    assert img.shape == (96, 320, 3)
