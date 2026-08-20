@@ -241,6 +241,40 @@ def _finite_prefix(path: np.ndarray) -> Optional[list]:
 
 # Per-arm fan colours (chosen-candidate gradient start/end). Left keeps the original green; right
 # gets an amber so both arms' fans read apart when drawn on the SAME agentview frame.
+def _load_commitment(reader: "DatasetReader", episode: int, start: int) -> tuple:
+    """``(macro, committed_steps)`` for this replan, or ``(None, None)``.
+
+    An adaptive server carves the chunk into macro groups and commits to the highest-value prefix
+    of the winning candidate, then replans. `critic_macro` is the group size and
+    `critic_best_prefix` the index of the last committed group, so the commitment is
+    ``(best_prefix + 1) * macro`` steps. Both are per-replan facts, read at the chunk's first
+    frame."""
+    macro = reader.get_scalar(episode, start, "critic_macro")
+    best = reader.get_scalar(episode, start, "critic_best_prefix")
+    if macro is None:
+        return None, None
+    macro = int(macro)
+    return (macro or None), (None if best is None else int((int(best) + 1) * macro))
+
+
+def _load_full_candidates(reader: "DatasetReader", episode: int, start: int, n_candidates: int) -> "Optional[list]":
+    """The candidates over the WHOLE horizon, before the commitment cut them short.
+
+    Only an adaptive run records this (`action_samples_full`): there, `action_samples` holds the
+    executed prefix, so the part the model proposed and the critic declined to commit to exists
+    nowhere else. Returns one ``(H, action_dim)`` array per candidate.
+    """
+    shape = reader.feature_shape("action_samples_full")
+    if not shape or len(shape) != 3:
+        return None
+    horizon, n, dim = shape
+    block = reader.get_extra(episode, start, "action_samples_full", (horizon, n, dim))
+    if block is None:
+        return None
+    block = np.asarray(block, dtype=float)
+    return [block[:, i, :] for i in range(min(n, n_candidates))]
+
+
 def _chunk_series(blocks: list, n_frames: int) -> np.ndarray:
     """How many steps the reply that owns each frame carried, one value per frame.
 
@@ -379,6 +413,8 @@ def _draw_fan(
     *,
     colors: tuple = _FAN_COLORS["left"],
     scores: Optional[np.ndarray] = None,
+    macro: Optional[int] = None,
+    committed: Optional[int] = None,
 ) -> np.ndarray:
     """Overlay every candidate's projected path onto one frame (wrist OR agentview).
 
@@ -419,11 +455,32 @@ def _draw_fan(
         if pts is not None:
             c0, c1 = colors
             n = len(pts) - 1
+            # `committed` splits the winning path into what the server actually committed to and
+            # the tail it proposed but replanned over (adaptive). The tail is drawn faint and thin:
+            # it is a plan that never ran, and showing it at the same weight would claim the arm
+            # went somewhere it did not.
+            cut = n if committed is None else max(0, min(int(committed) - 1, n))
             for i in range(n):
                 t = i / max(n - 1, 1)
                 col = tuple(int(a + (b - a) * t) for a, b in zip(c0, c1, strict=True))
-                d.line([pts[i], pts[i + 1]], fill=(*col, 255), width=5, joint="curve")
-            ex, ey = pts[-1]
+                live = i < cut
+                d.line(
+                    [pts[i], pts[i + 1]],
+                    fill=(*col, 255 if live else 90),
+                    width=5 if live else 3,
+                    joint="curve",
+                )
+            # Macro-group boundaries: the granularity the commitment could stop at. Small dots, so
+            # the path still reads as a path.
+            if macro:
+                for i in range(macro, len(pts), macro):
+                    mx, my = pts[i]
+                    solid = committed is None or i < committed
+                    d.ellipse(
+                        [mx - 2.5, my - 2.5, mx + 2.5, my + 2.5],
+                        fill=(255, 255, 255, 230 if solid else 110),
+                    )
+            ex, ey = pts[cut if committed is not None and cut < len(pts) else -1]
             d.ellipse([ex - 4, ey - 4, ex + 4, ey + 4], fill=(*c1, 255))
 
     return np.asarray(Image.alpha_composite(base, layer).convert("RGB"))
@@ -605,7 +662,19 @@ def render(args: argparse.Namespace) -> pathlib.Path:
     chunk_lengths = _chunk_series(all_blocks, n_frames) if (recorded and not args.no_chunk_plot) else None
     chunk_base = None
 
-    frames = []
+    import imageio
+
+    out = pathlib.Path(args.out).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Frames are STREAMED to the encoder, not collected and handed over at the end. A composed
+    # frame here is ~2.6 MB (1440x600 RGB), so a 9000-frame episode would have been ~23 GB held in
+    # a list -- which is exactly how a full-length render got OOM-killed.
+    # Browser-friendly h264: yuv420p is what every browser can decode (hf-utils encodes the same
+    # way for its dataset previews); macro_block_size=1 keeps odd panel widths from being padded.
+    writer = imageio.get_writer(
+        out, fps=args.fps, quality=8, macro_block_size=1, codec="libx264", pixelformat="yuv420p"
+    )
+    written = 0
     for block_idx, start in enumerate(blocks):
         # Each block runs to the next boundary (or the end), so a recorded chunk is drawn whole
         # whatever its length.
@@ -625,8 +694,18 @@ def render(args: argparse.Namespace) -> pathlib.Path:
         # candidate actually executed -- candidate 0 for a plain multi-sample reply, but a critic
         # picks by value, and drawing 0 as the chosen one would then highlight the wrong path.
         scores, chosen = (None, 0)
+        macro = committed = None
         if args.source == "samples":
             scores, chosen = _load_critic(reader, args.episode, start, args.candidates)
+            macro, committed = _load_commitment(reader, args.episode, start)
+            # Adaptive: draw the WHOLE horizon the model proposed, with the committed prefix solid
+            # and the rest faint. `chunk` above is only the executed prefix, so without this the
+            # picture would stop where the commitment did and the proposal would be invisible.
+            full = _load_full_candidates(reader, args.episode, start, args.candidates)
+            if full is not None:
+                chunk = full
+            else:
+                committed = None  # bon: the executed chunk IS the whole proposal, nothing to dim
 
         # The chunk's base-frame paths (FK of the joint targets) are the SAME for every tick in the
         # block -- only the wrist CAMERA moves as the arm executes -- so compute them once here and
@@ -657,7 +736,15 @@ def render(args: argparse.Namespace) -> pathlib.Path:
             if agent is not None and agentview_arms:
                 agent_sq = _to_size(agent, panel_w, panel_h)
                 for arm, apaths in agent_paths.items():
-                    agent_sq = _draw_fan(agent_sq, apaths, chosen=chosen, colors=_FAN_COLORS[arm], scores=scores)
+                    agent_sq = _draw_fan(
+                        agent_sq,
+                        apaths,
+                        chosen=chosen,
+                        colors=_FAN_COLORS[arm],
+                        scores=scores,
+                        macro=macro,
+                        committed=committed,
+                    )
                 label = (
                     f"agentview -- {'+'.join(agent_paths)} {fan_word}" if agent_paths else "agentview (no extrinsic)"
                 )
@@ -670,7 +757,13 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                 q_now = state[state_slices[arm]]
                 wpaths = [_project_wrist(geometries[arm], bp, q_now, wrist_intr) for bp in base_paths[arm]]
                 wrist_sq = _draw_fan(
-                    _to_size(wimg, panel_w, panel_h), wpaths, chosen=chosen, colors=_FAN_COLORS[arm], scores=scores
+                    _to_size(wimg, panel_w, panel_h),
+                    wpaths,
+                    chosen=chosen,
+                    colors=_FAN_COLORS[arm],
+                    scores=scores,
+                    macro=macro,
+                    committed=committed,
                 )
                 panels.append((wrist_sq, f"wrist {arm} -- {fan_word}"))
                 if arm == "left" and agent_panel is not None:
@@ -724,19 +817,14 @@ def render(args: argparse.Namespace) -> pathlib.Path:
                 )
             composed = _compose_frame(panels, panel_w, panel_h, header=header, below=below)
             for _ in range(max(1, args.hold)):
-                frames.append(composed)
+                writer.append_data(composed)
+                written += 1
 
-    if not frames:
+    writer.close()
+    if not written:
+        out.unlink(missing_ok=True)
         raise SystemExit("nothing to render -- no frame had both action/action_samples and images")
-
-    import imageio
-
-    out = pathlib.Path(args.out).expanduser()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    # Browser-friendly h264: yuv420p is what every browser can decode (hf-utils encodes the same
-    # way for its dataset previews); macro_block_size=1 keeps odd panel widths from being padded.
-    imageio.mimwrite(out, frames, fps=args.fps, quality=8, macro_block_size=1, codec="libx264", pixelformat="yuv420p")
-    print(f"wrote {out} ({len(frames)} frames over {len(blocks)} chunk(s))")
+    print(f"wrote {out} ({written} frames over {len(blocks)} chunk(s))")
     return out
 
 

@@ -319,3 +319,60 @@ def test_a_strip_without_a_band_is_still_drawn():
     base = _value_panel_base((line, None, None), 320, 96, title="chunk length", fmt=".0f")
     img = _value_panel(base, 2, len(line), float(line[2]))
     assert img.shape == (96, 320, 3)
+
+
+def _straight_paths(n_candidates=3, steps=30):
+    """Candidate paths as plain pixel polylines, which is all _draw_fan consumes."""
+    import numpy as np
+
+    return [
+        np.stack([np.linspace(10, 300, steps), np.full(steps, 40.0 + 25 * c)], axis=1) for c in range(n_candidates)
+    ]
+
+
+def test_macro_group_boundaries_are_marked_on_the_chosen_path():
+    """The granularity the commitment could stop at. Only on the chosen path -- putting them on
+    every candidate would bury the one decision the picture is about."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _draw_fan
+
+    blank = np.zeros((120, 320, 3), np.uint8)
+    plain = _draw_fan(blank, _straight_paths(), chosen=0)
+    dotted = _draw_fan(blank, _straight_paths(), chosen=0, macro=5)
+    assert not np.array_equal(plain, dotted), "macro=5 must mark the boundaries"
+    # The dots are near-white (alpha-composited, so not pure 255); the coloured path is not.
+    assert (dotted > 200).all(axis=2).sum() > (plain > 200).all(axis=2).sum()
+
+
+def test_the_uncommitted_tail_is_drawn_faint():
+    """Adaptive executes only a prefix of the winning chunk. Drawing the rest at full weight would
+    claim the arm went somewhere it never did."""
+    import numpy as np
+
+    from workstation.lerobot_recorder.render_deploy_samples import _draw_fan
+
+    blank = np.zeros((120, 320, 3), np.uint8)
+    whole = _draw_fan(blank, _straight_paths(), chosen=0)
+    part = _draw_fan(blank, _straight_paths(), chosen=0, committed=10)
+    assert not np.array_equal(whole, part)
+    # The tail is dimmer, so the committed run keeps more bright pixels than the partial one.
+    assert (whole.sum(axis=2) > 300).sum() > (part.sum(axis=2) > 300).sum()
+
+
+def test_a_recording_without_the_commitment_columns_draws_as_before():
+    """bon runs and every older recording: no macro, nothing to dim."""
+    from workstation.lerobot_recorder.render_deploy_samples import _load_commitment
+
+    class _Reader:
+        def get_scalar(self, ep, frame, key):
+            return None
+
+    assert _load_commitment(_Reader(), 0, 0) == (None, None)
+
+    class _Adaptive(_Reader):
+        def get_scalar(self, ep, frame, key):
+            return {"critic_macro": 5.0, "critic_best_prefix": 2.0}.get(key)
+
+    # committed = (best_prefix + 1) * macro -- three groups of five.
+    assert _load_commitment(_Adaptive(), 0, 0) == (5, 15)
