@@ -66,9 +66,10 @@ case "$cmd" in
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
     render-samples) exec python -m workstation.lerobot_recorder.render_deploy_samples "$@" ;;
+    render-gui) exec python -m workstation.lerobot_recorder.render_gui "$@" ;;
     calibrate) exec python -m workstation.lerobot_recorder.calibrate_main "$@" ;;
     *)
-        echo "usage: yam-data {record|mark-homing|check-videos|recover|deploy|cams|tune|doctor|render-samples|calibrate} [args]" >&2
+        echo "usage: yam-data {record|mark-homing|check-videos|recover|deploy|cams|tune|doctor|render-samples|render-gui|calibrate} [args]" >&2
         exit 2
         ;;
 esac
