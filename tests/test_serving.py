@@ -76,6 +76,30 @@ def test_dagger_policy_intervention_and_home_states():
     dc.close()
 
 
+def test_dagger_intervention_tracks_gripper_directly_but_limits_arm(monkeypatch):
+    ctrl = DaggerController(DaggerConfig(sim=True, rate=120.0, max_joint_speed=0.12))
+
+    def fake_read_handle(leader):
+        return np.ones(leader.num_dofs()), 0.0, []
+
+    monkeypatch.setattr("i2rt.serving.controllers.read_handle", fake_read_handle)
+    try:
+        ctrl.set_policy_running(True)
+        ctrl.set_intervention(True)
+        for side, smoother in ctrl._smooth.items():
+            smoother.reset(np.array([0.0] * 6 + [1.0]))
+            ctrl._fine_mapper[side].map(np.zeros(6), np.zeros(6), enabled=False)
+
+        ctrl.step()
+
+        applied = np.asarray(ctrl.snapshot()["left"]["applied"], dtype=float)
+        assert applied[:6] == pytest.approx(np.full(6, 0.001))
+        assert applied[-1] == pytest.approx(0.0)
+        assert ctrl._smooth["left"].cur[-1] == pytest.approx(0.0)
+    finally:
+        ctrl.close()
+
+
 def test_dagger_button_map_toggles_rollout(monkeypatch):
     ctrl = DaggerController(
         DaggerConfig(sim=True, button_map={"left.0": "rollout_toggle", "left.1": "intervention_toggle"})
