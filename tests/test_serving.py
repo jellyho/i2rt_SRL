@@ -72,7 +72,7 @@ def test_dagger_policy_intervention_and_home_states():
     assert snap["dagger_state"] == "stopped"
     assert snap["policy_running"] is False
     assert snap["intervention"] is False
-    assert snap["last_dagger_event"]["action"] == "keep"
+    assert snap["last_dagger_event"]["action"] == "success"  # "keep" is accepted, and normalized to this
     dc.close()
 
 

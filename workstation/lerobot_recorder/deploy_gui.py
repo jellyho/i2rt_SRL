@@ -189,6 +189,9 @@ class DeployGUI(RecorderGUI):
         # watch-only policy run still overlays a demonstration, so hiding the field there left no
         # way to point the overlay at the datasets folder holding them.
         self._set_form_row_visible(self.root_edit, True)
+        # Same reasoning, one level further: the overlay's datasets need not sit beside the ones
+        # being recorded. Blank keeps the old behaviour (overlay reads the recording root).
+        self._set_form_row_visible(self.reference_root_edit, True)
         self.root_edit.setToolTip(
             "Folder holding one subfolder per dataset.\n"
             + (
@@ -210,7 +213,8 @@ class DeployGUI(RecorderGUI):
         for btn in (getattr(self, "reference_pause_btn", None), getattr(self, "reference_refresh_btn", None)):
             if btn is not None:
                 btn.setVisible(False)
-        self.keep_home_btn.setVisible(per_rollout_verdict)
+        self.success_home_btn.setVisible(per_rollout_verdict)
+        self.fail_home_btn.setVisible(per_rollout_verdict)
         self.discard_home_btn.setText("Discard + Home" if per_rollout_verdict else "Stop + Home")
         self.dagger_box.setTitle(
             {
@@ -276,10 +280,17 @@ class DeployGUI(RecorderGUI):
         self.intervention_btn = QtWidgets.QPushButton("Human Intervention")
         self.intervention_btn.setCheckable(True)
         self.intervention_btn.clicked.connect(self._on_intervention_toggle)
-        self.keep_home_btn = QtWidgets.QPushButton("Keep + Home")
-        self.keep_home_btn.clicked.connect(lambda: self._on_finish("keep"))
+        # A rollout ends with a verdict, not with keep-or-throw-away. Both outcomes are data: a
+        # critic is fitted on successes AND failures, so a run that fails is worth recording, and
+        # only a botched one (robot fault, wrong scene) is worth discarding.
+        self.success_home_btn = QtWidgets.QPushButton("Success + Home")
+        self.success_home_btn.clicked.connect(lambda: self._on_finish("success"))
+        self.fail_home_btn = QtWidgets.QPushButton("Failure + Home")
+        self.fail_home_btn.clicked.connect(lambda: self._on_finish("fail"))
         self.discard_home_btn = QtWidgets.QPushButton("Discard + Home")
         self.discard_home_btn.clicked.connect(lambda: self._on_finish("discard"))
+        # Kept as an alias so older call sites (and tests) still resolve.
+        self.keep_home_btn = self.success_home_btn
         self.runner_status = QtWidgets.QLabel("policy: not connected")
         self.runner_status.setStyleSheet(f"color:{theme.MUTED};")
         # Lives on the COLLECT page, not the setup page: the operator decides mid-session
@@ -293,9 +304,9 @@ class DeployGUI(RecorderGUI):
         )
         self.mirror_check.toggled.connect(self._on_mirror_toggled)
         self.button_legend = QtWidgets.QLabel(
-            "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during intervention; "
-            "left lower = human intervention on/off, "
-            "right upper = discard + home, right lower = keep + home."
+            "Handle buttons: left upper = start the rollout, then DISCARD it (fine-grained toggle "
+            "during intervention); left lower = human intervention on/off; "
+            "right upper = success + home, right lower = failure + home."
         )
         self.button_legend.setWordWrap(True)
         self.button_legend.setStyleSheet(
@@ -311,8 +322,9 @@ class DeployGUI(RecorderGUI):
         grid.addWidget(self.dagger_state, 0, 0, 1, 4)
         grid.addWidget(self.policy_btn, 1, 0)
         grid.addWidget(self.intervention_btn, 1, 1)
-        grid.addWidget(self.keep_home_btn, 1, 2)
-        grid.addWidget(self.discard_home_btn, 1, 3)
+        grid.addWidget(self.success_home_btn, 1, 2)
+        grid.addWidget(self.fail_home_btn, 1, 3)
+        grid.addWidget(self.discard_home_btn, 1, 4)
         grid.addWidget(self.mirror_check, 2, 0, 1, 4)
         grid.addWidget(self.chunk_plot, 3, 0, 1, 4)
         grid.addWidget(self.button_legend, 4, 0, 1, 4)
@@ -572,7 +584,7 @@ class DeployGUI(RecorderGUI):
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
         self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")
-        buttons = [self.policy_btn, self.intervention_btn, self.discard_home_btn]
+        buttons = [self.policy_btn, self.intervention_btn, self.discard_home_btn, self.fail_home_btn]
         if not self.deploy_only:
             buttons.append(self.keep_home_btn)
         for btn in buttons:

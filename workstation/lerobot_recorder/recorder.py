@@ -898,10 +898,16 @@ class Recorder:
         self._last_dagger_event_seq = seq
         action = str(event.get("action", "")).lower()
         if action == "keep":
+            # Legacy name from when the handle offered keep-or-throw-away. It wrote
+            # outcome="keep" into outcomes.jsonl, which reads as neither success nor fail: the
+            # writer's totals ignored it, and a success_only training run excluded every episode
+            # a DAgger operator had kept. A kept rollout is a successful one; say so.
+            action = "success"
+        if action in ("success", "fail"):
             if self._pending:
-                self.keep_episode(outcome="keep")
+                self.keep_episode(outcome=action)
             else:
-                self._btn_outcome = "keep"
+                self._btn_outcome = action
         elif action == "discard":
             if self._pending:
                 self.delete_episode()

@@ -443,10 +443,13 @@ def test_dagger_records_one_rollout_across_interventions():
     rec._step(images, snap(running=False, event={"seq": 1, "action": "keep"}))
     assert rec.gate.recording is False
     assert rec._pending is False
-    assert rec._btn_outcome == "keep"
+    assert rec._btn_outcome == "success"
     assert len(submitted) == 1
     assert len(submitted[0][0]) == 3
-    assert submitted[0][1] == "keep"
+    # The label that reaches the writer, and so outcomes.jsonl. It used to be "keep", which
+    # training reads as neither success nor fail -- success_only skipped every episode a DAgger
+    # operator had kept.
+    assert submitted[0][1] == "success"
 
 
 def test_dagger_discard_drops_the_complete_rollout():
@@ -515,7 +518,7 @@ def test_dagger_recorder_events_do_not_use_expert_button_map():
     assert rec._btn_outcome is None
 
     rec._scan_dagger_event({"last_dagger_event": {"seq": 1, "action": "keep"}})
-    assert rec._btn_outcome == "keep"
+    assert rec._btn_outcome == "success"
     rec._scan_dagger_event({"last_dagger_event": {"seq": 2, "action": "discard"}})
     assert rec._btn_outcome == "discard"
 
