@@ -43,6 +43,8 @@ _EMPTY = {
     "homing": False,
     "dagger_state": "stopped",
     "last_dagger_event": None,
+    "mirror_required": False,
+    "takeover_blocked": "",
     "estop": False,
     "stamp": 0.0,
 }
@@ -335,6 +337,10 @@ class PortalBridge:
             "homing": bool(obs.get("homing")),
             "dagger_state": obs.get("dagger_state") or ("intervention" if intervening else "stopped"),
             "last_dagger_event": obs.get("last_dagger_event"),
+            # Why a takeover is unavailable, straight from the robot: the GUI locks the control
+            # that would cause it rather than letting the operator discover it by pressing.
+            "mirror_required": bool(obs.get("mirror_required", False)),
+            "takeover_blocked": str(obs.get("takeover_blocked") or ""),
             "estop": bool(obs.get("estop")),
             "stamp": float(obs.get("t", 0.0)),
         }

@@ -583,12 +583,33 @@ class DeployGUI(RecorderGUI):
             self.policy_btn.setText("Stop Policy" if running else "Start Policy")
         self.intervention_btn.setChecked(intervention)
         self.intervention_btn.setText("Human Control" if intervention else "Human Intervention")
+        # A takeover the robot will refuse must not look available. Under absolute mapping
+        # (the default) it needs mirroring, so in DAgger the checkbox is locked ON rather than
+        # left as a control that quietly disables the mode it belongs to.
+        blocked_reason = str(st.get("takeover_blocked") or "")
+        lock_mirror = bool(st.get("mirror_required")) and self.run_mode == "dagger"
+        self.mirror_check.setEnabled(not lock_mirror)
+        if lock_mirror:
+            if not self.mirror_check.isChecked():
+                self.mirror_check.setChecked(True)  # pushes it to the robot via the toggle handler
+            self.mirror_check.setToolTip(
+                "Required in DAgger under leader_mapping=absolute: the takeover commands the arm "
+                "to the handle's pose, so the handle has to be on the arm.\n"
+                "Run with leader_mapping=relative to be able to turn it off."
+            )
         self.dagger_state.setText(f"state: {st.get('dagger_state', 'stopped')}")
         buttons = [self.policy_btn, self.intervention_btn, self.discard_home_btn, self.fail_home_btn]
         if not self.deploy_only:
             buttons.append(self.keep_home_btn)
         for btn in buttons:
             btn.setEnabled(not blocked)
+
+        if blocked_reason:
+            # Say it where the operator is looking, not only in the log.
+            self.intervention_btn.setEnabled(False)
+            self.intervention_btn.setToolTip(blocked_reason)
+        elif not blocked:
+            self.intervention_btn.setToolTip("")
 
         ready = self.policy_ready
         # Starting a rollout is what opens an episode, so without a policy it would record

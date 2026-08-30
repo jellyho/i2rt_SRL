@@ -81,6 +81,8 @@ class Recorder:
             "discarded": 0,
             "interventions": 0,
             "dagger_state": "stopped",
+            "mirror_required": False,
+            "takeover_blocked": "",
             "policy_running": False,
             "leader_mirror": True,
             "intervention": False,
@@ -872,6 +874,8 @@ class Recorder:
     def _dagger_status(snap: dict) -> dict:
         return {
             "dagger_state": snap.get("dagger_state", "stopped"),
+            "mirror_required": bool(snap.get("mirror_required", False)),
+            "takeover_blocked": str(snap.get("takeover_blocked") or ""),
             "policy_running": bool(snap.get("policy_running")),
             "leader_mirror": bool(snap.get("leader_mirror", True)),
             "intervention": bool(snap.get("intervention")),

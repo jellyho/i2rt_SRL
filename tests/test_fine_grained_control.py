@@ -409,3 +409,55 @@ def test_an_unknown_mirror_source_is_refused(monkeypatch):
     monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
     with pytest.raises(ValueError, match="leader_mirror_source"):
         ctl.DaggerController(ctl.DaggerConfig(leader_mirror_source="mesured"))
+
+
+def _grip_ctrl(ctl, monkeypatch, trigger):
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(ctl, "read_handle", lambda _leader: (leader.pos.copy(), trigger[0], [0, 0]))
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=1.5, rate=120.0))
+    ctrl.set_policy_running(True)
+    return ctrl, follower
+
+
+def test_the_gripper_ramps_into_a_takeover_then_tracks_directly(monkeypatch):
+    """The trigger can be anywhere at the instant of takeover. Squeeze it shut while the arm holds
+    an open gripper and a direct command slams the gripper closed on whatever is between the
+    fingers -- so the rate limit stands until the two agree, then the trigger drives it directly
+    (a full close is 0.67 s under the limiter at the defaults, which loses the grasp)."""
+    from i2rt.serving import controllers as ctl
+
+    trigger = [1.0]  # squeezed shut before the human even takes over
+    ctrl, follower = _grip_ctrl(ctl, monkeypatch, trigger)
+    ctrl._smooth["left"].reset(np.zeros(7))  # gripper open
+
+    ctrl.set_intervention(True)
+    ctrl.step()
+    first = float(ctrl._smooth["left"].cur[-1])
+    assert first < 0.2, f"the first tick of a takeover must not slam the gripper shut ({first})"
+
+    for _ in range(400):
+        ctrl.step()
+    assert ctrl._grip_caught_up.get("left") is True
+
+    # Caught up: now it is direct, so a full reopen lands in ONE tick rather than 80.
+    trigger[0] = 0.0
+    ctrl.step()
+    assert float(ctrl._smooth["left"].cur[-1]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_each_takeover_ramps_again(monkeypatch):
+    """The flag is per takeover, not per session: handing back to the policy and grabbing again
+    starts from wherever the gripper now is."""
+    from i2rt.serving import controllers as ctl
+
+    trigger = [0.0]
+    ctrl, _follower = _grip_ctrl(ctl, monkeypatch, trigger)
+    ctrl.set_intervention(True)
+    for _ in range(400):
+        ctrl.step()
+    assert ctrl._grip_caught_up.get("left") is True
+
+    ctrl.set_intervention(False)
+    ctrl.set_intervention(True)
+    assert ctrl._grip_caught_up.get("left") is not True
