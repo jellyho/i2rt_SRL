@@ -163,6 +163,9 @@ class RecorderConfig:
     # Leader-handle button -> episode outcome, keyed "<side>.<button_index>" (upper=0,
     # lower=1). Left upper is reserved for fine-grained control; right upper discards.
     button_map: dict = field(default_factory=lambda: dict(DEFAULT_TELEOP_BUTTON_OUTCOMES))
+    # Where the run page's overlay lists past demonstrations from. Empty = the recording root.
+    # They differ whenever rollouts are written somewhere other than where the demos were collected.
+    reference_root: str = ""
     review_downscale: int = 4  # spatial stride for the review preview (640x480 -> 160x120)
     # Operator-preview blend when a past dataset episode is selected.  1.0 is
     # live cameras only; 0.0 is the reference episode only.  This never changes

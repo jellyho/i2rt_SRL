@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 
 class StubLeader:
@@ -251,7 +252,12 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
         "read_handle",
         lambda _leader: (leader.pos.copy(), 0.0, list(current["buttons"])),
     )
-    ctrl = ctl.DaggerController(ctl.DaggerConfig(fine_grained_scale=0.2, max_joint_speed=1.2, rate=120.0))
+    # leader_mapping="relative" explicitly: this test is about the relative anchor (a takeover
+    # starts from where the ARM is, so it never travels to the handle), which is now the opt-in
+    # mode. The absolute default is covered by test_absolute_takeover_sends_the_leader_pose.
+    ctrl = ctl.DaggerController(
+        ctl.DaggerConfig(fine_grained_scale=0.2, max_joint_speed=1.2, rate=120.0, leader_mapping="relative")
+    )
 
     # Outside intervention left.0 retains rollout-toggle behavior.
     current["buttons"] = [1, 0]
@@ -296,3 +302,162 @@ def test_dagger_context_button_and_policy_handoff_are_safe(monkeypatch):
     ctrl.step()  # next takeover starts anchored in normal mode, without a snap
     assert ctrl.snapshot()["fine_grained"] is False
     assert np.allclose(ctrl.snapshot()["left"]["human"][:6], follower.pos[:6])
+
+
+def test_absolute_takeover_sends_the_leader_pose(monkeypatch):
+    """The default mapping: where you put the handle is where the arm goes.
+
+    Relative mapping anchors at the arm's pose, so the same handle position means a different arm
+    position later in a session -- the offset grows with every correction. Absolute has no offset
+    to accumulate, which is why it is the default; the cost is that with mirroring off the arm
+    travels to the handle on takeover (rate-limited, and warned about at startup).
+    """
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(ctl, "read_handle", lambda _leader: (leader.pos.copy(), 0.0, [0, 0]))
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=1.2, rate=120.0))
+
+    leader.pos[0] = 0.7
+    ctrl.set_intervention(True)
+    ctrl.step()
+    human = ctrl.snapshot()["left"]["human"]
+    assert human is not None
+    assert abs(human[0] - 0.7) < 1e-9, "absolute mapping commands the leader's own joint pose"
+
+    # ...and the travel toward it is still rate-limited, which is what keeps the mirror-off case
+    # merely slow rather than violent.
+    assert np.max(np.abs(follower.pos[:6])) <= ctrl._run_step + 1e-9
+
+
+def test_relative_is_still_available_and_anchors_at_the_arm(monkeypatch):
+    """The opt-in mode: the handle can sit far from the arm and the arm does not chase it."""
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(ctl, "read_handle", lambda _leader: (leader.pos.copy(), 0.0, [0, 0]))
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=1.2, rate=120.0, leader_mapping="relative"))
+
+    leader.pos[0] = 0.7
+    ctrl.set_intervention(True)
+    ctrl.step()
+    human = ctrl.snapshot()["left"]["human"]
+    assert human is not None
+    assert abs(human[0] - 0.7) > 0.5, "relative mapping must NOT command the leader's absolute pose"
+
+
+def test_an_unknown_mapping_is_refused(monkeypatch):
+    """A typo in config.yaml would otherwise silently pick one of the two behaviours."""
+    from i2rt.serving import controllers as ctl
+
+    pair, _leader, _follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    with pytest.raises(ValueError, match="leader_mapping"):
+        ctl.DaggerController(ctl.DaggerConfig(leader_mapping="asbolute"))
+
+
+def test_mirroring_chases_the_arm_not_the_command(monkeypatch):
+    """Mirroring exists so a takeover starts from the arm's pose, and with absolute mapping that
+    is now literal: whatever the handle is on, the arm is commanded to. Chasing the COMMAND gets
+    there only as well as the arm tracks it -- under load the command sits ahead, and the handle
+    inherits that offset for the takeover to close."""
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(ctl, "read_handle", lambda _leader: (leader.pos.copy(), 0.0, [0, 0]))
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=50.0, rate=120.0))
+    ctrl.set_policy_running(True)
+
+    # The arm lags its command, as a loaded arm does.
+    lagging = np.full(follower.pos.shape, 0.4)
+    monkeypatch.setattr(follower, "get_joint_pos", lambda: lagging.copy(), raising=False)
+    ctrl.set_policy_action({"left": np.ones(7)})
+    for _ in range(200):
+        ctrl.step()
+
+    assert leader.cmds, "mirroring should be driving the leader"
+    target = np.asarray(leader.cmds[-1], dtype=float)
+    assert np.max(np.abs(target - 0.4)) < 1e-6, "the handle should sit on the ARM, not on its command"
+
+
+def test_mirroring_can_still_chase_the_command(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(ctl, "read_handle", lambda _leader: (leader.pos.copy(), 0.0, [0, 0]))
+    ctrl = ctl.DaggerController(
+        ctl.DaggerConfig(max_joint_speed=50.0, rate=120.0, leader_mirror_source="command")
+    )
+    ctrl.set_policy_running(True)
+    monkeypatch.setattr(follower, "get_joint_pos", lambda: np.full(follower.pos.shape, 0.4), raising=False)
+    ctrl.set_policy_action({"left": np.ones(7)})
+    for _ in range(200):
+        ctrl.step()
+
+    target = np.asarray(leader.cmds[-1], dtype=float)
+    assert np.max(np.abs(target[:6] - 1.0)) < 1e-6, "command mode should track the commanded pose"
+
+
+def test_an_unknown_mirror_source_is_refused(monkeypatch):
+    from i2rt.serving import controllers as ctl
+
+    pair, _leader, _follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    with pytest.raises(ValueError, match="leader_mirror_source"):
+        ctl.DaggerController(ctl.DaggerConfig(leader_mirror_source="mesured"))
+
+
+def _grip_ctrl(ctl, monkeypatch, trigger):
+    pair, leader, follower = _pair(ctl)
+    monkeypatch.setattr(ctl, "build_bimanual", lambda specs, sim: {"left": pair})
+    monkeypatch.setattr(ctl, "read_handle", lambda _leader: (leader.pos.copy(), trigger[0], [0, 0]))
+    ctrl = ctl.DaggerController(ctl.DaggerConfig(max_joint_speed=1.5, rate=120.0))
+    ctrl.set_policy_running(True)
+    return ctrl, follower
+
+
+def test_the_gripper_ramps_into_a_takeover_then_tracks_directly(monkeypatch):
+    """The trigger can be anywhere at the instant of takeover. Squeeze it shut while the arm holds
+    an open gripper and a direct command slams the gripper closed on whatever is between the
+    fingers -- so the rate limit stands until the two agree, then the trigger drives it directly
+    (a full close is 0.67 s under the limiter at the defaults, which loses the grasp)."""
+    from i2rt.serving import controllers as ctl
+
+    trigger = [1.0]  # squeezed shut before the human even takes over
+    ctrl, follower = _grip_ctrl(ctl, monkeypatch, trigger)
+    ctrl._smooth["left"].reset(np.zeros(7))  # gripper open
+
+    ctrl.set_intervention(True)
+    ctrl.step()
+    first = float(ctrl._smooth["left"].cur[-1])
+    assert first < 0.2, f"the first tick of a takeover must not slam the gripper shut ({first})"
+
+    for _ in range(400):
+        ctrl.step()
+    assert ctrl._grip_caught_up.get("left") is True
+
+    # Caught up: now it is direct, so a full reopen lands in ONE tick rather than 80.
+    trigger[0] = 0.0
+    ctrl.step()
+    assert float(ctrl._smooth["left"].cur[-1]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_each_takeover_ramps_again(monkeypatch):
+    """The flag is per takeover, not per session: handing back to the policy and grabbing again
+    starts from wherever the gripper now is."""
+    from i2rt.serving import controllers as ctl
+
+    trigger = [0.0]
+    ctrl, _follower = _grip_ctrl(ctl, monkeypatch, trigger)
+    ctrl.set_intervention(True)
+    for _ in range(400):
+        ctrl.step()
+    assert ctrl._grip_caught_up.get("left") is True
+
+    ctrl.set_intervention(False)
+    ctrl.set_intervention(True)
+    assert ctrl._grip_caught_up.get("left") is not True

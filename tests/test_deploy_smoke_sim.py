@@ -197,3 +197,23 @@ def test_robot_reports_the_deploy_mode(robot_server):
     """What the workstation's startup check reads to refuse a crossed server."""
     ctrl, _ = robot_server
     assert ctrl.snapshot()["mode"] == "deploy"
+
+
+def test_no_snapshot_field_is_an_empty_string(robot_server):
+    """portal's SendBuffer asserts every buffer is non-empty, so an empty string in the snapshot
+    kills the RPC server thread -- the client simply stops receiving, with the real cause buried in
+    a server-side traceback. Send None instead, as last_dagger_event already does."""
+    ctrl, _port = robot_server
+    ctrl.step()
+    snap = ctrl.snapshot()
+
+    def empties(obj, path="snapshot"):
+        if isinstance(obj, str):
+            return [] if obj else [path]
+        if isinstance(obj, dict):
+            return [p for k, v in obj.items() for p in empties(v, f"{path}.{k}")]
+        if isinstance(obj, (list, tuple)):
+            return [p for i, v in enumerate(obj) for p in empties(v, f"{path}[{i}]")]
+        return []
+
+    assert empties(snap) == []

@@ -724,12 +724,37 @@ class DeployConfig:
     arm_type: str = "yam"
     leader_gripper: str = "yam_teaching_handle"
     follower_gripper: str = "linear_4310"
+    #: How a takeover maps the leader onto the follower.
+    #:
+    #: "absolute" (default) sends the leader's own joint pose, so the handle and the arm agree:
+    #: where you put the handle is where the arm goes. "relative" accumulates leader deltas from
+    #: the pose the follower held at takeover, which keeps the arm from travelling when the handle
+    #: is nowhere near it -- at the cost of an offset that grows with every correction, so the
+    #: same handle pose means a different arm pose later in the session.
+    #:
+    #: Fine-grained mode is relative by construction (it scales leader deltas), so it still maps
+    #: relatively while engaged whatever this says -- that is what fine-grained IS.
+    leader_mapping: str = "absolute"
+    #: What the handle mirrors while the policy drives.
+    #:
+    #: "measured" (default) tracks the follower's OWN joint positions, so the handle physically
+    #: coincides with the arm and an absolute takeover starts with no offset at all.
+    #: "command" tracks the command sent to the follower instead. Same PD either way -- the leader's
+    #: nominal kp with the arm's kd -- but the arm's tracking error under load means the command
+    #: sits slightly ahead of the arm, and mirroring it puts the handle there too.
+    #:
+    #: There is no feedback loop in "measured": while the policy drives, the follower tracks the
+    #: POLICY, and mirroring is off entirely during a takeover.
+    leader_mirror_source: str = "measured"
     button_map: Dict[str, str] = field(
         default_factory=lambda: {
+            # Left upper starts the rollout, then discards it (see _toggle_button_action);
+            # left lower takes over. The right pair is the verdict, which is what a deployment
+            # actually produces: every rollout is a success or a failure, and both are data.
             "left.0": "rollout_toggle",
             "left.1": "intervention_toggle",
-            "right.0": "discard_home",
-            "right.1": "keep_home",
+            "right.0": "success_home",
+            "right.1": "fail_home",
         }
     )
 
@@ -819,6 +844,28 @@ class DeployController(BaseController):
         self.home_full_released = (
             np.concatenate([self.home_arm, [self.release_grip]]) if self._has_grip else self.home_arm.copy()
         )
+        mapping = str(getattr(cfg, "leader_mapping", "absolute")).lower()
+        if mapping not in ("absolute", "relative"):
+            raise ValueError(f"leader_mapping must be 'absolute' or 'relative', got {cfg.leader_mapping!r}")
+        self._relative_mapping = mapping == "relative"
+        # Per side: has the trigger caught up with the gripper since this takeover began? Cleared
+        # on every intervention edge, so each takeover ramps once and then tracks directly.
+        self._grip_caught_up: Dict[str, bool] = {}
+        source = str(getattr(cfg, "leader_mirror_source", "measured")).lower()
+        if source not in ("measured", "command"):
+            raise ValueError(f"leader_mirror_source must be 'measured' or 'command', got {cfg.leader_mirror_source!r}")
+        self._mirror_measured = source == "measured"
+        logger.info("takeover maps the leader %sly onto the follower", mapping)
+        if not self._relative_mapping and not self._leader_mirror:
+            # Absolute mapping sends the leader's own pose. With mirroring ON the handle is already
+            # tracking the arm, so a takeover is seamless; with it OFF the handle hangs wherever it
+            # was left and the arm TRAVELS there on takeover -- rate-limited by max_joint_speed,
+            # but a large unasked-for motion all the same. Relative mapping anchors at the arm's
+            # current pose instead and never travels.
+            logger.warning(
+                "leader_mapping=absolute with leader_mirror=off: on takeover the follower travels "
+                "to wherever the handle is left. Turn mirroring on, or use leader_mapping=relative."
+            )
         self._fine_mapper = {s: FineGrainedMapper(cfg.fine_grained_scale) for s in self.pairs}
         self._recenter_target = {
             s: np.asarray(p.follower.get_joint_pos(), dtype=float).copy() for s, p in self.pairs.items()
@@ -890,13 +937,39 @@ class DeployController(BaseController):
         """Release -> travel -> close is one routine; nothing may cut into the middle of it."""
         return bool(self._homing or self._releasing_grip or self._closing_at_home)
 
+    def takeover_blocked(self) -> str:
+        """Why a takeover cannot start right now, or "" if it can.
+
+        Absolute mapping commands the follower to the handle's own pose. With mirroring on the
+        handle is already tracking the arm, so that is a no-op and the takeover is seamless. With
+        mirroring OFF the handle hangs wherever it was left, and the same command becomes a
+        travel across the workspace the instant a human grabs it -- rate-limited, but not asked
+        for and not expected. Refusing is better than warning: the warning arrives on a terminal,
+        the motion arrives on the arm.
+
+        Relative mapping anchors at the arm's current pose, so it has nothing to travel to.
+        """
+        if self._relative_mapping or self._leader_mirror:
+            return ""
+        return (
+            "takeover refused: leader_mapping=absolute needs leader mirroring ON, or the follower "
+            "would travel to wherever the handle was left. Turn mirroring on, or run with "
+            "leader_mapping=relative."
+        )
+
     def set_intervention(self, flag: bool) -> None:
         if self._in_homing_sequence():
             return
         flag = bool(flag)
         if flag == self._intervening:
             return
+        if flag:
+            blocked = self.takeover_blocked()
+            if blocked:
+                logger.warning("%s", blocked)
+                return
         self._intervening = flag
+        self._grip_caught_up = {}  # a new takeover ramps the gripper again from wherever it is
         self._reset_fine_grained()
         # Handoff to policy mirroring starts from the physical leader pose, never
         # from a potentially distant target left by an offset intervention.
@@ -913,6 +986,12 @@ class DeployController(BaseController):
         """
         flag = bool(flag)
         if flag == self._leader_mirror:
+            return
+        if not flag and self._intervening and not self._relative_mapping:
+            # Turning it off mid-takeover would strand the handle away from the arm and leave the
+            # next takeover to travel there. Same rule as takeover_blocked, applied from the
+            # other direction.
+            logger.warning("leader mirroring stays on during a takeover under leader_mapping=absolute")
             return
         self._leader_mirror = flag
         # Re-seed the mirror limiter from the physical leader so re-enabling mid-rollout
@@ -983,9 +1062,21 @@ class DeployController(BaseController):
                 return False
         return True
 
+    #: How a rollout can end. "success"/"fail" both KEEP the episode and differ only in the label
+    #: the recorder writes; "discard" throws it away. Keeping a failure matters -- a critic is
+    #: fitted on both outcomes, so discarding every failure would train it on successes alone.
+    FINISH_ACTIONS = ("success", "fail", "discard")
+
+    #: Normalized gripper units within which the trigger counts as having caught up with the
+    #: gripper, after which the trigger drives it directly. Small enough that the remaining step is
+    #: imperceptible, large enough to be reached in a few ticks of the limiter.
+    _GRIP_CAUGHT_UP = 0.05
+
     def finish_dagger_run(self, action: str) -> None:
         action = str(action).lower()
-        if action not in {"keep", "discard"}:
+        if action == "keep":
+            action = "success"  # legacy name from when the choice was keep-or-throw-away
+        if action not in self.FINISH_ACTIONS:
             logger.warning("unknown dagger finish action: %s", action)
             return
         self._event_seq += 1
@@ -1020,11 +1111,20 @@ class DeployController(BaseController):
 
     def _toggle_button_action(self, action: str) -> None:
         if action == "rollout_toggle":
-            self.set_policy_running(not self._policy_running)
+            # Once the rollout is running there is nothing left for a "start" button to do, so the
+            # same button throws the run away -- which frees both right-hand buttons to be the
+            # success/fail verdict. Not while intervening: there the button is the fine-grained
+            # toggle (cfg.fine_grained_button), and stealing it would end a run mid-correction.
+            if self._policy_running and not self._intervening:
+                self.finish_dagger_run("discard")
+            else:
+                self.set_policy_running(not self._policy_running)
         elif action == "intervention_toggle":
             self.set_intervention(not self._intervening)
-        elif action == "keep_home":
-            self.finish_dagger_run("keep")
+        elif action in ("success_home", "fail_home"):
+            self.finish_dagger_run(action.removesuffix("_home"))
+        elif action == "keep_home":  # legacy mapping
+            self.finish_dagger_run("success")
         elif action == "discard_home":
             self.finish_dagger_run("discard")
         else:
@@ -1193,12 +1293,17 @@ class DeployController(BaseController):
                                 self.cfg.fine_recenter_max_following_error,
                             )
                     elif valid[side]:
+                        # build_follower_target is already the leader's ABSOLUTE pose; the mapper
+                        # replaces it with a delta accumulated from the takeover anchor. Which of
+                        # the two the operator gets is cfg.leader_mapping -- except in fine-grained
+                        # mode, which is a scaled delta by definition and so always maps relatively.
                         human = build_follower_target(pair.follower, arm_q[side], grip_cmd[side])
-                        human[: self.home_arm.size] = self._fine_mapper[side].map(
-                            arm_q[side][: self.home_arm.size],
-                            smoother.cur[: self.home_arm.size],
-                            self._fine_grained,
-                        )
+                        if self._relative_mapping or self._fine_grained:
+                            human[: self.home_arm.size] = self._fine_mapper[side].map(
+                                arm_q[side][: self.home_arm.size],
+                                smoother.cur[: self.home_arm.size],
+                                self._fine_grained,
+                            )
                         desired = human
                         if self.bilateral_kp > 0.0:
                             self._drive_leader(
@@ -1242,14 +1347,21 @@ class DeployController(BaseController):
                 if desired is not None:
                     target = desired if self._leader_recentering else smoother.step(desired)
                     if self._intervening and human is not None and self._has_grip:
-                        # Match steady teleoperation: the teaching-handle trigger
-                        # directly controls the normalized gripper command.  Keep
-                        # arm joints rate-limited across the policy/human handoff,
-                        # but do not make a full gripper close take 1 / joint-speed
-                        # seconds.  Synchronize the smoother so the next handoff
-                        # still starts from the command that was actually applied.
-                        target[-1] = human[-1]
-                        smoother.cur[-1] = human[-1]
+                        # Match steady teleoperation: the teaching-handle trigger directly
+                        # controls the normalized gripper command, so a close is immediate rather
+                        # than 1 / max_joint_speed seconds (0.67 s at the defaults -- the limiter
+                        # treats the 0-1 gripper as if it were radians).
+                        #
+                        # But only AFTER it has caught up. At the instant of takeover the trigger
+                        # can be anywhere: squeeze it shut while the arm holds an open gripper and
+                        # a direct command slams the gripper closed on whatever is between the
+                        # fingers. Until the two agree, the smoother's rate limit stands -- the
+                        # same ramp the arm joints get on engage, for the same reason.
+                        if abs(float(human[-1]) - float(smoother.cur[-1])) <= self._GRIP_CAUGHT_UP:
+                            self._grip_caught_up[side] = True
+                        if self._grip_caught_up.get(side):
+                            target[-1] = human[-1]
+                            smoother.cur[-1] = human[-1]
                     applied = self._apply(pair.follower, target)
                     if not self._intervening and self._policy_running and applied is not None:
                         if self._leader_mirror:
@@ -1259,7 +1371,9 @@ class DeployController(BaseController):
                             leader_smoother = self._leader_smooth[side]
                             leader_smoother.max_step = self._run_step
                             mirror_target = leader_smoother.step(
-                                np.asarray(applied, dtype=float)[: pair.leader.num_dofs()]
+                                np.asarray(self._mirror_reference(pair, applied), dtype=float)[
+                                    : pair.leader.num_dofs()
+                                ]
                             )
                             # Scale 1.0: the leader's own nominal kp, paired with the arm's
                             # yam.yml kd. Leader and follower are the same arm, so this is the
@@ -1358,6 +1472,14 @@ class DeployController(BaseController):
                 # Latched, so a mid-rollout hiccup does not split the episode in two.
                 "policy_driving": bool(self._policy_drove) or bool(self._intervening),
                 "leader_mirror": bool(self._leader_mirror),
+                # So a client can say WHY a takeover is unavailable, and lock the control that
+                # would cause it, instead of letting the operator find out by pressing the button.
+                "leader_mapping": "relative" if self._relative_mapping else "absolute",
+                "mirror_required": not self._relative_mapping,
+                # None, never "": portal's SendBuffer asserts every buffer is non-empty, so an
+                # empty string kills the RPC server thread and the client just stops getting
+                # snapshots. `last_dagger_event` carries None the same way.
+                "takeover_blocked": self.takeover_blocked() or None,
                 # Releasing and the closing tail are part of the same homing routine: report
                 # them as homing so nothing starts a rollout or streams actions mid-sequence.
                 "homing": bool(self._homing or self._releasing_grip or self._closing_at_home),
@@ -1393,6 +1515,22 @@ class DeployController(BaseController):
             leader.command_joint_pos(np.asarray(target_arm, dtype=float)[:m])
         except Exception:
             pass
+
+    def _mirror_reference(self, pair: ArmPair, applied: np.ndarray) -> np.ndarray:
+        """What the handle should chase this tick: the arm, or the command sent to it.
+
+        Mirroring exists so a takeover starts from the arm's pose. Chasing the COMMAND gets that
+        only as well as the arm tracks it -- under load the command sits ahead, and the handle
+        inherits exactly that offset, which an absolute takeover then commands the arm to close.
+        Chasing the MEASURED position has no such offset by construction. Falls back to the command
+        if the follower cannot be read, which is the old behaviour rather than a stall.
+        """
+        if not self._mirror_measured:
+            return applied
+        try:
+            return np.asarray(pair.follower.get_joint_pos(), dtype=float)
+        except Exception:
+            return applied
 
     def _drive_leader(
         self, pair: ArmPair, target_q: np.ndarray, kp_scale: float, kd: Optional[np.ndarray] = None

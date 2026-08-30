@@ -226,6 +226,14 @@ class RecorderGUI(QtWidgets.QWidget):
         self.task_combo.setCurrentText(self.cfg.task)
 
         self.root_edit.textChanged.connect(self._on_root_changed)
+        self.reference_root_edit = QtWidgets.QLineEdit(getattr(self.cfg, "reference_root", "") or "")
+        self.reference_root_edit.setPlaceholderText("same as root")
+        self.reference_root_edit.setToolTip(
+            "Folder holding the datasets the run page's overlay lists past demonstrations from.\n"
+            "Leave blank to use the recording root. Set it when the rollouts being recorded and "
+            "the demonstrations being overlaid live in different folders."
+        )
+        self.reference_root_edit.textChanged.connect(lambda *_: self._refresh_reference_datasets())
         self.repo_combo.editTextChanged.connect(self._on_dataset_changed)
 
         self.source_combo = PickerComboBox()
@@ -255,6 +263,7 @@ class RecorderGUI(QtWidgets.QWidget):
 
         form.addRow("repo_id", self.repo_combo)
         form.addRow("root", self.root_edit)
+        form.addRow("overlay root", self.reference_root_edit)
         form.addRow("task", self.task_combo)
         form.addRow("source", self.source_combo)
         form.addRow("", self.resume_check)
@@ -449,6 +458,7 @@ class RecorderGUI(QtWidgets.QWidget):
         # Set root/repo/task in this order so their existing change handlers
         # repopulate the dependent dataset and task choices correctly.
         self.root_edit.setText(saved("root", self.root_edit.text(), str))
+        self.reference_root_edit.setText(saved("reference_root", self.reference_root_edit.text(), str))
         self.repo_combo.setCurrentText(saved("repo_id", self.repo_combo.currentText(), str))
         self.task_combo.setCurrentText(saved("task", self.task_combo.currentText(), str))
 
@@ -474,6 +484,7 @@ class RecorderGUI(QtWidgets.QWidget):
         values = {
             "repo_id": self.repo_combo.currentText().strip(),
             "root": self.root_edit.text().strip(),
+            "reference_root": self.reference_root_edit.text().strip(),
             "task": self.task_combo.currentText().strip(),
             "source": self.source_combo.currentText().strip(),
             "resume": self.resume_check.isChecked(),
@@ -637,10 +648,24 @@ class RecorderGUI(QtWidgets.QWidget):
         """Folder name for the dataset being written in this session."""
         return os.path.basename(os.path.normpath(dataset_dir(self.cfg.root, self.cfg.repo_id)))
 
+    def _reference_root(self) -> str:
+        """Where the overlay looks for past demonstrations.
+
+        Separate from the recording root because the two genuinely differ: rollouts are written
+        into today's folder while the demonstrations worth overlaying live wherever they were
+        collected. Blank means "the same as the recording root", which is the common case and
+        keeps the field out of the way until it is needed.
+        """
+        if hasattr(self, "reference_root_edit"):
+            typed = self.reference_root_edit.text().strip()
+            if typed:
+                return typed
+        return self.root_edit.text().strip() if hasattr(self, "root_edit") else self.cfg.root
+
     def _refresh_reference_datasets(self, *, preferred: Optional[str] = None) -> None:
         """Rescan overlay source folders under the session root, then their episodes."""
         current = preferred or self.reference_dataset_combo.currentText().strip()
-        choices = list_datasets(self.cfg.root)
+        choices = list_datasets(self._reference_root())
         if current not in choices:
             active = self._active_dataset_name()
             current = active if active in choices else (choices[0] if choices else "")
@@ -668,12 +693,14 @@ class RecorderGUI(QtWidgets.QWidget):
             self._reference_player.stop()
             self.reference_pause_btn.setEnabled(False)
             self.reference_pause_btn.setText("Resume reference")
-            self.reference_status.setText(f"No dataset folders found under {os.path.expanduser(self.cfg.root)}.")
+            self.reference_status.setText(
+                f"No dataset folders found under {os.path.expanduser(self._reference_root())}."
+            )
             return
 
         selected = self._reference_player.episode
         selected_number = selected.episode if selected is not None else None
-        root = dataset_dir(self.cfg.root, dataset_name)
+        root = dataset_dir(self._reference_root(), dataset_name)
         try:
             episodes = discover_reference_episodes(root, self._reference_camera_keys)
         except Exception as exc:

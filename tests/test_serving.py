@@ -72,7 +72,7 @@ def test_dagger_policy_intervention_and_home_states():
     assert snap["dagger_state"] == "stopped"
     assert snap["policy_running"] is False
     assert snap["intervention"] is False
-    assert snap["last_dagger_event"]["action"] == "keep"
+    assert snap["last_dagger_event"]["action"] == "success"  # "keep" is accepted, and normalized to this
     dc.close()
 
 
@@ -94,8 +94,18 @@ def test_dagger_intervention_tracks_gripper_directly_but_limits_arm(monkeypatch)
 
         applied = np.asarray(ctrl.snapshot()["left"]["applied"], dtype=float)
         assert applied[:6] == pytest.approx(np.full(6, 0.001))
-        assert applied[-1] == pytest.approx(0.0)
+        # The trigger starts a full close away from the gripper, so the FIRST tick of a takeover
+        # is still rate-limited -- a direct command here would slam the gripper shut on whatever
+        # is between the fingers.
+        assert applied[-1] > 0.5
+
+        # Once the two agree the trigger drives the gripper directly, which is the point: under
+        # the limiter alone a full close takes 1 / max_joint_speed seconds.
+        for _ in range(2000):
+            ctrl.step()
+        assert ctrl._grip_caught_up.get("left") is True
         assert ctrl._smooth["left"].cur[-1] == pytest.approx(0.0)
+        assert np.asarray(ctrl.snapshot()["left"]["applied"], dtype=float)[-1] == pytest.approx(0.0)
     finally:
         ctrl.close()
 
