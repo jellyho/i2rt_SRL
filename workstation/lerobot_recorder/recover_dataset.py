@@ -26,6 +26,16 @@ so this is reversible and a partial episode worth salvaging is still there. A fi
 metadata *does* reference is never touched — if one of those is unreadable that is real data
 loss and it is reported instead, because no cleanup can fix it.
 
+It also repairs the crash that leaves *no* leftover files: LeRobot rewrites ``meta/info.json``
+every episode but flushes the episode parquets in batches, so Ctrl-C leaves the counters
+claiming episodes that only ever existed in memory, and the next open fails with
+
+    FileNotFoundError: Cached dataset doesn't contain all requested episodes
+    ... RepositoryNotFoundError: 404 ... /api/datasets/<repo>/refs
+
+Those episodes are unrecoverable; ``--fix`` rolls the counters back onto what is on disk so
+the surviving episodes open and recording can continue.
+
 The recorder runs the same recovery by itself when it resumes a dataset, so this command is
 for datasets you are not about to record into.
 """
@@ -37,28 +47,39 @@ import sys
 from typing import List, Optional
 
 from i2rt.serving.rig_config import Resolver, load_rig
-from workstation.lerobot_recorder.crash_recovery import describe, find_crash_leftovers, recover, verify
+from workstation.lerobot_recorder.crash_recovery import (
+    describe,
+    find_crash_leftovers,
+    find_uncommitted_metadata,
+    recover,
+    verify,
+)
 from workstation.lerobot_recorder.dataset_writer import dataset_dir, list_datasets
 
 
 def _process(name: str, root: str, fix: bool) -> int:
     ds_dir = dataset_dir(root, name)
     found = find_crash_leftovers(ds_dir)
+    drift = find_uncommitted_metadata(ds_dir)
 
-    if not found:
+    if not found and drift is None:
         state = verify(ds_dir)
         if state["ok"]:
             print(f"[{name}] clean — opens fine ({state['episodes']} episodes, {state['frames']} frames)")
             return 0
         # Nothing to clean up, yet it will not open: say so plainly rather than implying
         # this tool can fix it.
-        print(f"[{name}] no crash leftovers, but the dataset does not open:\n    {state['error']}",
-              file=sys.stderr)
+        print(f"[{name}] no crash leftovers, but the dataset does not open:\n    {state['error']}", file=sys.stderr)
         return 1
 
-    total = sum(len(v) for v in found.values())
+    total = sum(len(v) for v in found.values()) + (1 if drift else 0)
     print(f"[{name}] {total} leftover item(s) from an interrupted recording:")
     print(describe(ds_dir))
+    if drift:
+        print(
+            f"[{name}] --fix rolls the counters back to {drift['committed_episodes']} episodes; "
+            f"the {drift['lost_episodes']} buffered episode(s) never reached disk and cannot be recovered."
+        )
 
     if not fix:
         state = verify(ds_dir)
@@ -69,14 +90,19 @@ def _process(name: str, root: str, fix: bool) -> int:
 
     result = recover(ds_dir)
     print(f"[{name}] moved {len(result['moved'])} item(s) to {result['quarantine']}")
+    if result["uncommitted"]:
+        u = result["uncommitted"]
+        print(
+            f"[{name}] rolled meta/info.json back {u['info_episodes']} -> {u['committed_episodes']} episodes "
+            f"({u['info_frames']} -> {u['committed_frames']} frames)"
+        )
 
     state = verify(ds_dir)
     if state["ok"]:
         print(f"[{name}] recovered — opens fine ({state['episodes']} episodes, {state['frames']} frames)")
         return 0
     print(f"[{name}] still does not open after recovery: {state['error']}", file=sys.stderr)
-    print(f"[{name}] the quarantine at {result['quarantine']} has everything that was moved",
-          file=sys.stderr)
+    print(f"[{name}] the quarantine at {result['quarantine']} has everything that was moved", file=sys.stderr)
     return 1
 
 
