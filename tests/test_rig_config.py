@@ -301,3 +301,39 @@ def test_reference_overlay_opacity_is_shared_by_record_and_deploy_configs(tmp_pa
 
     assert record_cfg.reference_live_alpha == 0.3
     assert deploy_cfg.reference_live_alpha == 0.3
+
+
+def test_the_two_button_maps_are_separate_and_mean_different_things():
+    """config.yaml carries one map per mode, and they are not interchangeable.
+
+    `recorder.buttons` is teleop: a human drives, so a press is an episode OUTCOME. `deploy.buttons`
+    is policy-driven: the robot owns the rollout state machine, so a press is an ACTION. They
+    disagree on right.0 -- discard there, success here -- and when the recorder read the teleop map
+    during an eval rollout the robot closed the episode as a success while the recorder threw it
+    away in the same tick.
+    """
+    import pathlib
+
+    import yaml
+
+    from i2rt.serving.controllers import DeployController
+
+    cfg = yaml.safe_load((pathlib.Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+    teleop = cfg["recorder"]["buttons"]
+    deploy = cfg["deploy"]["buttons"]
+
+    assert teleop["right.0"] == "discard", "teleop: a press is an outcome"
+    assert deploy["right.0"] == "success_home", "deploy: a press is an action"
+    assert set(deploy.values()) <= set(DeployController.BUTTON_ACTIONS), "deploy values are robot actions"
+    assert set(teleop.values()) <= {"success", "fail", "discard"}, "teleop values are outcomes"
+
+
+def test_an_unknown_deploy_action_is_refused_at_startup():
+    """A typo would otherwise cost one warning at press time and a button that does nothing --
+    during a rollout, where the operator is watching the arm rather than the log."""
+    import pytest
+
+    from i2rt.serving.controllers import DaggerConfig, DaggerController
+
+    with pytest.raises(ValueError, match="unknown button action"):
+        DaggerController(DaggerConfig(sim=True, button_map={"right.0": "sucess_home"}))
