@@ -844,6 +844,15 @@ class DeployController(BaseController):
         self.home_full_released = (
             np.concatenate([self.home_arm, [self.release_grip]]) if self._has_grip else self.home_arm.copy()
         )
+        # A typo in config.yaml's deploy.buttons would otherwise cost one warning at press time
+        # and a button that does nothing -- during a rollout, where the operator is watching the
+        # arm rather than the log. Refuse at startup instead, when it is cheap to fix.
+        unknown = sorted(set(map(str, (cfg.button_map or {}).values())) - set(self.BUTTON_ACTIONS))
+        if unknown:
+            raise ValueError(
+                f"unknown button action(s) {unknown} in the deploy button map; "
+                f"known: {sorted(self.BUTTON_ACTIONS)}"
+            )
         mapping = str(getattr(cfg, "leader_mapping", "absolute")).lower()
         if mapping not in ("absolute", "relative"):
             raise ValueError(f"leader_mapping must be 'absolute' or 'relative', got {cfg.leader_mapping!r}")
@@ -1066,6 +1075,17 @@ class DeployController(BaseController):
     #: the recorder writes; "discard" throws it away. Keeping a failure matters -- a critic is
     #: fitted on both outcomes, so discarding every failure would train it on successes alone.
     FINISH_ACTIONS = ("success", "fail", "discard")
+
+    #: What a handle button may be mapped to in config.yaml's `deploy.buttons`. "keep_home" and
+    #: "discard_home" are the older names, still accepted so an existing rig config keeps working.
+    BUTTON_ACTIONS = (
+        "rollout_toggle",
+        "intervention_toggle",
+        "success_home",
+        "fail_home",
+        "discard_home",
+        "keep_home",
+    )
 
     #: Normalized gripper units within which the trigger counts as having caught up with the
     #: gripper, after which the trigger drives it directly. Small enough that the remaining step is

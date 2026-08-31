@@ -164,12 +164,30 @@ recorder:
   image_writer_threads: 12   # temp-PNG writer threads (the slow pre-encode step of the fallback);
                              # LeRobot advises ~4 per camera. 0 = synchronous (slowest)
   image_writer_processes: 0  # >0 = also use subprocesses if threads alone aren't enough
-  # Single source for teleop end+label behavior. Each mapped button both starts
-  # homing on the robot and assigns this outcome in the recorder.
+  # TELEOP only. A human drives, so each mapped button both starts homing on the robot and
+  # assigns this outcome in the recorder. Deploy/DAgger has its OWN map under `deploy:` below --
+  # there the policy drives and the buttons mean actions, not outcomes. Keep the two apart: they
+  # disagree on right.0, and when the recorder read this map during an eval rollout the robot
+  # closed the episode as a success while the recorder discarded it in the same tick.
   buttons:                   # "<side>.<index>" -> success | fail | discard (upper=0, lower=1)
     left.1: success          # left lower  -> success + home
     right.1: fail            # right lower -> fail + home
     right.0: discard         # right upper -> discard + home
+
+deploy:                      # policy-driven modes (deploy / DAgger / eval) -- robot server
+  # Handle buttons while a POLICY drives. Values are robot ACTIONS, not outcomes: the robot owns
+  # the rollout state machine here and reports the verdict back to the recorder, so this is the
+  # only place the mapping lives for these modes.
+  #
+  # Left upper starts the rollout and then discards it -- once a rollout is running there is
+  # nothing left for a start button to do, and that frees the right pair to be the verdict. It
+  # stays the fine-grained toggle during an intervention, so a correction is never ended by it.
+  buttons:                   # "<side>.<index>" -> rollout_toggle | intervention_toggle |
+                             #                     success_home | fail_home | discard_home
+    left.0: rollout_toggle   # left upper  -> start, then DISCARD (fine-grained while intervening)
+    left.1: intervention_toggle  # left lower -> human takeover on/off
+    right.0: success_home    # right upper -> SUCCESS + home
+    right.1: fail_home       # right lower -> FAILURE + home
 
 tasks:                       # quick-switch language instructions in the recorder GUI
   - "pick up the cap and close the bottle"
