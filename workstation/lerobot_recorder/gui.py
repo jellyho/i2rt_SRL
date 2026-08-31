@@ -233,7 +233,7 @@ class RecorderGUI(QtWidgets.QWidget):
             "Leave blank to use the recording root. Set it when the rollouts being recorded and "
             "the demonstrations being overlaid live in different folders."
         )
-        self.reference_root_edit.textChanged.connect(lambda *_: self._refresh_reference_datasets())
+        self.reference_root_edit.textEdited.connect(self._on_reference_root_typed)
         self.repo_combo.editTextChanged.connect(self._on_dataset_changed)
 
         self.source_combo = PickerComboBox()
@@ -380,6 +380,22 @@ class RecorderGUI(QtWidgets.QWidget):
         self.reference_refresh_btn = QtWidgets.QPushButton("Refresh demonstrations")
         self.reference_refresh_btn.clicked.connect(self._refresh_reference_datasets)
 
+        # The same setting as the setup page's "overlay root", on the RUN page too. The setup page
+        # is gone once the session starts, and which demonstrations are worth ghosting is a thing
+        # the operator works out mid-session -- the same reasoning that put the mirror checkbox
+        # here. Both edits drive one value (see _on_reference_root_typed), so there is no second
+        # source to fall out of sync.
+        self.reference_root_run_edit = QtWidgets.QLineEdit()
+        self.reference_root_run_edit.setPlaceholderText("same as root")
+        self.reference_root_run_edit.setMinimumWidth(200)
+        self.reference_root_run_edit.setToolTip(
+            "Folder the overlay lists demonstrations from. Blank = the recording root.\n"
+            "Editable during a run: the setup page is gone by then."
+        )
+        self.reference_root_run_edit.textEdited.connect(self._on_reference_root_typed)
+
+        reference_layout.addWidget(QtWidgets.QLabel("Overlay root:"))
+        reference_layout.addWidget(self.reference_root_run_edit)
         reference_layout.addWidget(QtWidgets.QLabel("Overlay:"))
         reference_layout.addWidget(self.reference_dataset_combo)
         reference_layout.addWidget(self.reference_list, 1)
@@ -459,6 +475,11 @@ class RecorderGUI(QtWidgets.QWidget):
         # repopulate the dependent dataset and task choices correctly.
         self.root_edit.setText(saved("root", self.root_edit.text(), str))
         self.reference_root_edit.setText(saved("reference_root", self.reference_root_edit.text(), str))
+        # The run-page box shows the same value; blockSignals so restoring settings does not look
+        # like an edit and kick off a rescan before the root is even applied.
+        self.reference_root_run_edit.blockSignals(True)
+        self.reference_root_run_edit.setText(self.reference_root_edit.text())
+        self.reference_root_run_edit.blockSignals(False)
         self.repo_combo.setCurrentText(saved("repo_id", self.repo_combo.currentText(), str))
         self.task_combo.setCurrentText(saved("task", self.task_combo.currentText(), str))
 
@@ -647,6 +668,20 @@ class RecorderGUI(QtWidgets.QWidget):
     def _active_dataset_name(self) -> str:
         """Folder name for the dataset being written in this session."""
         return os.path.basename(os.path.normpath(dataset_dir(self.cfg.root, self.cfg.repo_id)))
+
+    def _on_reference_root_typed(self, text: str) -> None:
+        """Mirror whichever overlay-root box was typed into onto the other, then rescan.
+
+        `textEdited` rather than `textChanged`: it fires only for user edits, so setting the peer's
+        text here cannot bounce back. Two boxes, one value -- a second source that drifts is how
+        the run page would end up listing from a folder the setup page does not name.
+        """
+        for peer in (self.reference_root_edit, self.reference_root_run_edit):
+            if peer is not self.sender() and peer.text() != text:
+                peer.blockSignals(True)
+                peer.setText(text)
+                peer.blockSignals(False)
+        self._refresh_reference_datasets()
 
     def _reference_root(self) -> str:
         """Where the overlay looks for past demonstrations.
