@@ -229,14 +229,20 @@ class DeployGUI(RecorderGUI):
                 "buttons · NOTHING is recorded in this mode",
                 "eval": "Start collection begins ONE episode; Stop collection ends it · "
                 "policy/intervention can use the UI or the handle buttons",
-                "dagger": "space toggles collection · policy/intervention/keep/discard can use UI or handle buttons",
+                "dagger": "space toggles collection · policy/intervention/success/failure can use UI or handle buttons",
             }[source]
         )
+        # THE text the operator reads. It is set here as well as at construction, and this one wins
+        # -- _sync_run_mode runs on every mode change. When the mapping moved to success/fail the
+        # constructor's copy was updated and this one was not, so the screen told the operator that
+        # right upper discards while the robot recorded it as a success, and said nothing about
+        # left upper having become discard. Wrong instructions on screen are worse than none: the
+        # button that used to mean "stop" now throws the episode away.
         self.button_legend.setText(
-            "Handle buttons: left upper = start/stop policy rollout, or fine-grained toggle during "
-            "intervention; left lower = human intervention on/off, "
+            "Handle buttons: left upper = start the rollout, then DISCARD it (fine-grained toggle "
+            "during intervention); left lower = human intervention on/off; "
             + (
-                "right upper = discard + home, right lower = keep + home."
+                "right upper = SUCCESS + home, right lower = FAILURE + home."
                 if per_rollout_verdict
                 else "right upper or lower = stop the rollout and home."
                 + ("" if recording else " Nothing is recorded.")

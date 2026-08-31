@@ -913,3 +913,33 @@ def test_end_rollout_is_ignored_when_there_is_no_rollout_to_end(tmp_path):
     dag.gate.arm()
     dag.end_rollout()
     assert dag._rollout_ended is False, "dagger has its own episode boundary"
+
+
+def test_eval_takes_its_verdict_from_the_robot_not_the_teleop_button_map():
+    """Two systems must not read the same press under different maps.
+
+    In eval the policy drives, so the handle buttons belong to the robot's rollout state machine,
+    which reports the verdict back through the dagger event. The recorder also used to scan them
+    with the TELEOP map, where right.0 means discard -- while the robot now has right.0 as
+    success_home. So a rollout ended with that button was closed as a success by the robot and
+    thrown away by the recorder in the same tick, and the log said `leader button right.0 ->
+    discard` while the operator was pressing what the screen called Success."""
+    cfg = RecorderConfig(record_source="eval", mock=False)
+    rec = Recorder(cfg)
+    assert rec._button_outcome == {}, "eval must not carry the teleop outcome map"
+
+    # ...and the verdict still arrives, from the robot's event
+    rec._scan_dagger_event({"last_dagger_event": {"seq": 1, "action": "success"}})
+    assert rec._btn_outcome == "success"
+
+    rec._btn_outcome = None
+    rec._scan_dagger_event({"last_dagger_event": {"seq": 2, "action": "fail"}})
+    assert rec._btn_outcome == "fail"
+
+
+def test_teleop_still_uses_the_button_map():
+    """Only the policy-driven modes hand the buttons to the robot; a human-driven teleop episode
+    is still labelled by the leader buttons."""
+    rec = Recorder(RecorderConfig(record_source="teleop", mock=False))
+    assert rec._button_outcome, "teleop keeps its outcome map"
+    assert rec._button_outcome.get("right.0") == "discard", "the teleop map, unchanged"
