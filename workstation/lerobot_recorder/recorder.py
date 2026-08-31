@@ -121,9 +121,16 @@ class Recorder:
         self._button_outcome: Dict[str, str] = {
             str(k).lower(): str(v).lower() for k, v in (cfg.button_map or {}).items()
         }
-        if cfg.record_source in ("dagger", "deploy"):
-            # Policy-driven modes: the handle buttons drive the robot's own rollout state
-            # machine (start/stop, takeover, home), not an episode outcome label.
+        if cfg.record_source in ("dagger", "deploy", "eval"):
+            # Policy-driven modes: the handle buttons drive the robot's own rollout state machine,
+            # which reports the verdict back through the dagger EVENT (see _scan_dagger_event).
+            # Reading them here as well means two systems interpreting the same press under
+            # different maps -- and they disagree: the robot has right.0 as success_home, while the
+            # teleop map has it as discard. An eval rollout ended by that button was closed as a
+            # success by the robot and thrown away by the recorder, in the same tick.
+            #
+            # "eval" belongs in this list for the same reason "dagger" does: the policy drives, so
+            # the buttons are the robot's. Leaving it out is what let the two maps diverge.
             self._button_outcome = {}
         self._last_dagger_event_seq = 0
         self._dagger_intervention_active = False
@@ -887,8 +894,15 @@ class Recorder:
         }
 
     def _scan_dagger_event(self, snap: dict) -> None:
-        """Apply robot-side DAgger keep/discard events exactly once."""
-        if self.cfg.record_source != "dagger":
+        """Apply the robot's end-of-rollout verdict exactly once.
+
+        Both policy-driven recording modes need this. `eval` was excluded, which was survivable
+        only while eval read the handle buttons itself through the teleop map -- and that map
+        disagrees with the robot's (right.0 is discard there, success_home on the robot), so the
+        two interpretations of one press raced. Now the robot is the single source in both modes,
+        which is what makes the disagreement impossible rather than merely unlikely.
+        """
+        if self.cfg.record_source not in ("dagger", "eval"):
             return
         event = snap.get("last_dagger_event")
         if not isinstance(event, dict):
