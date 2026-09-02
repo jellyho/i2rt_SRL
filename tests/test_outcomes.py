@@ -225,3 +225,28 @@ def test_cli_show_and_verify(tmp_path, capsys):
     assert "0  success" in out and "1  fail" in out
     assert oc.main(["relabel", ds_dir, "0", "unknown"]) == 0
     assert oc.episode_outcomes(ds_dir)[0] == "unknown"
+
+
+def test_migrate_leaves_every_other_stats_entry_alone(tmp_path):
+    """A dataset edited in place (mark-homing, set-task) can have a stats.json that disagrees
+    with its per-episode stats -- and which side is current differs per feature. The migration
+    owns two keys; it must not re-aggregate the rest (seen on yam_lego_taxi: a full
+    re-aggregation rolled observation.control_mode back to its pre-edit value)."""
+    pytest.importorskip("lerobot")
+    import os
+
+    ds_dir = _record(tmp_path, [("success", 3), ("fail", 2)])
+    _strip_to_pre_schema(ds_dir)
+    stats_path = os.path.join(ds_dir, "meta", "stats.json")
+    stats = json.load(open(stats_path))
+    stats["observation.state"]["mean"] = [123.0] * len(stats["observation.state"]["mean"])  # "edited in place"
+    stats["some.tool.wrote.this"] = {"note": "not a feature at all"}
+    json.dump(stats, open(stats_path, "w"))
+
+    oc.migrate(ds_dir)
+
+    after = json.load(open(stats_path))
+    assert after["observation.state"]["mean"] == [123.0] * len(stats["observation.state"]["mean"])
+    assert after["some.tool.wrote.this"] == {"note": "not a feature at all"}
+    assert after[oc.SUCCESS_KEY]["max"] == [True] and abs(after[oc.SUCCESS_KEY]["mean"][0] - 1 / 5) < 1e-9
+    assert after[oc.DONE_KEY]["mean"][0] == pytest.approx(2 / 5)

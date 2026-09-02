@@ -355,13 +355,8 @@ def migrate(ds_dir: str, *, outcomes: Optional[Dict[int, str]] = None, force: bo
                 ]
         _atomic_parquet(df, f)
 
-    # ---- stats.json: whole-dataset aggregate, rebuilt from the per-episode rows
-    from workstation.lerobot_recorder.crash_recovery import reaggregate_stats
-
-    if not reaggregate_stats(ds_dir):
-        logger.warning(
-            "meta/stats.json could not be re-aggregated; normalization stats for the new features are absent"
-        )
+    # ---- stats.json: add the two keys; everything already there is left exactly as it was
+    _update_outcome_stats(ds_dir)
 
     result = _tally(verdict, lengths)
     logger.info("migrated %s: %s", ds_dir, result)
@@ -430,9 +425,7 @@ def relabel(ds_dir: str, episode: int, outcome: Optional[str]) -> str:
                 df[col] = series
         _atomic_parquet(df, f)
 
-    from workstation.lerobot_recorder.crash_recovery import reaggregate_stats
-
-    reaggregate_stats(ds_dir)
+    _update_outcome_stats(ds_dir)
     return state
 
 
@@ -458,6 +451,49 @@ def _declare(features: Dict[str, dict]) -> Dict[str, dict]:
     ours = {k: {**spec, "shape": list(spec["shape"])} for k, spec in OUTCOME_FEATURES.items()}
     order = _recorded_order(list(keep) + list(ours))
     return {k: (ours[k] if k in ours else keep[k]) for k in order}
+
+
+def _update_outcome_stats(ds_dir: str) -> None:
+    """Write the whole-dataset aggregate for the two outcome features into ``meta/stats.json``,
+    touching nothing else in that file.
+
+    Not a full re-aggregation on purpose: on a dataset that has been edited in place
+    (``mark-homing`` rewrites ``observation.control_mode``, ``set-task`` rewrites
+    ``task_index``) the per-episode stats and ``stats.json`` can already disagree, and which
+    of the two is current differs per feature. A migration that owns two keys should
+    rewrite two keys.
+    """
+    import pandas as pd
+    from lerobot.datasets.compute_stats import aggregate_stats
+    from lerobot.datasets.utils import serialize_dict
+
+    stats_names = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+    per_episode: List[Dict[str, Dict[str, np.ndarray]]] = []
+    cols = ["episode_index"] + [f"stats/{k}/{st}" for k in OUTCOME_FEATURES for st in stats_names]
+    for f in _episode_files(ds_dir):
+        df = pd.read_parquet(f, columns=cols)
+        for _, row in df.iterrows():
+            ep: Dict[str, Dict[str, np.ndarray]] = {}
+            for k in OUTCOME_FEATURES:
+                ep[k] = {}
+                for st in stats_names:
+                    v = row[f"stats/{k}/{st}"]
+                    v = v.tolist() if hasattr(v, "tolist") else v
+                    dtype = np.int64 if st == "count" else (np.bool_ if st in ("min", "max") else np.float64)
+                    ep[k][st] = np.asarray(v, dtype=dtype).reshape(-1)
+            per_episode.append(ep)
+    if not per_episode:
+        return
+    agg = serialize_dict(aggregate_stats(per_episode))
+    stats_path = os.path.join(ds_dir, "meta", "stats.json")
+    try:
+        with open(stats_path) as fh:
+            stats = json.load(fh)
+    except (OSError, ValueError):
+        stats = {}
+    for k in OUTCOME_FEATURES:
+        stats[k] = agg[k]
+    _atomic_json(stats, stats_path)
 
 
 def _empty_stats() -> Dict[str, Dict[str, np.ndarray]]:
