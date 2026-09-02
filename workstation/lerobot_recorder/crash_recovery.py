@@ -34,7 +34,8 @@ rest from the Hub, which for a local-only dataset is a 404.) The buffered episod
 gone -- they never left memory -- so the repair is to roll the *counters* back to what
 ``meta/episodes`` actually holds: :func:`find_uncommitted_metadata` reports it and
 :func:`truncate_to_committed` rewrites ``info.json``, re-aggregates ``meta/stats.json``
-from the surviving per-episode stats, and drops the matching ``outcomes.jsonl`` rows.
+from the surviving per-episode stats. (The episode verdicts live in the data itself --
+``next.success`` / ``next.done`` -- so nothing else needs rolling back.)
 
 Nothing here touches a file any episode references, so it cannot lose committed data.
 """
@@ -242,7 +243,16 @@ def _stats_shapes(ds_dir: str) -> Dict[str, Dict[str, tuple]]:
     }
 
 
-def _episode_stats(eps, index: int, shapes: Dict[str, Dict[str, tuple]]) -> Dict[str, Dict]:
+def _bool_features(ds_dir: str) -> set:
+    try:
+        with open(os.path.join(ds_dir, "meta", "info.json")) as fh:
+            feats = json.load(fh).get("features", {})
+    except (OSError, ValueError, json.JSONDecodeError):
+        return set()
+    return {k for k, v in feats.items() if isinstance(v, dict) and v.get("dtype") == "bool"}
+
+
+def _episode_stats(eps, index: int, shapes: Dict[str, Dict[str, tuple]], bool_features: set = frozenset()) -> Dict[str, Dict]:
     """One episode's row of ``stats/<feature>/<stat>`` columns, back in nested form."""
     import numpy as np
 
@@ -253,8 +263,15 @@ def _episode_stats(eps, index: int, shapes: Dict[str, Dict[str, tuple]]) -> Dict
             continue
         _, feature, stat = col.split("/", 2)
         value = row[col]
-        # ``count`` stays integral -- that is what LeRobot writes, and it is a frame count.
-        dtype = np.int64 if stat == "count" else np.float64
+        # ``count`` stays integral -- that is what LeRobot writes, and it is a frame count --
+        # and a bool feature's min/max stay bool, as LeRobot's own ``compute_episode_stats``
+        # leaves them (``next.success`` reads ``[false]``/``[true]``, not ``[0.0]``/``[1.0]``).
+        if stat == "count":
+            dtype = np.int64
+        elif feature in bool_features and stat in ("min", "max"):
+            dtype = np.bool_
+        else:
+            dtype = np.float64
         arr = np.array(value.tolist() if hasattr(value, "tolist") else value, dtype=dtype)
         want = shapes.get(feature, {}).get(stat)
         if want is not None and arr.shape != want and arr.size == int(np.prod(want)):
@@ -277,8 +294,9 @@ def reaggregate_stats(ds_dir: str) -> bool:
     if eps is None or len(eps) == 0:
         return False
     shapes = _stats_shapes(ds_dir)
+    bools = _bool_features(ds_dir)
     try:
-        stats = aggregate_stats([_episode_stats(eps, i, shapes) for i in range(len(eps))])
+        stats = aggregate_stats([_episode_stats(eps, i, shapes, bools) for i in range(len(eps))])
         with open(os.path.join(ds_dir, "meta", "stats.json"), "w") as fh:
             json.dump(serialize_dict(stats), fh, indent=4)
     except Exception as e:
@@ -288,7 +306,7 @@ def reaggregate_stats(ds_dir: str) -> bool:
 
 
 def truncate_to_committed(ds_dir: str, *, quarantine: str) -> Optional[Dict]:
-    """Roll ``info.json`` / ``stats.json`` / ``outcomes.jsonl`` back to the committed episodes.
+    """Roll ``info.json`` / ``stats.json`` back to the committed episodes.
 
     The originals are copied into ``quarantine`` first, so the pre-repair counters stay
     readable. ``stats.json`` is re-aggregated from the surviving per-episode stats rather
@@ -303,8 +321,7 @@ def truncate_to_committed(ds_dir: str, *, quarantine: str) -> Optional[Dict]:
 
     info_path = os.path.join(ds_dir, "meta", "info.json")
     stats_path = os.path.join(ds_dir, "meta", "stats.json")
-    outcomes_path = os.path.join(ds_dir, "outcomes.jsonl")
-    for path in (info_path, stats_path, outcomes_path):
+    for path in (info_path, stats_path):
         if os.path.isfile(path):
             shutil.copy2(path, os.path.join(quarantine, os.path.relpath(path, ds_dir).replace(os.sep, "__")))
 
@@ -319,20 +336,6 @@ def truncate_to_committed(ds_dir: str, *, quarantine: str) -> Optional[Dict]:
 
     if os.path.isfile(stats_path):
         reaggregate_stats(ds_dir)
-
-    # The sidecar is appended per episode too, so it holds rows for episodes that are gone.
-    if os.path.isfile(outcomes_path):
-        kept = []
-        for line in open(outcomes_path):
-            if not line.strip():
-                continue
-            try:
-                if int(json.loads(line)["episode"]) < n_eps:
-                    kept.append(line if line.endswith("\n") else line + "\n")
-            except (ValueError, KeyError, json.JSONDecodeError):
-                kept.append(line if line.endswith("\n") else line + "\n")
-        with open(outcomes_path, "w") as fh:
-            fh.writelines(kept)
 
     logger.warning(
         "rolled metadata back to the %d committed episode(s): the interrupt lost %d episode(s) "

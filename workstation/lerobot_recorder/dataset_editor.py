@@ -6,17 +6,17 @@ What remains here is what the *recorder* needs: the video/length consistency che
 both of which encode YAM specifics a general tool should not. The heavy structural
 operations (deleting episodes, changing tasks) go through LeRobot's official
 ``lerobot.datasets.dataset_tools`` so the parquet data, videos, and ``meta/`` stay
-consistent (episodes are re-indexed, ``info.json`` counts updated, etc.). Around
-those we also keep the recorder's own ``outcomes.jsonl`` sidecar in sync.
+consistent (episodes are re-indexed, ``info.json`` counts updated, etc.). The episode
+verdict is two ordinary features (``next.success`` / ``next.done``, see ``outcomes.py``), so
+those tools carry it along for free.
 
 Every structural edit **backs the dataset up first** — the original folder is
 renamed aside to ``<name>.backup-<op>.<timestamp>`` (the convention already used on
-disk) so a bad edit is always recoverable. Lightweight edits (relabelling an
-episode outcome) only touch the sidecar and need no backup.
+disk) so a bad edit is always recoverable. Lightweight edits (relabelling an episode's
+verdict) rewrite two bool columns of one episode and its stats, and need no backup.
 
 ``delete_episodes`` writes a brand-new dataset in a temp dir and then swaps it into
-place; the other files (``outcomes.jsonl``, ``rl_config.json``) are remapped/copied
-across. Nothing here requires the robot or cameras — only ``lerobot`` + ``pyarrow``.
+place; ``rl_config.json`` is copied across. Nothing here requires the robot or cameras — only ``lerobot`` + ``pyarrow``.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
+from workstation.lerobot_recorder import outcomes as _outcomes
 from workstation.lerobot_recorder.config import ARM_DOF
 from workstation.lerobot_recorder.dataset_writer import dataset_dir
 
@@ -82,38 +83,6 @@ def detect_homing_start(
 
 
 # --------------------------------------------------------------------------- pure helpers
-def remap_outcome_entries(entries: List[dict], deleted: List[int], total_episodes: int) -> List[dict]:
-    """Drop the deleted episodes' outcome rows and re-index the survivors to 0..k-1.
-
-    ``entries`` is the parsed ``outcomes.jsonl``; ``deleted`` the episode indices being
-    removed; ``total_episodes`` the count *before* deletion. Survivors keep their
-    relative order and are renumbered exactly the way LeRobot re-indexes the data.
-    Rows without a valid ``episode`` field are dropped (they can't be placed).
-    """
-    deleted_set = set(deleted)
-    keep_old = [i for i in range(total_episodes) if i not in deleted_set]
-    mapping = {old: new for new, old in enumerate(keep_old)}
-
-    by_ep: Dict[int, dict] = {}
-    for e in entries:
-        try:
-            ep = int(e["episode"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if ep in mapping:
-            by_ep[ep] = e
-
-    out: List[dict] = []
-    for old in keep_old:
-        e = by_ep.get(old)
-        if e is None:
-            continue
-        e = dict(e)
-        e["episode"] = mapping[old]
-        out.append(e)
-    return out
-
-
 def video_length_mismatches(ds_dir: str) -> List[dict]:
     """Find episodes whose stored video window disagrees with the frame ``length``.
 
@@ -184,30 +153,6 @@ def repair_length_consistency(ds_dir: str) -> int:
     return repaired
 
 
-def _read_jsonl(path: str) -> List[dict]:
-    entries: List[dict] = []
-    if not os.path.exists(path):
-        return entries
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.warning("skipping malformed outcome row in %s", path)
-    return entries
-
-
-def _write_jsonl(path: str, entries: List[dict]) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, "w") as fh:
-        for e in entries:
-            fh.write(json.dumps(e) + "\n")
-    os.replace(tmp, path)
-
-
 # --------------------------------------------------------------------------- editor
 class DatasetEditor:
     """Metadata reader + structural editor for one dataset at ``<root>/<name>``."""
@@ -217,11 +162,6 @@ class DatasetEditor:
         self.root = root
         self.ds_dir = dataset_dir(root, repo_id)
         self._ds = None  # loaded LeRobotDataset (lazily)
-
-    # ------------------------------------------------------------------ paths
-    @property
-    def outcomes_path(self) -> str:
-        return os.path.join(self.ds_dir, "outcomes.jsonl")
 
     # ------------------------------------------------------------------ load / inspect
     def load(self) -> None:
@@ -252,36 +192,13 @@ class DatasetEditor:
         return 0
 
     def outcomes_by_episode(self) -> Dict[int, str]:
-        out: Dict[int, str] = {}
-        for e in _read_jsonl(self.outcomes_path):
-            try:
-                out[int(e["episode"])] = str(e["outcome"])
-            except (KeyError, TypeError, ValueError):
-                continue
-        return out
-
-    def sources_by_episode(self) -> Dict[int, str]:
-        """Per-episode record source from the sidecar: ``teleop`` / ``dagger`` / ``eval``."""
-        out: Dict[int, str] = {}
-        for e in _read_jsonl(self.outcomes_path):
-            src = e.get("source")
-            if e.get("episode") is not None and src is not None:
-                try:
-                    out[int(e["episode"])] = str(src)
-                except (TypeError, ValueError):
-                    continue
-        return out
+        """Per-episode verdict (``success`` / ``fail`` / ``unknown``) from the dataset's own
+        metadata. Empty for a dataset that predates the outcome features."""
+        return _outcomes.episode_outcomes(self.ds_dir, strict=False)
 
     def frames_by_episode(self) -> Dict[int, int]:
-        """Per-episode recorded frame count from the sidecar (best-effort)."""
-        out: Dict[int, int] = {}
-        for e in _read_jsonl(self.outcomes_path):
-            if e.get("episode") is not None and e.get("frames") is not None:
-                try:
-                    out[int(e["episode"])] = int(e["frames"])
-                except (TypeError, ValueError):
-                    continue
-        return out
+        """Per-episode frame count, from ``meta/episodes``."""
+        return _outcomes.episode_lengths(self.ds_dir)
 
     def tasks_by_episode(self) -> Dict[int, str]:
         """Per-episode task string, read from the LeRobot metadata (best-effort)."""
@@ -445,26 +362,12 @@ class DatasetEditor:
             logger.warning("could not refresh control_mode stats: %s", e)
 
     def relabel(self, episode: int, outcome: str) -> None:
-        """Set an episode's outcome in the sidecar (no LeRobot rewrite; cheap & instant).
-
-        Outcomes are the recorder's own annotation (``success`` / ``fail`` / ``discard``);
-        they live only in ``outcomes.jsonl`` and don't touch the training data.
-        """
-        entries = _read_jsonl(self.outcomes_path)
-        found = False
-        for e in entries:
-            try:
-                if int(e.get("episode")) == int(episode):
-                    e["outcome"] = outcome
-                    found = True
-            except (TypeError, ValueError):
-                continue
-        if not found:
-            entries.append({"episode": int(episode), "outcome": outcome})
-            entries.sort(key=lambda e: int(e.get("episode", 0)))
-        os.makedirs(self.ds_dir, exist_ok=True)
-        _write_jsonl(self.outcomes_path, entries)
-        logger.info("relabelled episode %d -> %s", episode, outcome)
+        """Set an episode's verdict: rewrites its ``next.success`` / ``next.done`` terminal
+        frame and the episode's stats for those two features, then re-aggregates
+        ``meta/stats.json``. Videos and every other column are untouched."""
+        _outcomes.relabel(self.ds_dir, episode, outcome)
+        self._ds = None  # data changed on disk; reopen on next use
+        logger.info("relabelled episode %d -> %s", episode, _outcomes.normalize(outcome))
 
     # ------------------------------------------------------------------ backup
     def _backup(self, op: str) -> str:
@@ -480,7 +383,7 @@ class DatasetEditor:
         """Delete episodes and re-index the dataset in place.
 
         Builds a fresh, re-indexed dataset with ``lerobot.datasets.dataset_tools`` in a
-        temp dir, remaps the ``outcomes.jsonl`` sidecar, then atomically swaps it into
+        temp dir (the verdict columns travel with the frames), then atomically swaps it into
         place (the original is copied to a ``.backup-...`` dir first when ``backup``).
         Returns the backup path (or "" if not backed up).
         """
@@ -517,10 +420,6 @@ class DatasetEditor:
                 self.load()  # reopen against the repaired metadata
                 _delete_episodes(self._ds, episode_indices=indices, output_dir=tmp_dir, repo_id=self.repo_id)
 
-            # Remap our sidecars into the new dataset before the swap.
-            new_outcomes = remap_outcome_entries(_read_jsonl(self.outcomes_path), indices, total)
-            if new_outcomes:
-                _write_jsonl(os.path.join(tmp_dir, "outcomes.jsonl"), new_outcomes)
             rl_cfg = os.path.join(self.ds_dir, "rl_config.json")
             if os.path.exists(rl_cfg):
                 shutil.copy2(rl_cfg, os.path.join(tmp_dir, "rl_config.json"))
@@ -553,7 +452,7 @@ class DatasetEditor:
         """Set the language instruction (task) for the given episodes, in place.
 
         Uses ``dataset_tools.modify_tasks`` (rewrites ``tasks.parquet`` + the
-        ``task_index`` column) and updates the sidecar's ``task`` field to match.
+        ``task_index`` column).
         Returns the backup path (or "").
         """
         from lerobot.datasets.dataset_tools import modify_tasks
@@ -573,16 +472,6 @@ class DatasetEditor:
         except Exception:
             raise
 
-        entries = _read_jsonl(self.outcomes_path)
-        ep_set = set(episodes)
-        for e in entries:
-            try:
-                if int(e.get("episode")) in ep_set:
-                    e["task"] = task
-            except (TypeError, ValueError):
-                continue
-        if entries:
-            _write_jsonl(self.outcomes_path, entries)
         self._ds = None  # metadata changed; reload on next use
         logger.info("set task for %d episode(s) -> %r", len(episodes), task)
         return backup_path

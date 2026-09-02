@@ -53,7 +53,8 @@ while keeping the source untouched. The export can match left-idle, right-idle,
 either-arm-idle, or both-arms-idle runs and can apply the cuts to successful
 episodes, failed episodes, or both. A background job reports per-episode
 progress and rebuilds all camera videos, Parquet data, timestamps, statistics,
-episode metadata, `outcomes.jsonl`, and RL sidecars consistently. Exports refuse
+episode metadata, the episode verdict columns (`next.success` / `next.done`, re-stamped
+on the last surviving frame), and RL sidecars consistently. Exports refuse
 to overwrite existing datasets and abort if a rule would remove more than 90%
 of any episode.
 

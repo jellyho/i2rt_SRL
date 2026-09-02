@@ -183,10 +183,6 @@ def _uncommitted(root, *, episodes=2, frames=20):
     info["total_frames"] += frames
     info["splits"] = {"train": f"0:{info['total_episodes']}"}
     info_path.write_text(json.dumps(info))
-    (root / "outcomes.jsonl").write_text("".join(
-        json.dumps({"episode": ep, "outcome": "success", "frames": 10}) + "\n"
-        for ep in range(info["total_episodes"])
-    ))
     return info
 
 
@@ -205,7 +201,7 @@ def test_counters_matching_the_metadata_report_nothing(tmp_path):
     assert find_uncommitted_metadata(str(_dataset(tmp_path))) is None
 
 
-def test_truncate_rolls_info_and_the_sidecar_back(tmp_path):
+def test_truncate_rolls_info_back(tmp_path):
     root = _dataset(tmp_path, episodes=3, per_ep=10)
     _uncommitted(root)
     q = tmp_path / "q"
@@ -216,8 +212,6 @@ def test_truncate_rolls_info_and_the_sidecar_back(tmp_path):
     assert (info["total_episodes"], info["total_frames"]) == (3, 30)
     assert info["splits"] == {"train": "0:3"}
     assert drift["lost_episodes"] == 2
-    outcomes = [json.loads(line) for line in (root / "outcomes.jsonl").read_text().splitlines()]
-    assert [o["episode"] for o in outcomes] == [0, 1, 2]
     # the pre-repair counters stay readable rather than being overwritten in place
     assert json.loads((q / "meta__info.json").read_text())["total_episodes"] == 5
 

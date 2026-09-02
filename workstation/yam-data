@@ -14,6 +14,8 @@
 #   workstation/yam-data cams            # list connected RealSense serials
 #   workstation/yam-data tune [args]     # GUI exposure/brightness tuner (match cameras)
 #   workstation/yam-data doctor [args]   # dataset stats / validation
+#   workstation/yam-data migrate-outcomes <dataset-dir>   # move outcomes.jsonl into the schema (next.success / next.done)
+#   workstation/yam-data outcomes {show|verify|relabel} <dataset-dir> [args]   # read / check / change episode verdicts
 #   workstation/yam-data calibrate [args]
 #       GUI: calibrate the whole camera rig from ONE ChArUco board on the desk -- each wrist
 #       camera's extrinsic (hand-eye), each agentview extrinsic, and the left<->right arm offset.
@@ -62,12 +64,14 @@ case "$cmd" in
     cams)   exec python -m workstation.lerobot_recorder.cameras --list ;;
     tune)   exec python -m workstation.lerobot_recorder.tuner_main "$@" ;;
     doctor) exec python -m workstation.lerobot_recorder.doctor "$@" ;;
+    migrate-outcomes) exec python -m workstation.lerobot_recorder.outcomes migrate "$@" ;;
+    outcomes) exec python -m workstation.lerobot_recorder.outcomes "$@" ;;
     render-samples|render-gui)
         echo "rendering moved to the ACRFT repo: misc/yam-misc $cmd  (i2rt is the robot; rendering is analysis)" >&2
         exit 2 ;;
     calibrate) exec python -m workstation.lerobot_recorder.calibrate_main "$@" ;;
     *)
-        echo "usage: yam-data {record|mark-homing|check-videos|recover|deploy|cams|tune|doctor|calibrate} [args]" >&2
+        echo "usage: yam-data {record|mark-homing|check-videos|recover|deploy|cams|tune|doctor|migrate-outcomes|outcomes|calibrate} [args]" >&2
         exit 2
         ;;
 esac

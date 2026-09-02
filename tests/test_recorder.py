@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import time
 from types import SimpleNamespace
 
 import numpy as np
 
-from workstation.lerobot_recorder.config import ACTION_DIM, RecorderConfig
+from workstation.lerobot_recorder import outcomes as _outcomes
+from workstation.lerobot_recorder.config import ACTION_DIM, CameraSpec, RecorderConfig
 from workstation.lerobot_recorder.dataset_writer import dataset_dir
 from workstation.lerobot_recorder.portal_bridge import PortalBridge
 from workstation.lerobot_recorder.recorder import Recorder
@@ -107,13 +107,11 @@ def test_recorder_records_episode_and_outcome(tmp_path):
     assert final["kept"] >= 1 and final["success"] >= 1  # live stats counted the keep
     assert final["robot_ok"] is True  # mock bridge reports connected
 
-    # the dataset (and its outcomes sidecar) lives at <root>/<name>
-    sidecar = tmp_path / "yam" / "outcomes.jsonl"
-    assert sidecar.exists()
+    # the dataset lives at <root>/<name>; the verdict went into it with the frames
     assert dataset_dir(str(tmp_path), "test/yam") == str(tmp_path / "yam")
-    entry = json.loads(sidecar.read_text().splitlines()[0])
-    assert entry["outcome"] == "success"
-    assert entry["episode"] == 0
+    saved = rec.writer.saved_episodes
+    assert saved[0]["outcome"] == "success"
+    assert saved[0]["episode"] == 0
 
 
 def test_eval_rollout_records_one_frame_per_sent_action(tmp_path):
@@ -139,7 +137,7 @@ def test_eval_rollout_records_one_frame_per_sent_action(tmp_path):
     rec.shutdown()
     assert frames == n  # strict 1:1 -- one frame per action sent, no more, no fewer
     assert rec.writer.num_episodes >= 1
-    assert (tmp_path / "eval" / "outcomes.jsonl").exists()
+    assert rec.writer.saved_episodes[0]["frames"] == n
 
 
 def test_note_action_sent_is_a_noop_until_armed_in_eval(tmp_path):
@@ -176,10 +174,10 @@ def test_manual_save_finalizes_and_next_episode_reopens_writer(tmp_path):
     finally:
         rec.shutdown()
 
-    lines = (tmp_path / "manual" / "outcomes.jsonl").read_text().splitlines()
-    rows = [json.loads(line) for line in lines]
-    assert [row["episode"] for row in rows] == [0, 1]
-    assert [row["outcome"] for row in rows] == ["success", "fail"]
+    assert [row["episode"] for row in first_writer.saved_episodes] == [0]
+    assert [row["outcome"] for row in first_writer.saved_episodes] == ["success"]
+    assert [row["episode"] for row in rec.writer.saved_episodes] == [1]
+    assert [row["outcome"] for row in rec.writer.saved_episodes] == ["fail"]
 
 
 def test_manual_save_preserves_armed_idle_state(tmp_path):
@@ -199,9 +197,23 @@ def test_manual_save_preserves_armed_idle_state(tmp_path):
         rec.shutdown()
 
 
+def _real_dataset_cfg(**kw) -> RecorderConfig:
+    """Mock hardware, real LeRobot writer: what a cross-session count has to be read back from.
+    One tiny camera keeps the AV1 encode of a one-frame episode to a fraction of a second
+    (and above the 16x16 floor the SVT encoder crashes on)."""
+    return RecorderConfig(
+        fps=60,
+        mock=True,
+        mock_writer=False,
+        review_before_save=False,
+        cameras=[CameraSpec("agentview", serial="", width=32, height=32, fps=60)],
+        **kw,
+    )
+
+
 def test_status_reports_dataset_total_across_sessions(tmp_path):
     # session 1: fresh dataset — total grows with the saves
-    cfg = RecorderConfig(repo_id="test/total", root=str(tmp_path), fps=60, mock=True, review_before_save=False)
+    cfg = _real_dataset_cfg(repo_id="test/total", root=str(tmp_path))
     rec = Recorder(cfg)
     rec.start()
     try:
@@ -217,9 +229,7 @@ def test_status_reports_dataset_total_across_sessions(tmp_path):
         rec.shutdown()
 
     # session 2: resume — the dashboard total starts at the EXISTING count, not 0
-    cfg2 = RecorderConfig(
-        repo_id="test/total", root=str(tmp_path), fps=60, mock=True, review_before_save=False, resume=True
-    )
+    cfg2 = _real_dataset_cfg(repo_id="test/total", root=str(tmp_path), resume=True)
     rec2 = Recorder(cfg2)
     rec2.start()
     try:
@@ -237,7 +247,7 @@ def test_status_reports_dataset_total_across_sessions(tmp_path):
 
 def test_status_reports_dataset_outcome_totals_across_sessions(tmp_path):
     # session 1: one success + one fail
-    cfg = RecorderConfig(repo_id="test/outcomes", root=str(tmp_path), fps=60, mock=True, review_before_save=False)
+    cfg = _real_dataset_cfg(repo_id="test/outcomes", root=str(tmp_path))
     rec = Recorder(cfg)
     rec.start()
     try:
@@ -252,10 +262,8 @@ def test_status_reports_dataset_outcome_totals_across_sessions(tmp_path):
     finally:
         rec.shutdown()
 
-    # session 2: resume — totals seed from the dataset's outcome sidecar, then grow
-    cfg2 = RecorderConfig(
-        repo_id="test/outcomes", root=str(tmp_path), fps=60, mock=True, review_before_save=False, resume=True
-    )
+    # session 2: resume — totals seed from the verdicts the dataset itself carries, then grow
+    cfg2 = _real_dataset_cfg(repo_id="test/outcomes", root=str(tmp_path), resume=True)
     rec2 = Recorder(cfg2)
     rec2.start()
     try:
@@ -268,6 +276,8 @@ def test_status_reports_dataset_outcome_totals_across_sessions(tmp_path):
         assert st["success_total"] == 2 and st["fail_total"] == 1
     finally:
         rec2.shutdown()
+    # ...and the verdicts are in the dataset's own schema, readable without either session
+    assert _outcomes.episode_outcomes(str(tmp_path / "outcomes")) == {0: "success", 1: "fail", 2: "success"}
 
 
 def test_streaming_encoding_reaches_the_writer_without_being_asked_for(tmp_path):
@@ -446,7 +456,7 @@ def test_dagger_records_one_rollout_across_interventions():
     assert rec._btn_outcome == "success"
     assert len(submitted) == 1
     assert len(submitted[0][0]) == 3
-    # The label that reaches the writer, and so outcomes.jsonl. It used to be "keep", which
+    # The label that reaches the writer, and so next.success. It used to be "keep", which
     # training reads as neither success nor fail -- success_only skipped every episode a DAgger
     # operator had kept.
     assert submitted[0][1] == "success"
@@ -892,8 +902,8 @@ def test_each_eval_rollout_is_its_own_episode(tmp_path):
         assert rec.gate.armed is True, "the gate stays armed for the next rollout"
     finally:
         rec.shutdown()  # drains the async writer
-    # ...and both really reached the dataset, as two episodes rather than one.
-    rows = [json.loads(line) for line in (tmp_path / "evalseg" / "outcomes.jsonl").read_text().splitlines()]
+    # ...and both really reached the writer, as two episodes rather than one.
+    rows = rec.writer.saved_episodes
     assert [r["episode"] for r in rows] == [0, 1]
     assert all(r["frames"] == 4 for r in rows), rows
 

@@ -696,16 +696,24 @@ separate checkerboard sweep. Needs `opencv-contrib-python>=4.7` (`cv2.aruco`'s
 - **Dataset location**: `root` is a **parent dir**; the dataset lives at
   `<root>/<name>` (name = last segment of `repo_id`), so several datasets can sit
   side by side under one `root`. The reader/replay resolve the same path.
-- **Outcome labels**: **Keep (success)** / **Keep (fail)** tag each episode; the
-  label + task + frame count are appended to `outcomes.jsonl` **inside the dataset
-  folder** (a sidecar, since LeRobot has no per-episode label slot).
+- **Outcome labels**: **Keep (success)** / **Keep (fail)** tag each episode. The verdict
+  is recorded **in the dataset's own schema** as two per-frame bool features,
+  `next.success` and `next.done` (True on the episode's last frame: `done` iff it was
+  judged, `success` iff it succeeded — so an eval rollout kept without judging it is a
+  third state, not a failure). LeRobot writes per-episode stats for them, so the verdict
+  is readable from `meta/episodes` alone (`outcomes.episode_outcomes(ds_dir)`), and every
+  LeRobot tool (delete / split / merge) carries it along. Datasets recorded before this
+  kept an `outcomes.jsonl` sidecar; `yam-data migrate-outcomes <dataset-dir>` converts
+  them in place, and the recorder refuses to append to an unmigrated one.
+  `yam-data outcomes {show|verify|relabel} <dataset-dir>` reads, checks against an old
+  sidecar, or changes a verdict.
 - **Resume**: tick **Continue collecting** in the GUI (or `--resume`) to append to
   the existing dataset at `<root>/<name>` instead of creating a new one (episode
   indices continue).
-- **Doctor**: `workstation/yam-data doctor --root ~/lerobot_data [--repo-id ...]`
-  prints episode counts, success rate, and per-task stats from `outcomes.jsonl`
-  (and validates the LeRobot dataset if `--repo-id` is given). The replay episode
-  list is annotated with ✓/✗ from the same sidecar.
+- **Doctor**: `workstation/yam-data doctor --root ~/lerobot_data/<name> [--repo-id ...]`
+  prints episode counts, success rate, and per-task stats from the dataset's own
+  metadata (and validates the LeRobot dataset if `--repo-id` is given). The replay
+  episode list is annotated with ✓/✗ from the same columns.
 - **Safety**: E-STOP button in both GUIs (holds the followers); optional collision
   soft-stop (`control_config.FOLLOWER_EFFORT_LIMIT`); disk-space guard refuses to
   save below `min_free_gb`.

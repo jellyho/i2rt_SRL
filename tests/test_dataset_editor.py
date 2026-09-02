@@ -1,8 +1,8 @@
-"""Dataset editor: outcome-sidecar remapping (pure) + relabel (sidecar I/O).
+"""Dataset editor: relabel (a two-column rewrite of one episode) + the metadata readers.
 
-The structural edits (delete_episodes / set_task) go through LeRobot's dataset_tools
-and are covered by the end-to-end check against a real dataset; here we lock the
-pure re-indexing logic and the lightweight relabel path, which need no lerobot.
+The structural edits (delete_episodes / set_task) go through LeRobot's dataset_tools and
+carry the verdict columns along like any other feature; here we lock the lightweight
+relabel path and the readers, against a real (tiny) LeRobotDataset.
 """
 
 from __future__ import annotations
@@ -12,78 +12,79 @@ import json
 import numpy as np
 import pytest
 
+from workstation.lerobot_recorder import outcomes as _outcomes
+from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.dataset_editor import (
     DatasetEditor,
     detect_homing_start,
-    remap_outcome_entries,
     repair_length_consistency,
     video_length_mismatches,
 )
+from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
 
 
-def _entries(*eps):
-    return [{"episode": e, "outcome": "success", "task": "t", "frames": 10} for e in eps]
+def _frame():
+    return {
+        "images": {"agentview": np.zeros((32, 32, 3), np.uint8)},
+        "observation.state": np.zeros(42, np.float32),
+        "action": np.zeros(14, np.float32),
+    }
 
 
-def test_remap_drops_deleted_and_reindexes_contiguously():
-    entries = _entries(0, 1, 2, 3, 4)
-    out = remap_outcome_entries(entries, deleted=[1, 3], total_episodes=5)
-    # survivors were old 0,2,4 -> new 0,1,2 in order
-    assert [e["episode"] for e in out] == [0, 1, 2]
+def _record(tmp_path, episodes, repo_id="me/ds"):
+    """``[(outcome, n_frames), ...]`` -> a real dataset at <tmp_path>/<name>."""
+    cfg = RecorderConfig(repo_id=repo_id, root=str(tmp_path), mock=False, encoding_backend="pyav")
+    w = AsyncDatasetWriter(cfg, ["agentview"], {"agentview": (32, 32, 3)})
+    w.open(_frame())
+    for outcome, n in episodes:
+        w.submit([_frame() for _ in range(n)], outcome, "t")
+    w.finalize()
+    return DatasetEditor(repo_id, str(tmp_path))
 
 
-def test_remap_preserves_payload_fields():
-    entries = [{"episode": 2, "outcome": "fail", "task": "pick", "frames": 42, "source": "teleop"}]
-    out = remap_outcome_entries(entries, deleted=[0], total_episodes=3)
-    # old 2 -> new 1 (0 deleted, 1 and 2 survive)
-    assert out == [{"episode": 1, "outcome": "fail", "task": "pick", "frames": 42, "source": "teleop"}]
-
-
-def test_remap_ignores_rows_for_deleted_or_unknown_episodes():
-    entries = _entries(0, 1, 2) + [{"episode": 99}, {"nope": 1}]
-    out = remap_outcome_entries(entries, deleted=[1], total_episodes=3)
-    assert [e["episode"] for e in out] == [0, 1]  # old 0->0, old 2->1
-
-
-def test_remap_handles_missing_sidecar_rows():
-    # only episode 2 has a row; 0 and 1 don't. deleting 0 -> old 2 becomes new 1.
-    out = remap_outcome_entries(_entries(2), deleted=[0], total_episodes=3)
-    assert out == [{"episode": 1, "outcome": "success", "task": "t", "frames": 10}]
-
-
-def test_relabel_updates_existing_sidecar_row(tmp_path):
-    ds_dir = tmp_path / "close_bottle_cap"
-    ds_dir.mkdir()
-    sidecar = ds_dir / "outcomes.jsonl"
-    sidecar.write_text(
-        json.dumps({"episode": 0, "outcome": "success", "task": "t"}) + "\n"
-        + json.dumps({"episode": 1, "outcome": "success", "task": "t"}) + "\n"
-    )
-    ed = DatasetEditor("me/close_bottle_cap", str(tmp_path))
+def test_relabel_rewrites_only_that_episode(tmp_path):
+    pytest.importorskip("lerobot")
+    ed = _record(tmp_path, [("success", 4), ("success", 5), (None, 3)])
     ed.relabel(1, "fail")
+    assert ed.outcomes_by_episode() == {0: "success", 1: "fail", 2: "unknown"}
+    # the terminal frame carries it, the others stay untouched
+    import pandas as pd
 
-    rows = [json.loads(x) for x in sidecar.read_text().splitlines() if x.strip()]
-    assert rows[0]["outcome"] == "success"
-    assert rows[1]["outcome"] == "fail"
-    assert len(rows) == 2  # no duplicate row added
-
-
-def test_relabel_appends_when_row_absent(tmp_path):
-    ds_dir = tmp_path / "ds"
-    ds_dir.mkdir()
-    ed = DatasetEditor("me/ds", str(tmp_path))
-    ed.relabel(0, "discard")
-    rows = [json.loads(x) for x in (ds_dir / "outcomes.jsonl").read_text().splitlines() if x.strip()]
-    assert rows == [{"episode": 0, "outcome": "discard"}]
+    df = pd.read_parquet(sorted((tmp_path / "ds" / "data").rglob("*.parquet"))[0])
+    ep1 = df[df["episode_index"] == 1].sort_values("frame_index")
+    assert ep1["next.done"].tolist() == [False, False, False, False, True]
+    assert ep1["next.success"].tolist() == [False] * 5
+    # and the dataset-level stats followed: 1 success frame out of 12
+    stats = json.load(open(tmp_path / "ds" / "meta" / "stats.json"))
+    assert abs(stats["next.success"]["mean"][0] - 1 / 12) < 1e-9
+    assert abs(stats["next.done"]["mean"][0] - 2 / 12) < 1e-9
 
 
-def test_outcomes_by_episode_reads_back(tmp_path):
-    ds_dir = tmp_path / "ds"
-    ds_dir.mkdir()
-    ed = DatasetEditor("me/ds", str(tmp_path))
+def test_relabel_can_withdraw_a_verdict(tmp_path):
+    pytest.importorskip("lerobot")
+    ed = _record(tmp_path, [("fail", 3)])
+    ed.relabel(0, "unknown")
+    assert ed.outcomes_by_episode() == {0: "unknown"}
     ed.relabel(0, "success")
-    ed.relabel(1, "fail")
-    assert ed.outcomes_by_episode() == {0: "success", 1: "fail"}
+    assert ed.outcomes_by_episode() == {0: "success"}
+
+
+def test_relabel_refuses_a_pre_schema_dataset(tmp_path):
+    ds_dir = tmp_path / "old"
+    (ds_dir / "meta").mkdir(parents=True)
+    (ds_dir / "meta" / "info.json").write_text(
+        json.dumps({"total_episodes": 1, "features": {"observation.state": {"dtype": "float32", "shape": [42]}}})
+    )
+    ed = DatasetEditor("me/old", str(tmp_path))
+    with pytest.raises(_outcomes.OutcomeColumnsMissing, match="migrate-outcomes"):
+        ed.relabel(0, "fail")
+    assert ed.outcomes_by_episode() == {}  # a listing degrades to "no verdicts", it does not crash
+
+
+def test_frames_by_episode_comes_from_the_metadata(tmp_path):
+    pytest.importorskip("lerobot")
+    ed = _record(tmp_path, [("success", 4), ("fail", 7)])
+    assert ed.frames_by_episode() == {0: 4, 1: 7}
 
 
 # --------------------------------------------------------------- video-length consistency
