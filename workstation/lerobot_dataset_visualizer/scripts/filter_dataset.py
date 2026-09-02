@@ -25,6 +25,9 @@ from lerobot.datasets.compute_stats import (
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_FEATURES
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # the i2rt repo root
+from workstation.lerobot_recorder import outcomes as _outcomes
+
 
 def write_status(path: Path, **updates: object) -> None:
     current: dict[str, object] = {}
@@ -39,16 +42,12 @@ def write_status(path: Path, **updates: object) -> None:
     os.replace(temporary, path)
 
 
-def load_outcomes(root: Path) -> dict[int, dict]:
-    result: dict[int, dict] = {}
-    path = root / "outcomes.jsonl"
-    if not path.exists():
-        return result
-    for line in path.read_text().splitlines():
-        if line.strip():
-            row = json.loads(line)
-            result[int(row["episode"])] = row
-    return result
+def load_outcomes(root: Path) -> dict[int, str]:
+    """``{episode: "success" | "fail" | "unknown"}`` from the dataset's own schema
+    (``next.success`` / ``next.done``). A dataset recorded before those features existed
+    raises with the one command that migrates it; guessing would silently turn every
+    "apply to successful episodes" rule into a no-op."""
+    return _outcomes.episode_outcomes(str(root), strict=True)
 
 
 def action_idle_mask(actions: np.ndarray, threshold: float, mode: str) -> np.ndarray:
@@ -290,6 +289,19 @@ def task_for_index(source: LeRobotDataset, task_index: int) -> str:
     return str(matches.index[0])
 
 
+def restamp_outcome(buffer: dict, features: dict, kept: int, outcome: str) -> None:
+    """Put the episode verdict back on the LAST kept frame.
+
+    The verdict lives on an episode's terminal frame (``next.done`` / ``next.success``), and
+    a trailing idle stretch is exactly what this exporter removes -- copying the columns
+    through would drop the verdict with the frames. Rewrite both columns from the
+    episode-level verdict instead, over the frames that survive."""
+    flags = _outcomes.terminal_flags(kept, outcome)
+    for key in _outcomes.OUTCOME_FEATURES:
+        if key in features:
+            buffer[key] = [np.array([bool(v)], dtype=bool) for v in flags[key][:, 0]]
+
+
 def build_episode_buffer(
     target: LeRobotDataset,
     source: LeRobotDataset,
@@ -466,7 +478,6 @@ def main(config_path: Path, status_path: Path) -> None:
     total_episodes = source.meta.total_episodes
     total_source_frames = source.meta.total_frames
     processed_frames = kept_total = removed_total = 0
-    output_outcomes: list[dict] = []
     write_status(
         status_path,
         state="running",
@@ -487,8 +498,7 @@ def main(config_path: Path, status_path: Path) -> None:
         start = int(metadata["dataset_from_index"])
         end = int(metadata["dataset_to_index"])
         actions = np.asarray(source.hf_dataset[start:end]["action"], dtype=np.float32)
-        outcome_row = outcomes.get(episode_index)
-        outcome = outcome_row.get("outcome") if outcome_row else None
+        outcome = outcomes.get(episode_index, _outcomes.UNKNOWN)
 
         remove = np.zeros(end - start, dtype=bool)
         if should_filter(outcome, config["outcomeScope"]):
@@ -511,6 +521,7 @@ def main(config_path: Path, status_path: Path) -> None:
         rl_values = recompute_rl_features(features, len(kept_indices), outcome, rl_config)
         source_batch = source.hf_dataset[start:end]
         episode_buffer = build_episode_buffer(target, source, source_batch, kept_indices, features, rl_values)
+        restamp_outcome(episode_buffer, features, len(kept_indices), outcome)
         write_status(
             status_path,
             state="running",
@@ -540,12 +551,6 @@ def main(config_path: Path, status_path: Path) -> None:
         kept_total += kept
         removed_total += removed
 
-        if outcome_row:
-            new_row = dict(outcome_row)
-            new_row["episode"] = episode_index
-            new_row["frames"] = kept
-            output_outcomes.append(new_row)
-
         write_status(
             status_path,
             state="running",
@@ -563,8 +568,6 @@ def main(config_path: Path, status_path: Path) -> None:
 
     write_status(status_path, state="running", phase="finalizing", message="Finalizing dataset metadata")
     target.finalize()
-    if output_outcomes:
-        (temporary_root / "outcomes.jsonl").write_text("".join(json.dumps(row) + "\n" for row in output_outcomes))
     if rl_config_path.exists():
         shutil.copy2(rl_config_path, temporary_root / "rl_config.json")
     check = LeRobotDataset(output_name, root=temporary_root)

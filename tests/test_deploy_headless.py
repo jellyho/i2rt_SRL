@@ -18,6 +18,16 @@ def _stop_soon(delay=0.8):
     threading.Timer(delay, lambda: os.kill(os.getpid(), signal.SIGINT)).start()
 
 
+def _mock_saved(ds_dir) -> int:
+    """Episodes a MOCK writer saved: it records no dataset, only its manifest of saves."""
+    import json
+
+    from workstation.lerobot_recorder.dataset_writer import AsyncDatasetWriter
+
+    path = ds_dir / AsyncDatasetWriter._MOCK_MANIFEST
+    return len(json.loads(path.read_text())) if path.exists() else 0
+
+
 def test_headless_runs_and_shuts_down_cleanly(tmp_path):
     cfg = RecorderConfig(repo_id="test/hl", root=str(tmp_path), fps=60, mock=True,
                          record_source="deploy")
@@ -35,7 +45,7 @@ def test_headless_records_when_the_source_says_so(tmp_path):
     rc = run_headless(cfg, BridgeConfig(), status_period=0.3)
     assert rc == 0
     # Ctrl-C has to close the rollout — the GUI would use "Stop collection".
-    assert (tmp_path / "hlrec" / "outcomes.jsonl").exists()
+    assert _mock_saved(tmp_path / "hlrec") >= 1
 
 
 def test_headless_reports_the_wrong_robot_mode_instead_of_hanging(tmp_path, monkeypatch):
@@ -88,4 +98,4 @@ def test_headless_disables_review_since_nobody_can_review(tmp_path):
     _stop_soon(1.2)
     assert run_headless(cfg, BridgeConfig(), status_period=0.3) == 0
     assert cfg.review_before_save is False
-    assert (tmp_path / "hlrev" / "outcomes.jsonl").exists()  # saved, not held pending
+    assert _mock_saved(tmp_path / "hlrev") >= 1  # saved, not held pending

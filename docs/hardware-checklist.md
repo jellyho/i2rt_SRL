@@ -109,10 +109,10 @@ from lerobot.datasets import LeRobotDataset
 ds = LeRobotDataset("user/yam_pick", root="~/lerobot_data")
 print(ds.features.keys())
 PY
-cat ~/lerobot_data/outcomes.jsonl
+workstation/yam-data outcomes show ~/lerobot_data/yam_pick
 ```
-- [ ] Features include `observation.state(42)`, `observation.leader(12)`, `observation.control_mode(1)`, `action(14)`, and the 3 images.
-- [ ] `outcomes.jsonl` has one line per kept episode with `outcome`/`task`/`frames`/`source`.
+- [ ] Features include `observation.state(42)`, `observation.leader(12)`, `observation.control_mode(1)`, `action(14)`, `next.success(1)`, `next.done(1)`, and the 3 images.
+- [ ] `outcomes show` lists one line per kept episode with its verdict (`success` / `fail` / `unknown`); the verdict sits on the episode's last frame (`next.done` True, `next.success` True iff success).
 
 ## 8. Camera disconnect fallback
 
@@ -153,7 +153,7 @@ workstation/yam-data deploy --headless --robot-host <ROBOT_IP> --policy-host <PO
 workstation/yam-data record --source dagger --robot-host <ROBOT_IP> \
     --repo-id user/yam_dagger --serials <wl>,<wr>,<agent>
 ```
-- [ ] An episode = one complete policy rollout, including all policy and human-intervention frames. Recorded `action` is the executed command; `control_mode` is `policy` (1) or `intervention` (2) per frame. Verify in `outcomes.jsonl` (`source: dagger`).
+- [ ] An episode = one complete policy rollout, including all policy and human-intervention frames. Recorded `action` is the executed command; `control_mode` is `policy` (1) or `intervention` (2) per frame. A kept rollout is a success: `yam-data outcomes show` lists it as `success`.
 
 ## 12. Eval rollout recording
 

@@ -26,13 +26,13 @@ import queue
 import shutil
 import tempfile
 import threading
-import time
 from pathlib import Path
 from types import MethodType
 from typing import Dict, List, Optional
 
 import numpy as np
 
+from workstation.lerobot_recorder import outcomes as _outcomes
 from workstation.lerobot_recorder.config import RecorderConfig
 from workstation.lerobot_recorder.video_encoding import (
     EncodingBackendDecision,
@@ -103,7 +103,7 @@ def dataset_info(root: str) -> Dict:
     """Inspect the dataset dir at ``root`` for the setup page — no lerobot import.
 
     ``{"exists": bool, "episodes": int|None}``. Episode count is a best-effort read
-    of LeRobot metadata, falling back to the ``outcomes.jsonl`` sidecar."""
+    of LeRobot metadata (``meta/info.json``)."""
     path = os.path.expanduser(root)
     if not os.path.isdir(path) or not os.listdir(path):
         return {"exists": False, "episodes": None}
@@ -115,13 +115,6 @@ def dataset_info(root: str) -> Dict:
                 meta_episodes = json.load(fh).get("total_episodes")
             if meta_episodes is not None:
                 episodes = int(meta_episodes)
-        except Exception:
-            episodes = None
-    sidecar = os.path.join(path, "outcomes.jsonl")
-    if episodes is None and os.path.exists(sidecar):
-        try:
-            with open(sidecar) as fh:
-                episodes = sum(1 for line in fh if line.strip())
         except Exception:
             episodes = None
     return {"exists": True, "episodes": episodes}
@@ -147,7 +140,8 @@ class AsyncDatasetWriter:
         # dataset describes itself. Flattening them would store [N, action_dim] candidates as an
         # anonymous 56-vector and leave the reader to know the layout out of band.
         self.extra_features = {str(k): tuple(v) for k, v in (extra_features or {}).items()}
-        self._mock = cfg.mock
+        mock_writer = getattr(cfg, "mock_writer", None)
+        self._mock = bool(cfg.mock) if mock_writer is None else bool(mock_writer)
         # Output format: "lerobot" (LeRobotDataset) or "abcdl" (the abcdl MP4+binary
         # training cache; one episode dir per submit, written via abcdl.EpisodeWriter).
         self._abcdl = str(getattr(cfg, "record_format", "lerobot")).lower() == "abcdl"
@@ -177,11 +171,11 @@ class AsyncDatasetWriter:
             self._effective_vcodec = "h264"
         # The dataset lives in <root>/<name>; root is just the parent directory.
         self._root = dataset_dir(cfg.root, cfg.repo_id)
-        self._outcomes_path = os.path.join(self._root, "outcomes.jsonl")
         # Episodes already in the dataset before this session (resume); re-synced to
         # the authoritative count in open(). total/new_episodes build on this.
         self._initial_episodes = int(dataset_info(self._root)["episodes"] or 0) if cfg.resume else 0
-        # Whole-dataset ✓/✗ counts from the outcome sidecar (grow as episodes save).
+        # Whole-dataset ✓/✗ counts, read off the outcome columns' per-episode stats on resume
+        # (grow as episodes save).
         self._outcome_totals = self._read_outcome_totals() if cfg.resume else {"success": 0, "fail": 0}
 
         self._queue: "queue.Queue" = queue.Queue()
@@ -204,6 +198,10 @@ class AsyncDatasetWriter:
         self._failed = False
         self._last_error = ""
         self._failed_episodes = 0
+        # What this session saved, in order: {episode, outcome, task, frames, source}. The
+        # in-memory successor of the sidecar row -- for the status line and for tests; the
+        # verdict itself is in the dataset.
+        self._saved_episodes: List[dict] = []
         # Episodes whose encoded video came out short (dropped frames). Not a save failure —
         # recording continues and finalize() repairs it — but the GUI surfaces the count so a
         # failing encoder is noticed at the rig instead of at training time.
@@ -253,6 +251,10 @@ class AsyncDatasetWriter:
                 continue
             vec = np.asarray(val, dtype=np.float32).reshape(-1)
             feats[key] = {"dtype": "float32", "shape": (vec.size,), "names": self._vector_names(key, vec.size)}
+        # The episode's verdict, as two per-frame bool features -- unconditionally. This is
+        # where success/fail lives now; there is no sidecar. See outcomes.py for the shape.
+        for key, spec in _outcomes.OUTCOME_FEATURES.items():
+            feats[key] = dict(spec)
         if getattr(self.cfg, "rl_features", False):
             for key in ("success", "reward", "mc_return"):  # per-frame RL signals
                 feats[key] = {"dtype": "float32", "shape": (1,), "names": None}
@@ -417,92 +419,6 @@ class AsyncDatasetWriter:
             enc["image_writer_processes"] = int(self.cfg.image_writer_processes)
         return enc
 
-    def _dataset_episode_entries(self) -> List[dict]:
-        episodes = getattr(getattr(self._ds, "meta", None), "episodes", None)
-        if episodes is None:
-            return []
-        entries: List[dict] = []
-        try:
-            iterator = iter(episodes)
-        except TypeError:
-            return []
-        for ep in iterator:
-            try:
-                episode_index = int(ep["episode_index"])
-            except Exception:
-                continue
-            tasks = ep.get("tasks") or []
-            if isinstance(tasks, str):
-                task = tasks
-            else:
-                task = str(tasks[0]) if tasks else self.cfg.task
-            length = ep.get("length")
-            if length is None:
-                length = int(ep.get("dataset_to_index", 0)) - int(ep.get("dataset_from_index", 0))
-            entries.append(
-                {
-                    "episode": episode_index,
-                    "outcome": "unknown",
-                    "task": task,
-                    "frames": int(length),
-                    "source": "recovered",
-                    "t": None,
-                    "recovered": True,
-                }
-            )
-        return entries
-
-    def _read_outcome_entries(self) -> List[dict]:
-        if not os.path.exists(self._outcomes_path):
-            return []
-        entries: List[dict] = []
-        try:
-            with open(self._outcomes_path) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        logger.warning("skipping malformed outcome row in %s", self._outcomes_path)
-        except Exception as e:
-            logger.error("could not read outcome sidecar: %s", e)
-        return entries
-
-    def _rewrite_outcome_entries(self, entries: List[dict]) -> None:
-        os.makedirs(self._root, exist_ok=True)
-        tmp_path = f"{self._outcomes_path}.tmp"
-        with open(tmp_path, "w") as fh:
-            for entry in entries:
-                fh.write(json.dumps(entry) + "\n")
-        os.replace(tmp_path, self._outcomes_path)
-
-    def _ensure_outcome_sidecar_complete(self) -> None:
-        recovered = {int(e["episode"]): e for e in self._dataset_episode_entries()}
-        if not recovered:
-            return
-        entries_by_episode: Dict[int, dict] = {}
-        for entry in self._read_outcome_entries():
-            try:
-                entries_by_episode[int(entry["episode"])] = entry
-            except Exception:
-                logger.warning("skipping outcome row without a valid episode index in %s", self._outcomes_path)
-        missing = sorted(set(recovered) - set(entries_by_episode))
-        if not missing:
-            return
-        for episode_index in missing:
-            entries_by_episode[episode_index] = recovered[episode_index]
-        ordered = [entries_by_episode[i] for i in sorted(entries_by_episode)]
-        try:
-            self._rewrite_outcome_entries(ordered)
-            logger.warning(
-                "recovered %d missing outcome sidecar row(s) from dataset metadata: episodes %s",
-                len(missing), missing,
-            )
-        except Exception as e:
-            logger.error("could not repair outcome sidecar: %s", e)
-
     # ------------------------------------------------------- RL per-frame features
     def _rl_config_path(self) -> str:
         return os.path.join(self._root, "rl_config.json")
@@ -597,6 +513,11 @@ class AsyncDatasetWriter:
                         int(local_info.get("total_episodes", 0)) == 0
                         and int(local_info.get("total_frames", 0)) == 0
                     )
+                    if not empty_local and _outcomes.predates_outcome_schema(self._root):
+                        # Appending to a dataset that predates the outcome columns would produce a
+                        # parquet whose rows disagree about their schema -- refuse before opening it.
+                        # The fix is one command; the error names it.
+                        raise _outcomes.OutcomeColumnsMissing(self._root)
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise RuntimeError(f"Cannot read local dataset metadata at {info_path}: {exc}") from exc
                 if empty_local:
@@ -635,7 +556,6 @@ class AsyncDatasetWriter:
                     ):
                         self._ds.episode_buffer = self._ds.create_episode_buffer()
                     self._ds.clear_episode_buffer(delete_images=True)
-                self._ensure_outcome_sidecar_complete()
                 logger.info(
                     "dataset resuming at %s (%d existing episodes, vcodec=%s, batch=%s)",
                     self._root, self._n_episodes, self.cfg.vcodec, self.cfg.batch_encoding_size,
@@ -672,7 +592,7 @@ class AsyncDatasetWriter:
             self._suppress_image_staging()
         else:
             if self.cfg.resume:
-                self._n_episodes = self._existing_outcome_count()
+                self._n_episodes = len(self._read_mock_manifest())
             logger.info("MOCK writer (repo_id=%s); features=%s", self.cfg.repo_id, sorted(self._features))
 
         self._initial_episodes = self._n_episodes  # authoritative pre-session count
@@ -732,31 +652,34 @@ class AsyncDatasetWriter:
             )
 
     def _read_outcome_totals(self) -> Dict[str, int]:
-        """Whole-dataset success/fail counts from the outcome sidecar (best-effort)."""
-        totals = {"success": 0, "fail": 0}
-        try:
-            with open(self._outcomes_path) as fh:
-                for line in fh:
-                    if not line.strip():
-                        continue
-                    outcome = json.loads(line).get("outcome")
-                    if outcome in totals:
-                        totals[outcome] += 1
-        except FileNotFoundError:
-            pass
-        except Exception as e:
-            logger.warning("could not read outcome sidecar totals: %s", e)
-        return totals
+        """Whole-dataset success/fail counts, from the outcome columns' per-episode stats."""
+        if not os.path.isdir(self._root):
+            return {"success": 0, "fail": 0}
+        if self._mock:
+            rows = self._read_mock_manifest()
+            return {k: sum(1 for r in rows if r.get("outcome") == k) for k in ("success", "fail")}
+        return _outcomes.outcome_totals(self._root)
 
-    def _existing_outcome_count(self) -> int:
+    # A mock writer records nothing, so across a save-and-continue it would forget how many
+    # episodes it "saved" and restart at #0. This manifest is that memory -- a list of the
+    # saved_episodes rows -- and nothing else reads it. It is not a dataset.
+    _MOCK_MANIFEST = "mock_manifest.json"
+
+    def _read_mock_manifest(self) -> List[dict]:
         try:
-            with open(self._outcomes_path) as fh:
-                return sum(1 for line in fh if line.strip())
-        except FileNotFoundError:
-            return 0
-        except Exception as e:
-            logger.warning("could not count existing outcomes at %s: %s", self._outcomes_path, e)
-            return 0
+            with open(os.path.join(self._root, self._MOCK_MANIFEST)) as fh:
+                rows = json.load(fh)
+            return rows if isinstance(rows, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _append_mock_manifest(self, row: dict) -> None:
+        os.makedirs(self._root, exist_ok=True)
+        rows = self._read_mock_manifest() + [row]
+        path = os.path.join(self._root, self._MOCK_MANIFEST)
+        with open(path + ".tmp", "w") as fh:
+            json.dump(rows, fh)
+        os.replace(path + ".tmp", path)
 
     # ------------------------------------------------------------------ submit
     def _check_writable(self) -> None:
@@ -777,9 +700,11 @@ class AsyncDatasetWriter:
     def supports_streaming(self) -> bool:
         """Whether frames can be handed over one at a time instead of an episode at a time.
 
-        Per-frame RL signals (success / reward / mc_return) are the exception: they are
-        computed from the episode's length and final outcome, so they cannot be attached to a
-        frame as it is captured. Those recordings keep buffering the whole episode.
+        The verdict itself streams fine: ``next.success`` / ``next.done`` are False on every
+        frame but the last, so frames go in with False and only the final one is rewritten
+        once the outcome is known (see ``_handle_stream_item``). The optional RL signals
+        (reward / mc_return) are the exception -- they depend on the episode's length at every
+        frame -- so those recordings keep buffering the whole episode.
         """
         return not (self._mock or self._abcdl or bool(getattr(self.cfg, "rl_features", False)))
 
@@ -878,9 +803,15 @@ class AsyncDatasetWriter:
 
     @property
     def outcome_totals(self) -> Dict[str, int]:
-        """Whole-dataset {success, fail} counts (sidecar history + this session)."""
+        """Whole-dataset {success, fail} counts (dataset history on resume + this session)."""
         with self._lock:
             return dict(self._outcome_totals)
+
+    @property
+    def saved_episodes(self) -> List[dict]:
+        """Episodes this session saved, oldest first: {episode, outcome, task, frames, source}."""
+        with self._lock:
+            return [dict(e) for e in self._saved_episodes]
 
     @property
     def finalized(self) -> bool:
@@ -932,6 +863,11 @@ class AsyncDatasetWriter:
         if extra:
             for k, v in extra.items():
                 frame[k] = np.asarray([v], dtype=np.float32)
+        # The verdict is not known while frames stream in; every frame carries False and the
+        # terminal frame is rewritten at end_episode. LeRobot validates that every declared
+        # feature is present on every add_frame, so the placeholder is not optional.
+        for key in _outcomes.OUTCOME_FEATURES:
+            frame.setdefault(key, _outcomes.frame_value(False))
         frame["task"] = task
         return frame
 
@@ -1000,6 +936,7 @@ class AsyncDatasetWriter:
                 self._saving_frames = 0
             return
         self.low_disk = False
+        self._stamp_streamed_verdict(outcome, n_frames)
         with self._lock:
             self._saving = True
             self._saving_index = self._n_episodes
@@ -1048,6 +985,7 @@ class AsyncDatasetWriter:
         self.low_disk = False
         # Per-frame RL signals from the episode outcome (None when disabled).
         ff = self._frame_features(len(frames), outcome)
+        verdict = _outcomes.terminal_flags(len(frames), outcome)
         if not self._mock:
             if self._abcdl:
                 self._save_episode_abcdl(frames, task, self._n_episodes, ff)
@@ -1063,6 +1001,8 @@ class AsyncDatasetWriter:
                         if ff:
                             for k, v in ff.items():
                                 frame[k] = np.asarray([v[i]], dtype=np.float32)
+                        for k, v in verdict.items():
+                            frame[k] = v[i]
                         frame["task"] = task
                         self._ds.add_frame(frame)
                     if self._encoding_decision.effective == "torchcodec":
@@ -1169,23 +1109,37 @@ class AsyncDatasetWriter:
         w.save(task=task, frame_features=frame_features)
 
     def _record_outcome(self, episode_index: int, outcome: Optional[str], task: str, n_frames: int) -> None:
-        entry = {
-            "episode": episode_index,
-            "outcome": outcome,
+        """Only the live counters. The verdict itself went into the dataset with the frames."""
+        state = _outcomes.normalize(outcome)
+        row = {
+            "episode": int(episode_index),
+            "outcome": state,
             "task": task,
-            "frames": n_frames,
+            "frames": int(n_frames),
             "source": self.cfg.record_source,
-            "t": time.time(),
         }
-        try:
-            os.makedirs(self._root, exist_ok=True)
-            with open(self._outcomes_path, "a") as fh:
-                fh.write(json.dumps(entry) + "\n")
-        except Exception as e:
-            logger.error("could not write outcome sidecar: %s", e)
-        if outcome in ("success", "fail"):
-            with self._lock:
-                self._outcome_totals[outcome] += 1
+        with self._lock:
+            if state in ("success", "fail"):
+                self._outcome_totals[state] += 1
+            self._saved_episodes.append(row)
+        if self._mock:
+            self._append_mock_manifest(row)
+
+    def _stamp_streamed_verdict(self, outcome: Optional[str], n_frames: int) -> None:
+        """Rewrite the terminal frame's ``next.success`` / ``next.done`` in LeRobot's buffer.
+
+        Streamed frames were added with both False (the verdict did not exist yet). Only the
+        last frame carries it, so only one element per column changes -- and it has to change
+        BEFORE ``save_episode`` computes the episode's stats, or ``stats/next.success/max``
+        would say the episode was never judged.
+        """
+        buf = getattr(self._ds, "episode_buffer", None)
+        if not buf:
+            return
+        flags = _outcomes.terminal_flags(n_frames, outcome)
+        for key, column in flags.items():
+            if buf.get(key):
+                buf[key][-1] = column[-1]
 
     # ------------------------------------------------------------------ shutdown
     def finalize(self) -> None:

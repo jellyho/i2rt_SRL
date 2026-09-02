@@ -183,9 +183,9 @@ git clone https://github.com/jellyho/hf-utils && cd hf-utils && ./run.sh
 
 Per episode: **scrub / play** every camera in sync, plot `action` vs `observation.state`,
 **set the task**, **delete** episodes (with re-indexing), split, merge, render to MP4/GIF,
-and annotate subtasks. It reads this recorder's `outcomes.jsonl` when present, so
-success / fail / discard still show up per episode and survive a delete. Everything
-destructive backs up first.
+and annotate subtasks. The episode verdict is part of the dataset itself (`next.success` /
+`next.done`, see below), so success / fail / unjudged show up per episode and survive a
+delete or a split. Everything destructive backs up first.
 
 Two things stayed here because they encode YAM specifics a general tool should not have:
 **homing annotation** (below) and `yam-data check-videos`, which can re-encode an mp4 that
@@ -382,7 +382,9 @@ same env. The **policy server** env is unconstrained (its own conda/uv).
 **Safety & ops highlights**: network E-STOP, per-joint position + optional effort
 (collision) limits, command-staleness watchdog (link loss → hold), async dataset
 writer (collect while saving), camera-disconnect auto-reconnect, disk-space guard,
-and a per-episode `outcomes.jsonl` (`yam-data doctor` summarizes success rates).
+and the per-episode verdict recorded in the LeRobot schema itself as `next.success` /
+`next.done` (`yam-data doctor` summarizes success rates; datasets recorded before this
+carried an `outcomes.jsonl` sidecar instead — `yam-data migrate-outcomes <dir>` converts them).
 
 **Verify on hardware**: follow [`docs/hardware-checklist.md`](docs/hardware-checklist.md)
 — an ordered, runnable confirmation list for every feature.

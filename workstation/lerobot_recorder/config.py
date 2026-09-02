@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from i2rt.serving.control_config import DEFAULT_TELEOP_BUTTON_OUTCOMES
 
@@ -157,6 +157,9 @@ class RecorderConfig:
     # a dataset that will not open. 0 disables the check.
     min_free_ram_gb: float = 3.0
     mock: bool = False  # synthetic cameras + teleop stream (no hardware / robot)
+    # None -> the writer follows ``mock``. False with ``mock=True`` records the synthetic stream
+    # into a real LeRobot dataset (a dry run of the writer with no hardware; what the tests use).
+    mock_writer: Optional[bool] = None
     review_before_save: bool = True  # hold each episode for Keep/Delete instead of auto-saving
     auto_arm: bool = False  # arm collection automatically on Start (record on the next teleop engage)
     review_cam: str = "agentview"  # which camera to buffer (downsampled) for review playback
