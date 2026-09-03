@@ -56,8 +56,10 @@ def test_relabel_rewrites_only_that_episode(tmp_path):
     assert ep1["next.success"].tolist() == [False] * 5
     # and the dataset-level stats followed: 1 success frame out of 12
     stats = json.load(open(tmp_path / "ds" / "meta" / "stats.json"))
-    assert abs(stats["next.success"]["mean"][0] - 1 / 12) < 1e-9
-    assert abs(stats["next.done"]["mean"][0] - 2 / 12) < 1e-9
+    # float32, not float64: the stats are stored and aggregated as float32, so 2/12 comes back as
+    # 0.16666666790843. rel=1e-6 is what that dtype can actually carry.
+    assert stats["next.success"]["mean"][0] == pytest.approx(1 / 12, rel=1e-6)
+    assert stats["next.done"]["mean"][0] == pytest.approx(2 / 12, rel=1e-6)
 
 
 def test_relabel_can_withdraw_a_verdict(tmp_path):
@@ -115,10 +117,14 @@ def test_video_length_mismatch_detected(tmp_path):
     pytest.importorskip("pandas")
     ds = tmp_path / "ds"
     # ep0 consistent (100 frames); ep1 agentview dropped a trailing frame (99 vs 100).
-    _write_meta(ds, 30, [
-        (0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)}),
-        (1, 100, {"agentview": (100, 199), "wrist_left": (100, 200)}),
-    ])
+    _write_meta(
+        ds,
+        30,
+        [
+            (0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)}),
+            (1, 100, {"agentview": (100, 199), "wrist_left": (100, 200)}),
+        ],
+    )
     bad = video_length_mismatches(str(ds))
     assert len(bad) == 1
     assert bad[0]["episode"] == 1 and bad[0]["camera"].endswith("agentview")
@@ -130,10 +136,14 @@ def test_repair_snaps_timestamp_to_length(tmp_path):
     import pandas as pd
 
     ds = tmp_path / "ds"
-    _write_meta(ds, 30, [
-        (0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)}),
-        (1, 100, {"agentview": (100, 199), "wrist_left": (100, 200)}),
-    ])
+    _write_meta(
+        ds,
+        30,
+        [
+            (0, 100, {"agentview": (0, 100), "wrist_left": (0, 100)}),
+            (1, 100, {"agentview": (100, 199), "wrist_left": (100, 200)}),
+        ],
+    )
     n = repair_length_consistency(str(ds))
     assert n == 1
     assert video_length_mismatches(str(ds)) == []

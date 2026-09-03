@@ -23,7 +23,11 @@ from lerobot.datasets.compute_stats import (
     sample_indices,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.utils import DEFAULT_FEATURES
+
+try:  # lerobot >= 0.5 moved it out of the datasets package
+    from lerobot.utils.constants import DEFAULT_FEATURES
+except ImportError:  # 0.4.x
+    from lerobot.datasets.utils import DEFAULT_FEATURES
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # the i2rt repo root
 from workstation.lerobot_recorder import outcomes as _outcomes
