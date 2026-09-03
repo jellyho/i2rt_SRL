@@ -248,5 +248,9 @@ def test_migrate_leaves_every_other_stats_entry_alone(tmp_path):
     after = json.load(open(stats_path))
     assert after["observation.state"]["mean"] == [123.0] * len(stats["observation.state"]["mean"])
     assert after["some.tool.wrote.this"] == {"note": "not a feature at all"}
-    assert after[oc.SUCCESS_KEY]["max"] == [True] and abs(after[oc.SUCCESS_KEY]["mean"][0] - 1 / 5) < 1e-9
-    assert after[oc.DONE_KEY]["mean"][0] == pytest.approx(2 / 5)
+    # float32 all the way through: LeRobot stores the per-episode stats as float32 and aggregates
+    # them in float32, so 1/5 comes back as 0.20000000596. A 1e-9 tolerance asserts float64
+    # precision on a float32 quantity and only passed by luck on one aggregation order.
+    assert after[oc.SUCCESS_KEY]["max"] == [True]
+    assert after[oc.SUCCESS_KEY]["mean"][0] == pytest.approx(1 / 5, rel=1e-6)
+    assert after[oc.DONE_KEY]["mean"][0] == pytest.approx(2 / 5, rel=1e-6)
