@@ -410,6 +410,52 @@ class AsyncDatasetWriter:
             logger.exception("TorchCodec failed for %s; retrying this camera with PyAV", video_key)
             return self._pyav_encode_temporary(video_key, episode_index)
 
+    @staticmethod
+    def _accepted_kwargs(func) -> set:
+        """Parameter names ``func`` will accept, or an empty set when it takes **kwargs."""
+        import inspect
+
+        try:
+            params = inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return set()
+        if any(q.kind is inspect.Parameter.VAR_KEYWORD for q in params.values()):
+            return set()
+        return set(params)
+
+    def _fit_encoding_kwargs(self, enc: dict, func) -> dict:
+        """Drop only the keys ``func`` cannot take, folding vcodec/gop into RGBEncoderConfig.
+
+        lerobot 0.5 replaced the flat ``vcodec=`` argument with an ``rgb_encoder`` config object
+        that carries the codec AND the keyframe interval. Passing the flat kwargs and retrying
+        with NONE of them on the TypeError meant one unsupported key silently dropped
+        ``batch_encoding_size`` and ``streaming_encoding`` too -- so recording fell back to
+        LeRobot's defaults: PNG staging for every frame of every camera, g=2, and whatever codec
+        it likes. The log said "using defaults" and the run carried on.
+
+        Filtering by signature keeps the supported keys, and the version that wants a config
+        object gets one instead of losing the setting.
+        """
+        accepted = self._accepted_kwargs(func)
+        if not accepted:
+            return enc
+        out = {k: v for k, v in enc.items() if k in accepted}
+        if "vcodec" in enc and "vcodec" not in accepted and "rgb_encoder" in accepted:
+            try:
+                from lerobot.configs.video import RGBEncoderConfig
+            except ImportError:
+                return out
+            # g is the keyframe interval _apply_gop monkeypatches onto the encoder after the
+            # fact on 0.4.x; here it is simply part of the config the encoder is built from.
+            out["rgb_encoder"] = RGBEncoderConfig(
+                vcodec=str(enc["vcodec"]),
+                g=max(1, int(getattr(self.cfg, "gop", 10))),
+            )
+        dropped = sorted(set(enc) - set(out) - {"vcodec"})
+        if dropped:
+            logger.warning("this lerobot does not accept %s; leaving them at its defaults", dropped)
+        return out
+
     def _create_encoding_kwargs(self) -> dict:
         enc = self._dataset_encoding_kwargs()
         # Async PNG writer (parallelizes the slow pre-encode step). Only pass when
@@ -533,12 +579,8 @@ class AsyncDatasetWriter:
                 # refuse to open. Clear the orphans before trying.
                 self._recover_from_crash()
                 LeRobotDataset = _import_lerobot_dataset()
-                enc = self._dataset_encoding_kwargs()
-                try:
-                    self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root, **enc)
-                except TypeError:
-                    logger.warning("LeRobotDataset() rejected encoding kwargs %s; using defaults", sorted(enc))
-                    self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root)
+                enc = self._fit_encoding_kwargs(self._dataset_encoding_kwargs(), LeRobotDataset.__init__)
+                self._ds = LeRobotDataset(self.cfg.repo_id, root=self._root, **enc)
                 self._n_episodes = int(
                     getattr(self._ds, "num_episodes", getattr(getattr(self._ds, "meta", None), "total_episodes", 0))
                 )
@@ -562,27 +604,16 @@ class AsyncDatasetWriter:
                 )
             else:
                 LeRobotDataset = _import_lerobot_dataset()
-                enc = self._create_encoding_kwargs()
-                try:
-                    self._ds = LeRobotDataset.create(
-                        repo_id=self.cfg.repo_id,
-                        fps=self.cfg.fps,
-                        features=self._features,
-                        root=self._root,
-                        robot_type=self.cfg.robot_type,
-                        use_videos=True,
-                        **enc,
-                    )
-                except TypeError:  # older/newer LeRobot without these kwargs — fall back
-                    logger.warning("LeRobot.create() rejected encoding kwargs %s; using defaults", sorted(enc))
-                    self._ds = LeRobotDataset.create(
-                        repo_id=self.cfg.repo_id,
-                        fps=self.cfg.fps,
-                        features=self._features,
-                        root=self._root,
-                        robot_type=self.cfg.robot_type,
-                        use_videos=True,
-                    )
+                enc = self._fit_encoding_kwargs(self._create_encoding_kwargs(), LeRobotDataset.create)
+                self._ds = LeRobotDataset.create(
+                    repo_id=self.cfg.repo_id,
+                    fps=self.cfg.fps,
+                    features=self._features,
+                    root=self._root,
+                    robot_type=self.cfg.robot_type,
+                    use_videos=True,
+                    **enc,
+                )
                 logger.info(
                     "dataset created at %s (repo_id=%s, vcodec=%s, batch=%s)",
                     self._root, self.cfg.repo_id, self.cfg.vcodec, self.cfg.batch_encoding_size,
