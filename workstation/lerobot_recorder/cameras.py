@@ -63,6 +63,7 @@ class CameraManager:
         self._pipelines: Dict[str, object] = {}
         self._serials: Dict[str, str] = {}  # resolved serial per key (for reconnect)
         self._last: Dict[str, np.ndarray] = {}  # latest frame per key (written by the capture thread)
+        self._stamp: Dict[str, float] = {}
         self._healthy: Dict[str, bool] = {}
         # Per-camera pinhole intrinsics, filled in on open; see _read_intrinsics.
         self._intrinsics: Dict[str, dict] = {}
@@ -74,7 +75,7 @@ class CameraManager:
         # just read the latest cached frame via read().
         self._cap_lock = threading.Lock()
         self._cap_stop = threading.Event()
-        self._cap_thread: "threading.Thread | None" = None
+        self._cap_threads: "list[threading.Thread]" = []
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -100,32 +101,47 @@ class CameraManager:
                 logger.warning("camera '%s' (%s) could not open: %s", spec.key, serial, e)
 
         self._cap_stop.clear()
-        self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self._cap_thread.start()
+        # ONE THREAD PER CAMERA. They used to share one, which made the three cameras serial: each
+        # wait_for_frames blocks for up to 1000 ms, and _try_reconnect re-opens a RealSense
+        # pipeline synchronously inside the same loop -- seconds during which NO camera's cache is
+        # updated. Consumers cannot tell a frozen cache from a still scene, so the recorder went on
+        # pairing the same picture with new actions: "the robot is moving but the frames are not
+        # increasing, just the same initial frame", concentrated at startup because that is when a
+        # camera is most likely to hiccup and trigger the blocking reconnect.
+        self._cap_threads = [
+            threading.Thread(target=self._capture_loop, args=(spec,), daemon=True, name=f"cam-{spec.key}")
+            for spec in self.specs
+        ]
+        for t in self._cap_threads:
+            t.start()
 
-    def _capture_loop(self) -> None:
-        """Continuously grab the latest frame per camera and cache it. Owns the camera
-        API and the (blocking) reconnect, so consumers never block on hardware."""
+    def _capture_loop(self, spec: CameraSpec) -> None:
+        """Grab the latest frame for ONE camera and cache it. Owns that camera's API and its
+        (blocking) reconnect, so neither consumers nor the other cameras block on it."""
         while not self._cap_stop.is_set():
-            for spec in self.specs:
-                if self._cap_stop.is_set():
-                    break
-                try:
-                    pipe = self._pipelines.get(spec.key)
-                    if pipe is None:
-                        raise RuntimeError("pipeline not open")
-                    frames = pipe.wait_for_frames(timeout_ms=1000)
-                    img = np.asanyarray(frames.get_color_frame().get_data())  # HxWx3 uint8 (rgb8)
-                    with self._cap_lock:
-                        self._last[spec.key] = img
-                    if not self._healthy.get(spec.key, True):  # was down -> recovered
-                        logger.info("camera '%s' recovered", spec.key)
-                    self._healthy[spec.key] = True
-                except Exception:
-                    if self._healthy.get(spec.key, True):  # log the drop once, on the transition
-                        logger.warning("camera '%s' stopped delivering frames (link unstable?)", spec.key)
-                    self._healthy[spec.key] = False
-                    self._try_reconnect(spec)  # blocking pipe re-open, but off the record/GUI threads
+            try:
+                pipe = self._pipelines.get(spec.key)
+                if pipe is None:
+                    raise RuntimeError("pipeline not open")
+                frames = pipe.wait_for_frames(timeout_ms=1000)
+                img = np.asanyarray(frames.get_color_frame().get_data())  # HxWx3 uint8 (rgb8)
+                with self._cap_lock:
+                    self._last[spec.key] = img
+                    # When this frame arrived, so a consumer can ask how stale the image it
+                    # just paired with an action was. The recorder samples the LATEST cached
+                    # frame, so a consecutive pair of reads inside one camera period gets the
+                    # same image -- which reads as a freeze in the video and is invisible
+                    # without this. Nothing is written to the dataset; see age_s().
+                    self._stamp[spec.key] = time.monotonic()
+                if not self._healthy.get(spec.key, True):  # was down -> recovered
+                    logger.info("camera '%s' recovered", spec.key)
+                self._healthy[spec.key] = True
+            except Exception:
+                if self._healthy.get(spec.key, True):  # log the drop once, on the transition
+                    logger.warning("camera '%s' stopped delivering frames (link unstable?)", spec.key)
+                self._healthy[spec.key] = False
+                # Blocking, and now only for THIS camera: the others keep delivering.
+                self._try_reconnect(spec)
 
     def _supported_color_fps(self, serial: str, spec: CameraSpec) -> list:
         """Color fps values the device actually offers at (width, height) in rgb8."""
@@ -165,7 +181,9 @@ class CameraManager:
         if supported and spec.fps not in supported:
             usable = [f for f in supported if f <= spec.fps] or supported
             fps = max(usable)
-            logger.info("camera '%s': %d fps unsupported; using %d fps (available: %s)", spec.key, spec.fps, fps, supported)
+            logger.info(
+                "camera '%s': %d fps unsupported; using %d fps (available: %s)", spec.key, spec.fps, fps, supported
+            )
         self._fps[spec.key] = fps
         return fps
 
@@ -194,9 +212,12 @@ class CameraManager:
         try:
             intr = profile.get_stream(_rs().stream.color).as_video_stream_profile().get_intrinsics()
             self._intrinsics[spec.key] = {
-                "fx": float(intr.fx), "fy": float(intr.fy),
-                "cx": float(intr.ppx), "cy": float(intr.ppy),
-                "width": int(intr.width), "height": int(intr.height),
+                "fx": float(intr.fx),
+                "fy": float(intr.fy),
+                "cx": float(intr.ppx),
+                "cy": float(intr.ppy),
+                "width": int(intr.width),
+                "height": int(intr.height),
             }
         except Exception as e:
             self._intrinsics.pop(spec.key, None)
@@ -240,13 +261,42 @@ class CameraManager:
                 if not (rng.min <= value <= rng.max):
                     logger.warning(
                         "camera '%s': option '%s'=%g out of range [%g, %g] (ignored)",
-                        spec.key, name, value, rng.min, rng.max,
+                        spec.key,
+                        name,
+                        value,
+                        rng.min,
+                        rng.max,
                     )
                     continue
                 sensor.set_option(option, value)
                 logger.info("camera '%s': %s = %g", spec.key, name, value)
             except Exception as e:
                 logger.warning("camera '%s': could not set option '%s'=%g: %s", spec.key, name, value, e)
+
+    def stamps(self) -> Dict[str, float]:
+        """When each camera's cached frame arrived, monotonic. Empty in mock mode.
+
+        The record loop paces itself at cfg.fps while the cameras run at their own rate, so a tick
+        can read a frame it has already read -- "images repeat if the camera is slower", as _loop
+        says. Comparing these tells a genuinely new frame from the same one seen again, which is
+        what the repeated frames at the start of a rollout were.
+        """
+        if self.cfg.mock:
+            return {}
+        with self._cap_lock:
+            return dict(self._stamp)
+
+    def age_s(self) -> Dict[str, float]:
+        """Seconds since each camera's cached frame arrived. Empty in mock mode.
+
+        Diagnostic only: the recorder logs the worst of these per episode so "the image was N ms
+        old when it was paired with that action" is answerable without a schema change.
+        """
+        if self.cfg.mock:
+            return {}
+        now = time.monotonic()
+        with self._cap_lock:
+            return {k: now - t for k, t in self._stamp.items()}
 
     def read(self) -> Dict[str, np.ndarray]:
         """Return {key: HxWx3 uint8 RGB} — the latest cached frame per camera, copied.
@@ -258,6 +308,9 @@ class CameraManager:
         with self._cap_lock:
             for spec in self.specs:
                 img = self._last.get(spec.key)
+                # A camera that has never delivered gets black, for the GUI's benefit. It must
+                # not reach a dataset: `healthy` is False until every camera has delivered at
+                # least once, and the recorder records nothing while it is False.
                 out[spec.key] = img.copy() if img is not None else np.zeros((spec.height, spec.width, 3), np.uint8)
         return out
 
@@ -281,14 +334,30 @@ class CameraManager:
 
     @property
     def healthy(self) -> bool:
-        """True iff every camera delivered a frame on the latest read (always True in mock)."""
-        return all(self._healthy.values()) if self._healthy else True
+        """True iff every camera has delivered at least one frame AND is currently delivering.
+
+        The "at least one" half is the part that was missing, and it is the whole of the
+        start-of-episode problem. `_healthy` is EMPTY until the capture thread's first pass, and
+        this used to return True for an empty dict -- so before any camera had produced anything,
+        the recorder believed the sensors were fine, `read()` handed it the zeros it fabricates for
+        a camera with no frame yet, and those went into the episode. Once one real frame arrives it
+        is then copied to every tick until the next one, which is the "first few chunks are a
+        repeated first frame, especially the very first rollout" report. Nothing further along can
+        tell a fabricated frame from a real one; only here is the difference still visible.
+        """
+        if self.cfg.mock:
+            return True
+        if not self._pipelines:  # not started
+            return False
+        with self._cap_lock:
+            delivered = set(self._last)
+        return all(spec.key in delivered for spec in self.specs) and all(self._healthy.values())
 
     def stop(self) -> None:
         self._cap_stop.set()
-        if self._cap_thread is not None:
-            self._cap_thread.join(timeout=2.0)
-            self._cap_thread = None
+        for t in self._cap_threads:
+            t.join(timeout=2.0)
+        self._cap_threads = []
         for pipe in self._pipelines.values():
             try:
                 pipe.stop()

@@ -133,6 +133,9 @@ class AsyncChunkBroker(BasePolicy):
         self._chunked = True
         self._step = 0  # global count of actions handed out
         self._chunk_index = -1  # which chunk the current action came from
+        #: (chunk_index, step_in_chunk) of the action the last `infer` returned, latched at the
+        #: moment it was sliced. See stats().
+        self._served_provenance: "tuple[int, int] | None" = None
 
         self._inflight = False
         self._request_step = 0  # global step whose observation was sent
@@ -191,11 +194,21 @@ class AsyncChunkBroker(BasePolicy):
         self._prefix_fn = fn
 
     def stats(self) -> Dict:
-        """Timing/provenance of the action just returned, for the UI and the dataset."""
+        """Timing/provenance of the action just returned, for the UI and the dataset.
+
+        `chunk_index` and `step_in_chunk` describe the action THIS CALL RETURNED, which is not the
+        same as the broker's state when the caller gets round to asking. On the last step of a
+        chunk, `infer` hands out the action and then -- in the same call -- activates the pending
+        reply, which advances `_chunk_index` and resets `_cursor`. Reading the live fields after
+        that labelled the last action of chunk N as belonging to chunk N+1: the recording then
+        showed chunk N with 29 frames and chunk N+1 with 31, on a run where every chunk was 30.
+        So the provenance is latched when the action is sliced and reported from the latch.
+        """
         with self._lock:
+            served = self._served_provenance
             return {
-                "chunk_index": self._chunk_index,
-                "step_in_chunk": max(self._cursor - 1, 0),
+                "chunk_index": served[0] if served else self._chunk_index,
+                "step_in_chunk": served[1] if served else max(self._cursor - 1, 0),
                 "chunk_len": self._chunk,
                 "infer_ms": self._last_infer_s * 1000.0,
                 "delay_ticks": self._last_delay_ticks,
@@ -333,6 +346,8 @@ class AsyncChunkBroker(BasePolicy):
 
         with self._lock:
             results = _slice_step(self._results, self._cursor) if self._chunked else self._results
+            # Latch WHOSE action this is before anything below can move the cursor or the chunk.
+            self._served_provenance = (self._chunk_index, self._cursor)
             self._cursor += 1
             self._step += 1
             exhausted = self._cursor >= self._chunk
@@ -366,6 +381,7 @@ class AsyncChunkBroker(BasePolicy):
             self._chunk = 0
             self._step = 0
             self._chunk_index = -1
+            self._served_provenance = None
             self._last_delay_ticks = 0
             self._arrived.clear()
         self._policy.reset()

@@ -156,7 +156,10 @@ class DeploymentPolicyRunner:
         self.on_connected = None
         #: Called with the sent action vector every time an action is pushed to the robot, so the
         #: recorder can log exactly one eval frame per executed action (see Recorder.note_action_sent).
-        self.on_action_sent: Callable[[np.ndarray], None] | None = None
+        #: Called with (action, images) the instant an action is sent; the recorder builds that
+        #: step's frame inside the call, on THIS thread, so the frame carries the image the
+        #: policy was given and the provenance stamped just above it.
+        self.on_action_sent: Callable[..., None] | None = None
         #: Called when the policy stops driving -- the operator stopping it, an intervention, or
         #: the arm going home. This runner is the authority on that: it is what decides to send or
         #: not, and it already resets the chunk here. A recorder uses it to end the episode, so one
@@ -367,8 +370,17 @@ class DeploymentPolicyRunner:
                     margin_ticks=self.cfg.prefetch_margin_ticks,
                     prefetch_ticks=self.cfg.prefetch_ticks,
                 )
+                logger.info(
+                    "inference is ASYNC (--async-inference): the next chunk is prefetched, so a "
+                    "chunk starts a few ticks after the observation it was computed from"
+                )
             else:
                 policy = ActionChunkBroker(client)
+                logger.info(
+                    "inference is SYNC: every chunk is computed from the observation just handed "
+                    "over, and the arm holds its last target for the round trip at each chunk "
+                    "boundary (those stall ticks send nothing, so they are not recorded)"
+                )
 
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)
@@ -515,7 +527,8 @@ class DeploymentPolicyRunner:
                     # exactly as a real rollout would produce -- a no-op unless armed in eval mode.
                     self._set(robot_connected=True, policy_connected=True, streaming=True, last_error="")
                     if self.on_action_sent is not None:
-                        self.on_action_sent(np.zeros(1, dtype=float))
+                        # No policy and no action: the recorder falls back to the snapshot's.
+                        self.on_action_sent(None)
                 else:
                     self._connect_robot()
                     obs = self._robot.get_observation()
@@ -533,7 +546,8 @@ class DeploymentPolicyRunner:
                         self._connect_policy()
                         if not self._was_streaming:
                             self._reset_policy_chunk()
-                        policy_obs = self._build_obs(obs, self.images_fn())
+                        policy_images = self.images_fn()
+                        policy_obs = self._build_obs(obs, policy_images)
                         if policy_obs:
                             result = self._policy.infer(policy_obs)
                             action = result["actions"]
@@ -546,8 +560,11 @@ class DeploymentPolicyRunner:
                             # provenance written with the frame is this action's, not the previous.
                             self._note_timing(time.time())
                             # Log one eval frame for the action we just executed (1 frame == 1 send).
+                            # The frame is built inside this call, on this thread, from the images
+                            # that produced `result`: the recorded (s, a) is the pair the policy
+                            # used, and the chunk it is filed under cannot have moved on.
                             if self.on_action_sent is not None:
-                                self.on_action_sent(action_vec)
+                                self.on_action_sent(action_vec, policy_images)
                             self._set(
                                 streaming=True,
                                 last_error="",
