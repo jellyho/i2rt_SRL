@@ -367,8 +367,17 @@ class DeploymentPolicyRunner:
                     margin_ticks=self.cfg.prefetch_margin_ticks,
                     prefetch_ticks=self.cfg.prefetch_ticks,
                 )
+                logger.info(
+                    "inference is ASYNC (--async-inference): the next chunk is prefetched, so a "
+                    "chunk starts a few ticks after the observation it was computed from"
+                )
             else:
                 policy = ActionChunkBroker(client)
+                logger.info(
+                    "inference is SYNC: every chunk is computed from the observation just handed "
+                    "over, and the arm holds its last target for the round trip at each chunk "
+                    "boundary (those stall ticks send nothing, so they are not recorded)"
+                )
 
         self._image_shape = self._image_shape_from_meta(meta)
         image_keys = meta.get("image_keys", self.cfg.image_keys)

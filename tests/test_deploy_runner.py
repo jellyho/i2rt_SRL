@@ -509,3 +509,51 @@ def test_elapsed_is_relative_because_float32_cannot_hold_a_unix_timestamp():
     r._note_timing(1_787_124_096.033)
     first = float(r.get_extras()["policy.elapsed_s"][0])
     assert first == pytest.approx(0.033, abs=1e-4), "a 33 ms tick must survive the float32 column"
+
+
+# --------------------------------------------------------------------------------------- #
+# Which broker actually gets built: sync is the default, and the log says which one is live
+# --------------------------------------------------------------------------------------- #
+def _connect_with(monkeypatch, caplog, **bridge_kw):
+    """Run _connect_policy against a stub websocket client and return (policy, log text)."""
+    import logging as _logging
+
+    import yam_policy
+
+    class _StubClient:
+        def __init__(self, host, port):
+            pass
+
+        def get_server_metadata(self):
+            return {}
+
+    monkeypatch.setattr(yam_policy, "WebsocketClientPolicy", _StubClient)
+    r = _idle_runner()
+    for k, v in bridge_kw.items():
+        setattr(r.cfg, k, v)
+    r._policy_port_open = lambda: True
+    with caplog.at_level(_logging.INFO):
+        r._connect_policy()
+    return r._policy, caplog.text
+
+
+def test_synchronous_broker_is_what_a_default_run_gets(monkeypatch, caplog):
+    """Evaluation runs synchronously unless --async-inference is passed, so the recorded chunk is
+    always computed from the observation just handed over. A flag this consequential must also be
+    visible in the log: the operator should never have to infer the mode from the launch command."""
+    from yam_policy import ActionChunkBroker
+
+    policy, text = _connect_with(monkeypatch, caplog)
+    assert isinstance(policy, ActionChunkBroker)
+    assert "inference is SYNC" in text
+    assert "ASYNC" not in text
+
+
+def test_async_broker_only_with_the_flag_and_it_says_so(monkeypatch, caplog):
+    """Opting in swaps the broker AND announces it, so a prefetched rollout is never mistaken for a
+    synchronous one when its chunk boundaries are read back off the recording."""
+    from yam_policy import AsyncChunkBroker
+
+    policy, text = _connect_with(monkeypatch, caplog, async_inference=True)
+    assert isinstance(policy, AsyncChunkBroker)
+    assert "inference is ASYNC" in text
