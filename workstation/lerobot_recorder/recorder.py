@@ -64,6 +64,9 @@ class Recorder:
             "armed": False,
             "recording": False,
             "pending": False,
+            # Arming opens the dataset before the rollout starts; True while that is happening,
+            # so the GUI can say "preparing" instead of looking hung. See arm().
+            "preparing": False,
             "teleop": "—",
             "episodes": 0,
             "episodes_total": 0,  # whole dataset incl. what a resumed one already had
@@ -292,6 +295,26 @@ class Recorder:
             return
         if not self._ram_ok_to_start():
             return
+        if self._eval:
+            # Pay the writer's start-up cost HERE, before the rollout exists, instead of on the
+            # record loop at the moment the first frame arrives. Opening a LeRobotDataset and
+            # starting the video encoder takes seconds; done lazily it happened exactly when the
+            # policy began driving, the bounded frame queue filled behind it, and the record loop
+            # blocked -- which is what froze the preview and stalled the frame count for the first
+            # chunks of a rollout. Arming is where a wait is free: nothing is moving yet.
+            t0 = time.perf_counter()
+            self._set(armed=False, recording=False, preparing=True)
+            try:
+                self._ensure_writer_open()
+            except Exception as e:
+                # Refuse to arm rather than start a rollout that cannot be recorded.
+                logger.error("could not open the dataset, not arming: %s", e)
+                self._set(armed=False, recording=False, preparing=False)
+                return
+            took = time.perf_counter() - t0
+            self._set(preparing=False)
+            if took > 0.5:
+                logger.info("dataset ready in %.1f s (paid before the rollout, not during it)", took)
         self.gate.arm()
         self._rollout_ended = False
         if self._eval:  # eval: each rollout between arm and disarm is its own episode

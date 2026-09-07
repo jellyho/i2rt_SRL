@@ -1123,3 +1123,27 @@ def test_the_send_counter_restarts_each_rollout(tmp_path):
         assert rec.get_status()["frames"] == 0, "the wait before the first action is not the rollout"
     finally:
         rec.shutdown()
+
+
+def test_arming_opens_the_dataset_before_the_rollout(tmp_path):
+    """The writer's start-up cost is paid at arm, not on the record loop at the first frame.
+
+    Opening a LeRobotDataset and starting the video encoder takes seconds. Done lazily it landed
+    exactly when the policy began driving: the bounded frame queue filled behind it and the record
+    loop blocked, which froze the preview and stalled the frame count for the first chunks. Arming
+    is where a wait costs nothing, because nothing is moving yet.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/prep", root=str(tmp_path), fps=30, mock=True, record_source="eval", review_before_save=False
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    try:
+        assert rec.writer is None, "nothing is open before arming"
+        rec.arm()
+        assert rec.writer is not None, "arming must leave a writer ready to take frames"
+        assert rec.get_status()["armed"] is True
+        assert rec.get_status()["preparing"] is False
+    finally:
+        rec.shutdown()
