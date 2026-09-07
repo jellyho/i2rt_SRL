@@ -75,7 +75,7 @@ class CameraManager:
         # just read the latest cached frame via read().
         self._cap_lock = threading.Lock()
         self._cap_stop = threading.Event()
-        self._cap_thread: "threading.Thread | None" = None
+        self._cap_threads: "list[threading.Thread]" = []
 
     # ------------------------------------------------------------------ public
     def start(self) -> None:
@@ -101,38 +101,47 @@ class CameraManager:
                 logger.warning("camera '%s' (%s) could not open: %s", spec.key, serial, e)
 
         self._cap_stop.clear()
-        self._cap_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self._cap_thread.start()
+        # ONE THREAD PER CAMERA. They used to share one, which made the three cameras serial: each
+        # wait_for_frames blocks for up to 1000 ms, and _try_reconnect re-opens a RealSense
+        # pipeline synchronously inside the same loop -- seconds during which NO camera's cache is
+        # updated. Consumers cannot tell a frozen cache from a still scene, so the recorder went on
+        # pairing the same picture with new actions: "the robot is moving but the frames are not
+        # increasing, just the same initial frame", concentrated at startup because that is when a
+        # camera is most likely to hiccup and trigger the blocking reconnect.
+        self._cap_threads = [
+            threading.Thread(target=self._capture_loop, args=(spec,), daemon=True, name=f"cam-{spec.key}")
+            for spec in self.specs
+        ]
+        for t in self._cap_threads:
+            t.start()
 
-    def _capture_loop(self) -> None:
-        """Continuously grab the latest frame per camera and cache it. Owns the camera
-        API and the (blocking) reconnect, so consumers never block on hardware."""
+    def _capture_loop(self, spec: CameraSpec) -> None:
+        """Grab the latest frame for ONE camera and cache it. Owns that camera's API and its
+        (blocking) reconnect, so neither consumers nor the other cameras block on it."""
         while not self._cap_stop.is_set():
-            for spec in self.specs:
-                if self._cap_stop.is_set():
-                    break
-                try:
-                    pipe = self._pipelines.get(spec.key)
-                    if pipe is None:
-                        raise RuntimeError("pipeline not open")
-                    frames = pipe.wait_for_frames(timeout_ms=1000)
-                    img = np.asanyarray(frames.get_color_frame().get_data())  # HxWx3 uint8 (rgb8)
-                    with self._cap_lock:
-                        self._last[spec.key] = img
-                        # When this frame arrived, so a consumer can ask how stale the image it
-                        # just paired with an action was. The recorder samples the LATEST cached
-                        # frame, so a consecutive pair of reads inside one camera period gets the
-                        # same image -- which reads as a freeze in the video and is invisible
-                        # without this. Nothing is written to the dataset; see age_s().
-                        self._stamp[spec.key] = time.monotonic()
-                    if not self._healthy.get(spec.key, True):  # was down -> recovered
-                        logger.info("camera '%s' recovered", spec.key)
-                    self._healthy[spec.key] = True
-                except Exception:
-                    if self._healthy.get(spec.key, True):  # log the drop once, on the transition
-                        logger.warning("camera '%s' stopped delivering frames (link unstable?)", spec.key)
-                    self._healthy[spec.key] = False
-                    self._try_reconnect(spec)  # blocking pipe re-open, but off the record/GUI threads
+            try:
+                pipe = self._pipelines.get(spec.key)
+                if pipe is None:
+                    raise RuntimeError("pipeline not open")
+                frames = pipe.wait_for_frames(timeout_ms=1000)
+                img = np.asanyarray(frames.get_color_frame().get_data())  # HxWx3 uint8 (rgb8)
+                with self._cap_lock:
+                    self._last[spec.key] = img
+                    # When this frame arrived, so a consumer can ask how stale the image it
+                    # just paired with an action was. The recorder samples the LATEST cached
+                    # frame, so a consecutive pair of reads inside one camera period gets the
+                    # same image -- which reads as a freeze in the video and is invisible
+                    # without this. Nothing is written to the dataset; see age_s().
+                    self._stamp[spec.key] = time.monotonic()
+                if not self._healthy.get(spec.key, True):  # was down -> recovered
+                    logger.info("camera '%s' recovered", spec.key)
+                self._healthy[spec.key] = True
+            except Exception:
+                if self._healthy.get(spec.key, True):  # log the drop once, on the transition
+                    logger.warning("camera '%s' stopped delivering frames (link unstable?)", spec.key)
+                self._healthy[spec.key] = False
+                # Blocking, and now only for THIS camera: the others keep delivering.
+                self._try_reconnect(spec)
 
     def _supported_color_fps(self, serial: str, spec: CameraSpec) -> list:
         """Color fps values the device actually offers at (width, height) in rgb8."""
@@ -346,9 +355,9 @@ class CameraManager:
 
     def stop(self) -> None:
         self._cap_stop.set()
-        if self._cap_thread is not None:
-            self._cap_thread.join(timeout=2.0)
-            self._cap_thread = None
+        for t in self._cap_threads:
+            t.join(timeout=2.0)
+        self._cap_threads = []
         for pipe in self._pipelines.values():
             try:
                 pipe.stop()

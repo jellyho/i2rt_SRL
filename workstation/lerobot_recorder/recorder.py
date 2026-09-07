@@ -651,8 +651,26 @@ class Recorder:
         return d
 
     def get_last_images(self) -> dict:
-        with self._lock:
-            return dict(self._last_images)
+        """The freshest camera frames, read from the cameras and NOT from the record loop.
+
+        This used to hand back `self._last_images`, which the record loop refreshes once per tick.
+        That coupled every consumer to the loop, and the loop can block: `_ep_add` streams into a
+        bounded queue and `stream_frame` waits when it is full, which is exactly what happens while
+        the writer is still creating the dataset and starting the video encoder at the top of an
+        episode. For those seconds the loop never came round again, so the cached dict stopped
+        changing and EVERY reader saw a frozen picture -- the GUI preview for all three cameras at
+        once with no camera having disconnected, and, worse, the policy runner, which takes its
+        observation through this same call. The first action chunks of a rollout were computed from
+        a frame that had stopped moving.
+
+        The capture threads own the frames and never block on the writer, so reading from them is
+        both fresher and independent of anything downstream.
+        """
+        try:
+            return self.cameras.read()
+        except Exception:  # a camera manager that is not up yet -> whatever the loop last saw
+            with self._lock:
+                return dict(self._last_images)
 
     def get_review_frames(self) -> List[np.ndarray]:
         with self._lock:
@@ -786,6 +804,8 @@ class Recorder:
             try:
                 images = self.cameras.read()
                 with self._lock:
+                    # Kept only as the fallback for get_last_images before the cameras are up;
+                    # nothing reads it while they are running.
                     self._last_images = images
                 snap = self.robot.get_snapshot()
                 self._scan_dagger_event(snap)

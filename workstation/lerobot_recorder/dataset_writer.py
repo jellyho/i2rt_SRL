@@ -26,6 +26,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import MethodType
 from typing import Dict, List, Optional
@@ -190,6 +191,10 @@ class AsyncDatasetWriter:
         # ~6.5x faster than capture, so it should sit near empty; if it ever fills,
         # stream_frame blocks rather than dropping a frame.
         self._frame_queue: "queue.Queue" = queue.Queue(maxsize=64)
+        #: How long callers have spent waiting on a full frame queue, and whether that was said
+        #: once already. See stream_frame.
+        self._queue_wait_s = 0.0
+        self._warned_queue_full = False
         self._streamed_frames = 0
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -775,12 +780,32 @@ class AsyncDatasetWriter:
         resident set is bounded by the queue instead.
 
         The queue is bounded and this call BLOCKS when it is full. That is deliberate: dropping
-        a frame silently is how videos end up shorter than the metadata claims. Blocking is
-        near-hypothetical anyway -- the streaming encoder measures ~196 frames/s on three
-        640x480 cameras against a 30 fps capture rate.
+        a frame silently is how videos end up shorter than the metadata claims. It is also NOT
+        hypothetical at the top of an episode, whatever the steady-state 196 frames/s says -- the
+        writer thread is still creating the dataset and starting the video encoder then, so 64
+        frames fill in about two seconds at 30 fps and the caller waits. The caller is the record
+        loop, so that wait used to stop everything the loop fed. It no longer feeds the cameras
+        (see Recorder.get_last_images), but a stall long enough to see is worth saying out loud
+        rather than leaving as a mystery in the frame counter.
         """
         self._check_writable()
+        try:
+            self._frame_queue.put_nowait(("frame", frame, task))
+            return
+        except queue.Full:
+            pass
+        t0 = time.monotonic()
         self._frame_queue.put(("frame", frame, task))
+        waited = time.monotonic() - t0
+        self._queue_wait_s += waited
+        if waited > 0.2 and not self._warned_queue_full:
+            self._warned_queue_full = True
+            logger.warning(
+                "the frame queue filled and the caller waited %.1f s -- the writer is behind the "
+                "capture rate. Expected briefly while the encoder starts; sustained means the "
+                "encoder cannot keep up and the recording will lag the robot.",
+                waited,
+            )
 
     def end_episode(self, outcome: Optional[str], task: str) -> None:
         """Close the streamed episode and save it."""
