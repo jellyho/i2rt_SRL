@@ -241,3 +241,33 @@ def test_an_adaptive_policy_reports_each_replans_own_length():
             seen.append(broker.action_horizon)
     assert broker.stale_chunks == 0
     assert seen[:3] == [8, 5, 10]
+
+
+def test_stats_describe_the_action_just_returned_not_the_broker_after_it():
+    """The provenance written next to an action must be that action's.
+
+    On the last step of a chunk `infer` hands out the action and then, in the SAME call, activates
+    the pending reply -- which advances `_chunk_index` and resets `_cursor`. Reading the live
+    fields afterwards gives the NEXT chunk's index for that last action, so the chunk loses its
+    final frame and the next one gains it. On a run of fixed 30-step chunks the rendered video
+    showed 29s and 31s.
+
+    The first chunk is the clean case: it starts at step 0 and runs to exhaustion before any
+    replan lands, so it must contribute exactly `horizon` frames, numbered 0..horizon-1. Reading
+    live state makes it `horizon - 1`, which is what this asserts against.
+    """
+    horizon = 10
+    broker = AsyncChunkBroker(_RampPolicy(horizon=horizon), rate_hz=100.0, prefetch_ticks=4)
+    seen = []
+    for t in range(3 * horizon):
+        broker.infer({"t": t})
+        st = broker.stats()
+        seen.append((st["chunk_index"], st["step_in_chunk"]))
+        time.sleep(0.002)
+
+    first = [step for idx, step in seen if idx == 0]
+    assert first == list(range(horizon)), f"the first chunk is not {horizon} whole steps: {first}"
+    # and within every chunk the step counter moves by one, never repeating or skipping
+    for i in range(1, len(seen)):
+        if seen[i][0] == seen[i - 1][0]:
+            assert seen[i][1] == seen[i - 1][1] + 1, (seen[i - 1], seen[i])
