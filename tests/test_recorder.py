@@ -1147,3 +1147,36 @@ def test_arming_opens_the_dataset_before_the_rollout(tmp_path):
         assert rec.get_status()["preparing"] is False
     finally:
         rec.shutdown()
+
+
+def test_extra_features_arriving_after_arm_redo_the_schema(tmp_path):
+    """Arming opens the dataset; the policy handshake can land after that.
+
+    The extras are dataset COLUMNS, and LeRobot rejects a frame whose keys differ from the declared
+    schema in either direction -- per frame, so it does not fail at open, it fails on every save
+    and stops the writer. Opening eagerly at arm (to keep the writer's start-up out of the rollout)
+    made that ordering reachable: arm, then handshake, then "Extra features: {...}" on the first
+    frame. An unwritten dataset is cheap to recreate, so it is recreated.
+    """
+    cfg = RecorderConfig(
+        repo_id="test/lateextras",
+        root=str(tmp_path),
+        fps=30,
+        mock=True,
+        record_source="eval",
+        review_before_save=False,
+    )
+    rec = Recorder(cfg)
+    rec.cameras.start()
+    rec.robot.start()
+    try:
+        rec.arm()  # before the handshake
+        assert "critic_scores" not in rec._sample_frame()
+        rec.set_extra_features({"critic_scores": (6,)}, lambda: {"critic_scores": np.zeros(6, np.float32)})
+        assert "critic_scores" in rec._sample_frame()
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1, "the frame must be accepted, not rejected on schema"
+        assert not rec.writer.progress.get("failed"), rec.writer.progress.get("last_error")
+    finally:
+        rec.shutdown()

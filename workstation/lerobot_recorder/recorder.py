@@ -302,6 +302,11 @@ class Recorder:
             # policy began driving, the bounded frame queue filled behind it, and the record loop
             # blocked -- which is what froze the preview and stalled the frame count for the first
             # chunks of a rollout. Arming is where a wait is free: nothing is moving yet.
+            if not self._extra_features and self._extras_fn is None:
+                # The handshake has not landed. Opening now would fix a schema without the
+                # policy's columns; set_extra_features reopens if it arrives later, but saying so
+                # here is cheaper than reading that code to find out why.
+                logger.info("arming before the policy handshake — the dataset schema will be redone when it lands")
             t0 = time.perf_counter()
             self._set(armed=False, recording=False, preparing=True)
             try:
@@ -378,9 +383,17 @@ class Recorder:
     def set_extra_features(self, features: Dict[str, tuple], values_fn) -> None:
         """Declare extra per-step columns, and where to read them each frame.
 
-        Called once the policy handshake is in, which is why the dataset is not opened until
-        the first recorded frame: the schema has to include these, and nothing knows them
-        before the server says so.
+        Called once the policy handshake is in. The schema has to include these, and nothing
+        knows them before the server says so -- which is why the dataset used to be opened lazily,
+        at the first recorded frame, by which time the handshake had certainly landed.
+
+        arm() now opens it eagerly, to keep the writer's start-up out of the rollout, and that
+        reintroduces the ordering: arming before the policy connects fixed a schema without these
+        columns, and every frame then failed with "Extra features: {...}". So if the writer is
+        already open and has not been written to, it is REOPENED against the new schema. Nothing
+        is lost -- an empty dataset is cheap to recreate -- and after the first frame the schema is
+        the dataset's, at which point a late handshake is a real conflict rather than an ordering
+        accident, and the writer's own guard drops what the dataset does not declare.
         """
         self._extra_features = {str(k): tuple(v) for k, v in (features or {}).items()}
         self._extras_fn = values_fn if self._extra_features else None
@@ -388,6 +401,19 @@ class Recorder:
             logger.info(
                 "recording extra per-step features: %s", ", ".join(f"{k}{v}" for k, v in self._extra_features.items())
             )
+        writer = self.writer
+        if writer is not None and not writer.finalized and not writer.num_episodes and not self._n_frames:
+            logger.info("reopening the dataset so its schema carries the policy's columns")
+            try:
+                writer.finalize()
+            except Exception as e:
+                logger.warning("could not close the schema-less writer cleanly: %s", e)
+            self.writer = None
+            self.cfg.resume = True  # the directory may exist from the open we are replacing
+            try:
+                self._ensure_writer_open()
+            except Exception as e:
+                logger.error("could not reopen the dataset with the policy's columns: %s", e)
 
     def _note_image_age(self) -> None:
         """Track the worst staleness of an image paired with an action, for the episode log.
