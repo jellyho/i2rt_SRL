@@ -1090,14 +1090,18 @@ def test_a_sensor_gap_is_counted_separately_from_a_hold(tmp_path):
     rec = _eval_rec(tmp_path, "gap")
     try:
         rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
-        snap = rec.robot.get_snapshot()
-        rec._step(rec.get_last_images(), snap)  # records
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())  # writes the queued frame
+        # The frame is built at the send now, so the gap has to be there and not at the record
+        # tick: the robot stops reporting for exactly the instant this action goes out.
+        healthy = rec.robot.get_snapshot
+        rec.robot.get_snapshot = lambda: {**healthy(), "state": None}
         rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
-        blind = dict(snap)
-        blind["state"] = None  # the robot stopped reporting for one tick
-        rec._step(rec.get_last_images(), blind)
-        assert rec.get_status()["frames"] == 1, "the blind tick must not become a frame"
+        rec.robot.get_snapshot = healthy
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert rec.get_status()["frames"] == 1, "the blind send must not become a frame"
         assert rec._skipped["state"] == 1, rec._skipped
+        # And NOT also a hold: a send happened, it just could not be recorded. Counting it twice
+        # would read as "the policy was thinking" on a tick where it was not.
         assert rec._skipped["hold"] == 0, rec._skipped
     finally:
         rec.shutdown()
@@ -1178,5 +1182,53 @@ def test_extra_features_arriving_after_arm_redo_the_schema(tmp_path):
         rec._step(rec.get_last_images(), rec.robot.get_snapshot())
         assert rec.get_status()["frames"] == 1, "the frame must be accepted, not rejected on schema"
         assert not rec.writer.progress.get("failed"), rec.writer.progress.get("last_error")
+    finally:
+        rec.shutdown()
+
+
+def test_two_sends_inside_one_record_tick_are_two_frames(tmp_path):
+    """The control loop and the record loop race, and the control loop wins often enough to matter.
+
+    Sampling the frame on the record tick meant a send that landed between two ticks produced no
+    frame at all, so a policy serving a fixed 30-step chunk reached the dataset with 29. The frame
+    is built at the send now, and the tick only writes what is already queued.
+    """
+    rec = _eval_rec(tmp_path, "twosends")
+    got = []
+    rec._ep_add = got.append
+    try:
+        rec.note_action_sent(np.full(ACTION_DIM, 1.0, dtype=np.float32))
+        rec.note_action_sent(np.full(ACTION_DIM, 2.0, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        assert len(got) == 2, "both sends belong in the dataset, not just the last one"
+        assert [float(f["action"][0]) for f in got] == [1.0, 2.0], "and in the order they went out"
+    finally:
+        rec.shutdown()
+
+
+def test_a_frame_is_filed_under_the_chunk_it_was_sent_in(tmp_path):
+    """The 29/31 report, reduced to its mechanism.
+
+    The runner overwrites this step's provenance at every send (deploy_runner._note_timing), so a
+    record tick landing after the next send read THAT send's chunk_index and filed the frame under
+    the following chunk: the chunk it belonged to came out one frame short and its successor one
+    frame long. Reading the provenance at the send is what makes the counts exact.
+    """
+    rec = _eval_rec(tmp_path, "chunkprov")
+    chunk = {"v": 0.0}
+    rec.set_extra_features(
+        {"policy/chunk_index": (1,)},
+        lambda: {"policy/chunk_index": np.array([chunk["v"]], np.float32)},
+    )
+    got = []
+    rec._ep_add = got.append
+    try:
+        for _ in range(4):  # a four-step chunk, all of it sent before the record loop comes round
+            rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        chunk["v"] = 1.0  # the runner has already replanned by the time the tick runs
+        rec.note_action_sent(np.zeros(ACTION_DIM, dtype=np.float32))
+        rec._step(rec.get_last_images(), rec.robot.get_snapshot())
+        filed = [float(f["policy/chunk_index"][0]) for f in got]
+        assert filed == [0.0, 0.0, 0.0, 0.0, 1.0], filed
     finally:
         rec.shutdown()
